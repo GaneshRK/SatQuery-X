@@ -11,6 +11,7 @@ router = APIRouter(prefix="/v1/models", tags=["Model Registry"])
 
 
 @router.get("", response_model=ModelListResponse)
+@router.get("/registry", response_model=ModelListResponse)
 async def list_models() -> ModelListResponse:
     registry = ModelRegistry()
     entries = registry.list_all()
@@ -38,7 +39,11 @@ async def list_models() -> ModelListResponse:
 @router.get("/{model_id}", response_model=ModelRegistryEntryResponse)
 async def get_model(model_id: str) -> ModelRegistryEntryResponse:
     registry = ModelRegistry()
-    m = registry.get(model_id)
+    try:
+        m = registry.get(model_id)
+    except KeyError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found in registry.")
 
     return ModelRegistryEntryResponse(
         id=m.id,

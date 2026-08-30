@@ -26,6 +26,20 @@ async def test_models_registry_endpoint(client):
     assert "CHANGE_VQA" in ids
     assert "OPTICAL_SAR_FUSION" in ids
 
+    # Test /registry alias
+    reg_res = await client.get("/v1/models/registry")
+    assert reg_res.status_code == 200
+    assert reg_res.json()["count"] == data["count"]
+
+    # Test single model lookup
+    single_res = await client.get("/v1/models/RS_VQA")
+    assert single_res.status_code == 200
+    assert single_res.json()["id"] == "RS_VQA"
+
+    # Test unknown model returns 404
+    unknown_res = await client.get("/v1/models/non_existent_model")
+    assert unknown_res.status_code == 404
+
 
 @pytest.mark.asyncio
 async def test_auth_token_generation(client):
