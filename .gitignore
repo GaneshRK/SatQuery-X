@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Data & models
+data/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+mlruns/
+wandb/
+
+# Docker volumes
+infra/volumes/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+secrets/

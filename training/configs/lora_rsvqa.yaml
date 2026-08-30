@@ -1,0 +1,24 @@
+# LoRA / QLoRA Fine-Tuning Configuration for RS_VQA and RS_CAPTION (§9 Tier 1)
+model_name_or_path: "Salesforce/blip-vqa-base"
+task_type: "visual_question_answering"
+output_dir: "./checkpoints/rs_vqa_lora_v1.0"
+dataset: "VRSBench-VQA + RSVQA"
+
+peft:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: "none"
+  target_modules: ["q_proj", "v_proj", "k_proj", "out_proj"]
+
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 2e-4
+  weight_decay: 0.01
+  num_train_epochs: 5
+  warmup_ratio: 0.05
+  fp16: true
+  logging_steps: 10
+  eval_steps: 50
+  save_total_limit: 3

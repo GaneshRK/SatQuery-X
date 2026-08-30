@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ title }} — SatQuery-X Intelligence Report</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    
+    :root {
+      --bg: #090d16;
+      --card-bg: #111827;
+      --border: #1f2937;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59, 130, 246, 0.15);
+      --success: #10b981;
+      --warning: #f59e0b;
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 40px 20px;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 40px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 24px;
+      margin-bottom: 32px;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-glow);
+      color: var(--accent);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    h1 { font-size: 26px; font-weight: 700; margin-top: 8px; color: #fff; }
+    .subtitle { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
+    
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+    .meta-card {
+      background: #1a2234;
+      border: 1px solid #28334e;
+      padding: 14px;
+      border-radius: 8px;
+    }
+    .meta-label { font-size: 11px; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
+    .meta-val { font-size: 16px; font-weight: 600; color: #fff; margin-top: 4px; }
+    .meta-val.green { color: var(--success); }
+
+    .section { margin-bottom: 36px; }
+    .section-title {
+      font-size: 16px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--accent);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .answer-box {
+      background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(16,185,129,0.05));
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      padding: 20px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 500;
+      color: #fff;
+    }
+
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-top: 14px;
+    }
+    .evidence-card {
+      background: #161f30;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      text-align: center;
+    }
+    .evidence-card img {
+      width: 100%;
+      height: 220px;
+      object-fit: cover;
+      display: block;
+      background: #000;
+    }
+    .evidence-card .caption {
+      padding: 10px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+    th, td {
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: #1a2234;
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      background: #1f293d;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #93c5fd;
+    }
+
+    .footer {
+      border-top: 1px solid var(--border);
+      padding-top: 20px;
+      margin-top: 40px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <span class="badge">SatQuery-X Multimodal Intelligence</span>
+        <h1>{{ title }}</h1>
+        <p class="subtitle">Query ID: <code>{{ query_id }}</code> &bull; Session: <code>{{ session_id }}</code></p>
+      </div>
+      <div style="text-align: right;">
+        <p style="font-size: 12px; color: var(--text-muted);">Generated: {{ generated_at }}</p>
+        <span class="badge" style="margin-top: 6px; background: rgba(16, 185, 129, 0.15); color: var(--success); border-color: rgba(16,185,129,0.3);">
+          Auditable & Verified
+        </span>
+      </div>
+    </div>
+
+    <!-- Metadata Grid -->
+    <div class="meta-grid">
+      <div class="meta-card">
+        <div class="meta-label">Detected Mode</div>
+        <div class="meta-val">{{ detected_mode }}</div>
+      </div>
+      <div class="meta-card">
+        <div class="meta-label">Task Class</div>
+        <div class="meta-val">{{ task_classification }}</div>
+      </div>
+      <div class="meta-card">
+        <div class="meta-label">Confidence</div>
+        <div class="meta-val green">{{ (confidence * 100)|round(1) }}%</div>
+      </div>
+      <div class="meta-card">
+        <div class="meta-label">Total Execution</div>
+        <div class="meta-val">{{ timings_ms.get('total', 0)|round(1) }} ms</div>
+      </div>
+    </div>
+
+    <!-- Core Natural Language Query & Answer -->
+    <div class="section">
+      <div class="section-title">Query & Grounded Response</div>
+      <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 8px;">Question: <strong style="color:#fff;">"{{ query }}"</strong></p>
+      <div class="answer-box">
+        {{ answer }}
+      </div>
+    </div>
+
+    <!-- Geospatial & Area Quantification -->
+    {% if evidence.quantified_area_km2 or evidence.change_percentage %}
+    <div class="section">
+      <div class="section-title">Geospatial Quantification</div>
+      <div class="meta-grid" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="meta-card">
+          <div class="meta-label">Changed Area (km²)</div>
+          <div class="meta-val">{{ evidence.quantified_area_km2 }} km²</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Changed Area (Hectares)</div>
+          <div class="meta-val">{{ evidence.quantified_area_hectares }} ha</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Change Percentage</div>
+          <div class="meta-val green">{{ evidence.change_percentage }}%</div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Visual Evidence Artifacts -->
+    <div class="section">
+      <div class="section-title">Visual Evidence & Overlays</div>
+      <div class="evidence-grid">
+        {% if evidence.change_mask_url %}
+        <div class="evidence-card">
+          <img src="{{ evidence.change_mask_url }}" alt="Change Mask" />
+          <div class="caption">Bi-Temporal Change Detection Mask</div>
+        </div>
+        {% endif %}
+        {% if evidence.overlay_url %}
+        <div class="evidence-card">
+          <img src="{{ evidence.overlay_url }}" alt="Evidence Overlay" />
+          <div class="caption">Visual Grounding & Overlay Map</div>
+        </div>
+        {% endif %}
+      </div>
+      {% if evidence.bboxes %}
+      <div style="margin-top: 14px;">
+        <p style="font-size: 13px; color: var(--text-muted);">Detected Bounding Regions (Pixel Space / Geo Coordinates):</p>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Label</th>
+              <th>Bounding Coordinates (x1, y1, x2, y2)</th>
+              <th>Region Confidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for b in evidence.bboxes %}
+            <tr>
+              <td>{{ loop.index }}</td>
+              <td><code>{{ b.get('label', 'detected') }}</code></td>
+              <td><code>[{{ b.get('x1')|round(1) }}, {{ b.get('y1')|round(1) }}, {{ b.get('x2')|round(1) }}, {{ b.get('y2')|round(1) }}]</code></td>
+              <td style="color: var(--success);">{{ (b.get('confidence', 0.5) * 100)|round(1) }}%</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Auditable Execution Trace -->
+    <div class="section">
+      <div class="section-title">Auditable Execution Trace (§5 Contract)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Step</th>
+            <th>Tool / Specialist Model</th>
+            <th>Version</th>
+            <th>Parameters</th>
+            <th>Latency</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in plan %}
+          <tr>
+            <td><strong>{{ s.step }}</strong></td>
+            <td><code>{{ s.tool }}</code></td>
+            <td><code>{{ s.version }}</code></td>
+            <td><code>{{ s.params }}</code></td>
+            <td>{{ timings_ms.get('step' ~ s.step, 0)|round(1) }} ms</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if analyst_notes %}
+    <div class="section">
+      <div class="section-title">Analyst Notes</div>
+      <p style="font-size: 14px; color: #d1d5db; background: #161f30; padding: 14px; border-radius: 6px;">
+        {{ analyst_notes }}
+      </p>
+    </div>
+    {% endif %}
+
+    <div class="footer">
+      <div>SatQuery-X &bull; Autonomous Geospatial Intelligence Engine (SIH26167)</div>
+      <div>Strict Traceability Guarantee &bull; Non-Monolithic Specialist Architecture</div>
+    </div>
+  </div>
+</body>
+</html>

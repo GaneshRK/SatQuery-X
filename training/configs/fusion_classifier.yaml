@@ -1,0 +1,17 @@
+# Optical-SAR Cross-Modal Fusion Classifier Configuration (§9 Tier 1)
+model_name: "dual_branch_cross_attention_fusion"
+task: "cross_modal_fusion_analysis"
+output_dir: "./checkpoints/optical_sar_fusion_v1.0"
+dataset: "BigEarthNet S1+S2"
+
+architecture:
+  optical_encoder: "vit_base_patch16"
+  sar_encoder: "resnet34_sar"
+  fusion_type: "cross_attention"
+  num_classes: 19  # BigEarthNet 19-class standard
+
+training:
+  batch_size: 32
+  learning_rate: 3e-4
+  num_train_epochs: 20
+  metrics: ["multilabel_f1", "accuracy", "map"]

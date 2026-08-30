@@ -1,0 +1,22 @@
+# Siamese Change Detection Training Configuration (§9 Tier 1)
+model_name: "siamese_resnet50_diff"
+task: "bi_temporal_change_map"
+output_dir: "./checkpoints/change_detection_siamese_v1.0"
+datasets: ["LEVIR-CD", "CDVQA"]
+
+architecture:
+  backbone: "resnet50"
+  pretrained: true
+  freeze_backbone_epochs: 2
+  decoder: "unet_diff_decoder"
+  in_channels: 3
+  num_classes: 2
+
+training:
+  batch_size: 8
+  learning_rate: 1e-4
+  optimizer: "adamw"
+  loss: "focal_dice_combined"
+  num_train_epochs: 15
+  image_size: [512, 512]
+  metrics: ["iou", "f1", "precision", "recall"]

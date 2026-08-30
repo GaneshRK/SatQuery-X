@@ -1,0 +1,82 @@
+models:
+  - id: RS_VQA
+    version: v0.1-baseline
+    task: visual_question_answering
+    input_modes: [single_image]
+    status: baseline
+    base_arch: "BLIP-VQA (zero-shot baseline, not RS fine-tuned)"
+    training_data: [RSVQA, VRSBench-VQA]
+    hardware: cpu
+    wrapper: backend.models.rs_vqa.wrapper.RSVQAModel
+    output:
+      answer: str
+      confidence: float
+      attention_region: bbox|null
+
+  - id: RS_CAPTION
+    version: v0.1-baseline
+    task: image_captioning
+    input_modes: [single_image]
+    status: baseline
+    base_arch: "BLIP captioning (zero-shot baseline)"
+    training_data: [VRSBench-Caption, BigEarthNet]
+    hardware: cpu
+    wrapper: backend.models.rs_caption.wrapper.RSCaptionModel
+    output:
+      caption: str
+      confidence: float
+
+  - id: RS_GROUNDING
+    version: v0.1-baseline
+    task: text_guided_grounding
+    input_modes: [single_image]
+    status: baseline
+    base_arch: "Spectral Saliency & Morphological Region Proposal (baseline)"
+    training_data: [VRSBench-Grounding]
+    hardware: cpu
+    wrapper: backend.models.rs_grounding.wrapper.RSGroundingModel
+    output:
+      boxes: list
+      masks: list|null
+      confidence: float
+
+  - id: CHANGE_DETECTION
+    version: v0.1-baseline
+    task: bi_temporal_change_map
+    input_modes: [bi_temporal]
+    status: baseline
+    base_arch: "Siamese-style diff encoder (baseline, not fine-tuned)"
+    hardware: cpu
+    wrapper: backend.models.change_detection.wrapper.ChangeDetectionModel
+    output:
+      change_mask: mask
+      change_regions: list
+      change_type_map: raster|null
+
+  - id: CHANGE_VQA
+    version: v0.1-baseline
+    task: change_based_vqa
+    input_modes: [bi_temporal]
+    status: baseline
+    depends_on: [CHANGE_DETECTION]
+    training_data: [CDVQA]
+    hardware: cpu
+    wrapper: backend.models.change_vqa.wrapper.ChangeVQAModel
+    output:
+      answer: str
+      confidence: float
+      supporting_regions: list
+
+  - id: OPTICAL_SAR_FUSION
+    version: v0.1-baseline
+    task: cross_modal_fusion_analysis
+    input_modes: [cross_modal_pair]
+    status: baseline
+    base_arch: "Dual-branch feature fusion (baseline classifier)"
+    training_data: [BigEarthNet]
+    hardware: cpu
+    wrapper: backend.models.optical_sar_fusion.wrapper.OpticalSARFusionModel
+    output:
+      answer: str
+      class_map: raster|null
+      confidence: float
