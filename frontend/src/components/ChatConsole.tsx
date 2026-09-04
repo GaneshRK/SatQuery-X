@@ -4,9 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Send,
   Sparkles,
-  Terminal,
   Loader2,
-  CheckCircle2,
   ShieldCheck,
   Zap,
   ChevronDown,
@@ -16,14 +14,21 @@ import {
   Layers,
   MapPin,
   CornerDownRight,
+  Download,
+  FileCode,
+  FileSpreadsheet,
+  FileText,
+  AlertTriangle,
 } from 'lucide-react';
 import { ExecutionTrace, InputMode } from '@/types';
-import { submitQuery, getQuery, listQueries, QueryDetailData } from '@/services/queries';
+import { submitQuery, listQueries, QueryDetailData, getExportUrl } from '@/services/queries';
 
 interface ChatConsoleProps {
   sessionId: string;
   detectedMode: InputMode | null;
   hasImages: boolean;
+  pendingPrompt?: string | null;
+  onClearPendingPrompt?: () => void;
   onQueryExecuted: (trace: ExecutionTrace) => void;
 }
 
@@ -65,6 +70,7 @@ export function formatQueryToTrace(queryData: QueryDetailData, sessionId: string
     outputs: {},
     answer: queryData.answer || 'Query processed.',
     confidence: queryData.confidence || 0.92,
+    answer_contract: queryData.answer_contract,
     evidence: {
       bboxes,
       geojson: evidenceRegions.map((e) => e.geojson_geometry),
@@ -82,6 +88,8 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
   sessionId,
   detectedMode,
   hasImages,
+  pendingPrompt,
+  onClearPendingPrompt,
   onQueryExecuted,
 }) => {
   const [queryText, setQueryText] = useState('');
@@ -91,6 +99,15 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
   const [queriesHistory, setQueriesHistory] = useState<QueryDetailData[]>([]);
   const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-fill and execute when pendingPrompt arrives from "Ask This Area"
+  useEffect(() => {
+    if (pendingPrompt && !loading) {
+      setQueryText(pendingPrompt);
+      handleSend(pendingPrompt);
+      if (onClearPendingPrompt) onClearPendingPrompt();
+    }
+  }, [pendingPrompt]);
 
   // Load queries history on sessionId change
   useEffect(() => {
@@ -106,7 +123,6 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
     fetchHistory();
   }, [sessionId]);
 
-  // Scroll to bottom when queries change or during loading
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [queriesHistory, loading, loadingStage]);
@@ -120,102 +136,92 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
           'Coastline & water boundary penetration assessment',
         ];
       case 'bi_temporal':
-      case 'change_vqa':
         return [
-          'Detect and quantify flood inundation area across the basin compared to baseline',
-          'Measure total waterlogged territory in square kilometers',
-          'Has built-up or structural area increased significantly?',
+          'Quantify total surface water change area in square kilometers',
+          'Detect flood inundation extent and affected agricultural parcels',
+          'Identify infrastructure at risk within 500m of inundated zones',
         ];
+      case 'single_image':
       default:
         return [
-          'Segment and quantify surface water bodies in km²',
-          'Measure forest canopy and dense vegetation coverage',
-          'Detect and count individual infrastructure structures',
-          'Describe terrain classification and dominant land use',
+          'Compute NDVI vegetation index and quantify healthy biomass canopy',
+          'Extract all surface water bodies using spectral NDWI thresholding',
+          'Detect and count structural footprints across the scene',
         ];
     }
   };
 
   const getFollowUps = (lastQuery?: QueryDetailData) => {
-    if (!lastQuery) return [];
-    const task = lastQuery.detected_task || '';
-    if (task.includes('FLOOD') || task.includes('WATER')) {
+    const task = lastQuery?.detected_task;
+    if (task === 'CHANGE_DETECTION') {
       return [
-        'Calculate flood recession rate over temporal baselines',
-        'Highlight critical submerged road and transport corridors',
-        'Generate official ISRO-format disaster impact dossier',
-      ];
-    }
-    if (task.includes('VEGETATION') || task.includes('DEFORESTATION')) {
-      return [
-        'Compute vegetation canopy density distribution',
-        'Identify vulnerable buffer zones under 500m from forest edge',
-        'Export geo-referenced GeoJSON boundaries',
+        'Which specific agricultural parcels lost vegetation?',
+        'Export detected change polygons as GeoJSON for QGIS',
+        'Compare SAR backscatter penetration for confirmation',
       ];
     }
     return [
-      'Compare spectral signatures against standard false-color infrared',
-      'Quantify spatial distribution by grid quadtree',
-      'Generate executive analytical briefing',
+      'Quantify the metric surface area of detected regions',
+      'What are the scientific limitations of this observation?',
+      'Generate a comprehensive intelligence PDF dossier',
     ];
   };
 
-  const handleSend = async (customText?: string) => {
-    const textToSend = customText || queryText;
-    if (!textToSend.trim() || !hasImages || !sessionId) return;
+  const handleSend = async (overrideText?: string) => {
+    const textToSend = overrideText || queryText;
+    if (!textToSend.trim() || !sessionId || loading) return;
 
     setLoading(true);
-    setLoadingStage('Parsing natural language & routing intent...');
     setError(null);
+    setLoadingStage('Analyzing query intent with Model Router...');
+    setQueryText('');
 
     try {
-      const { query_id } = await submitQuery(sessionId, textToSend.trim());
+      setTimeout(() => setLoadingStage('Validating CRS and reading raster chunks...'), 600);
+      setTimeout(() => setLoadingStage('Executing deterministic computer vision & spectral math...'), 1400);
 
-      setLoadingStage('Executing computer vision & raster math tools...');
+      const res = await submitQuery(sessionId, textToSend);
 
-      // Poll until query completes (with max timeout of 12s)
-      let queryDetail: QueryDetailData | null = null;
-      for (let i = 0; i < 18; i++) {
-        await new Promise((r) => setTimeout(r, 600));
-        if (i === 4) setLoadingStage('Reprojecting geometries to geodesic metric CRS...');
-        if (i === 8) setLoadingStage('Synthesizing spatial reasoning & evidence...');
-
-        queryDetail = await getQuery(sessionId, query_id);
-        if (queryDetail.status === 'COMPLETED' || queryDetail.status === 'FAILED') {
-          break;
-        }
-      }
-
-      if (queryDetail) {
-        const trace = formatQueryToTrace(queryDetail, sessionId);
-        onQueryExecuted(trace);
-        // Refresh local history
-        setQueriesHistory((prev) => {
-          const exists = prev.some((q) => q.id === queryDetail!.id);
-          if (exists) {
-            return prev.map((q) => (q.id === queryDetail!.id ? queryDetail! : q));
+      setTimeout(async () => {
+        try {
+          const updatedHistory = await listQueries(sessionId);
+          setQueriesHistory(updatedHistory || []);
+          const latest = updatedHistory?.find((q) => q.id === res.query_id) || updatedHistory?.[0];
+          if (latest) {
+            const trace = formatQueryToTrace(latest, sessionId);
+            onQueryExecuted(trace);
           }
-          return [...prev, queryDetail!];
-        });
-      }
-      setQueryText('');
+        } catch (pollErr) {
+          console.error('Error refreshing queries:', pollErr);
+        } finally {
+          setLoading(false);
+          setLoadingStage('');
+        }
+      }, 2200);
     } catch (err: any) {
-      setError(err.message || 'An error occurred during query execution.');
-    } finally {
+      console.error('Submit query failed:', err);
+      setError(err?.message || 'Failed to submit query.');
       setLoading(false);
       setLoadingStage('');
     }
   };
 
-  const latestQuery = queriesHistory.length > 0 ? queriesHistory[queriesHistory.length - 1] : undefined;
+  const handleDownloadExport = (queryId: string, format: string) => {
+    const url = getExportUrl(sessionId, queryId, format);
+    window.open(url, '_blank');
+  };
+
+  const latestQuery = queriesHistory[queriesHistory.length - 1];
 
   return (
-    <div className="bg-surface border border-border rounded-xl flex flex-col shadow-xl overflow-hidden">
+    <div className="flex flex-col h-full bg-[#080d1a] border border-border rounded-xl overflow-hidden shadow-2xl">
       {/* Console Header */}
-      <div className="p-4 border-b border-border/80 flex items-center justify-between bg-slate-950/40">
+      <div className="h-11 border-b border-border bg-slate-950/80 px-4 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-blue-400" />
-          <h3 className="font-semibold text-sm text-white">Natural Language Reasoning Thread</h3>
+          <Sparkles className="w-4 h-4 text-blue-400" />
+          <span className="text-xs font-mono font-semibold text-slate-200">
+            AI Geospatial Copilot
+          </span>
           {queriesHistory.length > 0 && (
             <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-900/40 text-blue-300 border border-blue-800/40 font-mono">
               {queriesHistory.length} turns
@@ -225,7 +231,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
         <div className="flex items-center gap-2">
           <span className="flex items-center gap-1.5 text-[11px] font-mono text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            Agent FSM: Active
+            Deterministic CV + AI
           </span>
         </div>
       </div>
@@ -239,7 +245,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
               No queries executed in this session yet.
             </p>
             <p className="text-[11px] text-slate-500 mt-1">
-              Select a suggested preset below or ask any geospatial question to trigger multi-tool reasoning.
+              Select a suggested mission below or draw an AOI on the map to ask specific questions.
             </p>
           </div>
         )}
@@ -250,6 +256,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
             (sum, e) => sum + (e.area_km2 || 0),
             0
           );
+          const contract = q.answer_contract;
 
           return (
             <div key={q.id} className="flex flex-col gap-2.5">
@@ -269,7 +276,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
                   <Bot className="w-3.5 h-3.5 text-emerald-400" />
                 </div>
                 <div className="max-w-[90%] bg-slate-900/90 border border-slate-800 rounded-2xl rounded-tl-sm p-3.5 flex flex-col gap-2 text-xs shadow-md">
-                  {/* Task & Confidence Tag */}
+                  {/* Task & Confidence Header */}
                   <div className="flex items-center justify-between flex-wrap gap-1.5 pb-2 border-b border-slate-800">
                     <div className="flex items-center gap-1.5">
                       <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-blue-950 text-blue-300 border border-blue-800/60">
@@ -300,8 +307,22 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
                     {q.answer || 'Query processed successfully.'}
                   </div>
 
-                  {/* Quantified Area Highlight if present */}
-                  {totalAreaKm2 > 0 && (
+                  {/* Structured Measurements from Answer Contract */}
+                  {contract?.measurements && contract.measurements.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {contract.measurements.map((m, idx) => (
+                        <span
+                          key={idx}
+                          className="px-2 py-0.5 rounded bg-cyan-950/40 border border-cyan-800/40 text-[10px] font-mono text-cyan-300 flex items-center gap-1"
+                        >
+                          <strong>{m.metric}:</strong> {typeof m.value === 'number' ? m.value.toFixed(2) : m.value} {m.unit || ''}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Quantified Area Highlight */}
+                  {totalAreaKm2 > 0 && !contract?.measurements && (
                     <div className="p-2 rounded-lg bg-cyan-950/40 border border-cyan-800/40 flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         <Layers className="w-3.5 h-3.5 text-cyan-400" />
@@ -310,12 +331,61 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
                         </span>
                       </div>
                       <span className="text-xs font-mono font-bold text-cyan-300">
-                        {totalAreaKm2.toFixed(3)} km² ({((totalAreaKm2 * 100).toFixed(1))} ha)
+                        {totalAreaKm2.toFixed(3)} km² ({(totalAreaKm2 * 100).toFixed(1)} ha)
                       </span>
                     </div>
                   )}
 
-                  {/* Collapsible Execution Steps */}
+                  {/* Scientific Limitations Notice */}
+                  {contract?.limitations && contract.limitations.length > 0 && (
+                    <div className="p-2 rounded bg-amber-950/20 border border-amber-900/30 text-[10px] font-mono text-amber-300/80 flex items-start gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                      <span>{contract.limitations[0]}</span>
+                    </div>
+                  )}
+
+                  {/* Export Toolbar */}
+                  <div className="pt-2 border-t border-slate-800 flex items-center justify-between flex-wrap gap-2 text-[10px] font-mono text-slate-400">
+                    <span className="flex items-center gap-1">
+                      <Download className="w-3 h-3" />
+                      Export Data:
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => handleDownloadExport(q.id, 'geojson')}
+                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-cyan-900/60 hover:text-cyan-300 text-slate-300 border border-slate-700 flex items-center gap-1 transition-all"
+                        title="Download GeoJSON FeatureCollection"
+                      >
+                        <FileCode className="w-2.5 h-2.5" />
+                        GeoJSON
+                      </button>
+                      <button
+                        onClick={() => handleDownloadExport(q.id, 'csv')}
+                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-emerald-900/60 hover:text-emerald-300 text-slate-300 border border-slate-700 flex items-center gap-1 transition-all"
+                        title="Download Metrics CSV"
+                      >
+                        <FileSpreadsheet className="w-2.5 h-2.5" />
+                        CSV
+                      </button>
+                      <button
+                        onClick={() => handleDownloadExport(q.id, 'json')}
+                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-blue-900/60 hover:text-blue-300 text-slate-300 border border-slate-700 flex items-center gap-1 transition-all"
+                        title="Download 10-Key JSON Dossier"
+                      >
+                        <FileText className="w-2.5 h-2.5" />
+                        JSON
+                      </button>
+                      <button
+                        onClick={() => handleDownloadExport(q.id, 'geotiff')}
+                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-purple-900/60 hover:text-purple-300 text-slate-300 border border-slate-700 flex items-center gap-1 transition-all"
+                        title="Download Source GeoTIFF Raster"
+                      >
+                        GeoTIFF
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Collapsible Tool Execution Steps */}
                   {q.execution_steps && q.execution_steps.length > 0 && (
                     <div className="pt-1">
                       <button
@@ -328,8 +398,8 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
                           <ChevronRight className="w-3 h-3" />
                         )}
                         <span>
-                          {q.execution_steps.length} Tool Execution Step
-                          {q.execution_steps.length > 1 ? 's' : ''}
+                          {q.execution_steps.length} Execution Step
+                          {q.execution_steps.length > 1 ? 's' : ''} (Trace)
                         </span>
                       </button>
 
@@ -370,7 +440,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
             </div>
             <div className="bg-slate-900/90 border border-blue-500/30 rounded-2xl rounded-tl-sm p-3.5 text-xs text-blue-200 font-mono flex items-center gap-2.5 shadow-lg shadow-blue-500/5">
               <Zap className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
-              <span>{loadingStage || 'Decomposing query with Agentic FSM...'}</span>
+              <span>{loadingStage || 'Decomposing query with Agentic Planner...'}</span>
             </div>
           </div>
         )}
@@ -418,7 +488,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
               onChange={(e) => setQueryText(e.target.value)}
               placeholder={
                 hasImages
-                  ? 'Ask any geospatial or change query (e.g. Quantify water body extent in km²)...'
+                  ? 'Ask any geospatial query (e.g. Quantify surface water extent in km²)...'
                   : 'Upload satellite imagery to activate vision-language reasoning...'
               }
               disabled={loading || !hasImages}

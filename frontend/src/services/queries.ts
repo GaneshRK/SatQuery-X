@@ -1,4 +1,5 @@
 import { apiRequest } from "./api";
+import { AnswerContract } from "@/types";
 
 export interface ExecutionStepData {
   id: string;
@@ -28,6 +29,7 @@ export interface QueryDetailData {
   status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
   answer: string | null;
   confidence: number | null;
+  answer_contract?: AnswerContract;
   execution_steps: ExecutionStepData[];
   evidence_regions: EvidenceRegionData[];
 }
@@ -36,11 +38,12 @@ export async function submitQuery(
   sessionId: string,
   text: string,
   imageId?: string,
-  pairId?: string
+  pairId?: string,
+  aoiGeometry?: any
 ): Promise<{ query_id: string; status: string; plan: any }> {
   return apiRequest(`/sessions/${sessionId}/queries/`, {
     method: "POST",
-    body: JSON.stringify({ text, image_id: imageId, pair_id: pairId }),
+    body: JSON.stringify({ text, image_id: imageId, pair_id: pairId, aoi_geometry: aoiGeometry }),
   });
 }
 
@@ -50,6 +53,11 @@ export async function getQuery(sessionId: string, queryId: string): Promise<Quer
 
 export async function listQueries(sessionId: string): Promise<QueryDetailData[]> {
   return apiRequest(`/sessions/${sessionId}/queries/`);
+}
+
+export function getExportUrl(sessionId: string, queryId: string, format: string): string {
+  const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+  return `${BASE_URL}/sessions/${sessionId}/queries/${queryId}/export/${format}/`;
 }
 
 export function subscribeToQueryStream(

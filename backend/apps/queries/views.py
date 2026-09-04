@@ -134,3 +134,83 @@ class QueryStreamView(views.APIView):
         response["Cache-Control"] = "no-cache"
         response["X-Accel-Buffering"] = "no"
         return response
+
+
+class QueryExportView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, session_id, query_id, export_format):
+        """
+        Exports query findings, evidence regions, or raster data in requested format:
+        'geojson', 'csv', 'json', 'png', 'geotiff'.
+        """
+        import csv
+        import io
+        from django.http import HttpResponse, FileResponse
+
+        query = get_object_or_404(Query, id=query_id, session_id=session_id)
+        fmt = export_format.lower().strip()
+
+        # 1. GeoJSON Export
+        if fmt == "geojson":
+            features = []
+            for r in query.evidence_regions.all():
+                features.append({
+                    "type": "Feature",
+                    "id": str(r.id),
+                    "geometry": r.geojson_geometry,
+                    "properties": {
+                        "class_name": r.class_name,
+                        "confidence": r.confidence,
+                        "area_m2": r.area_m2,
+                        "area_km2": r.area_km2,
+                        "area_ha": r.area_ha,
+                    }
+                })
+            geojson_data = {
+                "type": "FeatureCollection",
+                "query_id": str(query.id),
+                "query_text": query.text,
+                "answer": query.answer,
+                "confidence": query.confidence,
+                "features": features,
+            }
+            resp = HttpResponse(json.dumps(geojson_data, indent=2), content_type="application/geo+json")
+            resp["Content-Disposition"] = f'attachment; filename="satquery_evidence_{query.id}.geojson"'
+            return resp
+
+        # 2. CSV Export
+        elif fmt == "csv":
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["region_id", "class_name", "confidence", "area_m2", "area_km2", "area_ha", "centroid_or_bbox"])
+            for r in query.evidence_regions.all():
+                geom = r.geojson_geometry or {}
+                coords = str(geom.get("coordinates", []))[:60]
+                writer.writerow([str(r.id), r.class_name, r.confidence, r.area_m2, r.area_km2, r.area_ha, coords])
+            resp = HttpResponse(buf.getvalue(), content_type="text/csv")
+            resp["Content-Disposition"] = f'attachment; filename="satquery_measurements_{query.id}.csv"'
+            return resp
+
+        # 3. JSON Export (Full 10-Key Answer Contract)
+        elif fmt == "json":
+            contract = QueryDetailSerializer(query).data.get("answer_contract", {})
+            resp = HttpResponse(json.dumps(contract, indent=2), content_type="application/json")
+            resp["Content-Disposition"] = f'attachment; filename="satquery_answer_{query.id}.json"'
+            return resp
+
+        # 4. GeoTIFF / Raster Export
+        elif fmt in ("geotiff", "tif", "tiff"):
+            img = query.image or (query.image_pair.image_a if query.image_pair else None)
+            if img and img.file and os.path.exists(img.file.path):
+                return FileResponse(open(img.file.path, "rb"), content_type="image/tiff", as_attachment=True, filename=f"satquery_raster_{query.id}.tif")
+            return Response({"error": "No GeoTIFF available for this query."}, status=status.HTTP_404_NOT_FOUND)
+
+        # 5. PNG Preview Export
+        elif fmt == "png":
+            img = query.image or (query.image_pair.image_a if query.image_pair else None)
+            if img and img.preview_url and os.path.exists(img.preview_url.lstrip("/")):
+                return FileResponse(open(img.preview_url.lstrip("/"), "rb"), content_type="image/png", as_attachment=True, filename=f"satquery_preview_{query.id}.png")
+            return Response({"error": "No PNG preview available for this query."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({"error": f"Unsupported export format '{format}'. Supported: geojson, csv, json, geotiff, png."}, status=status.HTTP_400_BAD_REQUEST)

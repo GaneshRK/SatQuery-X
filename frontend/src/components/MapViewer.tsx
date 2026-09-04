@@ -3,28 +3,29 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   Layers,
-  Eye,
   Crosshair,
   ZoomIn,
   ZoomOut,
   Maximize2,
-  Compass,
   Sliders,
   MapPin,
-  Globe,
-  Sun,
-  Moon,
+  Square,
+  Sparkles,
+  Trash2,
+  Activity,
 } from 'lucide-react';
 import { RasterMetadata, EvidenceOutput } from '@/types';
 import * as maplibregl from 'maplibre-gl';
-import type { Map as MapLibreMap, GeoJSONSource } from 'maplibre-gl';
+import type { Map as MapLibreMap } from 'maplibre-gl';
 
 interface MapViewerProps {
   images: RasterMetadata[];
   evidence: EvidenceOutput | null;
+  onAskThisArea?: (aoi: any, promptText?: string) => void;
 }
 
 type BasemapType = 'satellite' | 'dark' | 'osm';
+type SpectralLayer = 'rgb' | 'false_color' | 'ndvi' | 'ndwi' | 'ndbi';
 
 const BASEMAP_STYLES: Record<BasemapType, any> = {
   satellite: {
@@ -74,28 +75,29 @@ const BASEMAP_STYLES: Record<BasemapType, any> = {
   },
 };
 
-export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
+export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence, onAskThisArea }) => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
 
   const [activeImageIndex, setActiveImageIndex] = useState(0);
   const [basemap, setBasemap] = useState<BasemapType>('satellite');
+  const [spectralLayer, setSpectralLayer] = useState<SpectralLayer>('rgb');
   const [rasterOpacity, setRasterOpacity] = useState(0.85);
   const [showEvidence, setShowEvidence] = useState(true);
   const [showRaster, setShowRaster] = useState(true);
   const [cursorCoords, setCursorCoords] = useState<{ lng: number; lat: number } | null>(null);
-  const [zoomLevel, setZoomLevel] = useState<number>(5);
+  const [zoomLevel, setZoomLevel] = useState<number>(9);
   const [selectedFeature, setSelectedFeature] = useState<any | null>(null);
+  const [activeAOI, setActiveAOI] = useState<any | null>(null);
+  const [aoiAreaHa, setAoiAreaHa] = useState<number | null>(null);
 
   const activeImage = images[activeImageIndex] || null;
-  const isBiTemporal = images.length >= 2;
 
   // Initialize MapLibre GL Map
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
 
-    // Initial center (defaults to India center or active raster center)
-    let initialCenter: [number, number] = [93.125, 26.625]; // Assam / Brahmaputra default
+    let initialCenter: [number, number] = [93.125, 26.625];
     let initialZoom = 9;
 
     if (activeImage?.bounds_wgs84) {
@@ -143,7 +145,6 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
     const map = mapRef.current;
     if (!map || !map.isStyleLoaded()) return;
 
-    // Remove existing raster layer & source if present
     if (map.getLayer('satquery-raster-layer')) {
       map.removeLayer('satquery-raster-layer');
     }
@@ -156,7 +157,6 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
     }
 
     const b = activeImage.bounds_wgs84;
-    // MapLibre Image Source expects coordinates: [top-left, top-right, bottom-right, bottom-left]
     const coordinates: [[number, number], [number, number], [number, number], [number, number]] = [
       [b.west, b.north],
       [b.east, b.north],
@@ -180,20 +180,16 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
           'raster-fade-duration': 150,
         },
       });
-
-      // Fit map to raster bounds on first load or image switch
-      map.fitBounds([b.west, b.south, b.east, b.north], { padding: 40, maxZoom: 14 });
     } catch (err) {
       console.warn('MapLibre raster layer warning:', err);
     }
-  }, [activeImage, showRaster, rasterOpacity]);
+  }, [activeImage, rasterOpacity, showRaster]);
 
-  // Update Evidence GeoJSON Polygons on Map
+  // Update Vector Evidence Layer on Map
   const updateEvidenceLayer = useCallback(() => {
     const map = mapRef.current;
     if (!map || !map.isStyleLoaded()) return;
 
-    // Remove existing layers
     if (map.getLayer('evidence-fill-layer')) map.removeLayer('evidence-fill-layer');
     if (map.getLayer('evidence-stroke-layer')) map.removeLayer('evidence-stroke-layer');
     if (map.getSource('satquery-evidence-source')) map.removeSource('satquery-evidence-source');
@@ -208,7 +204,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
       geometry: geom.type ? geom : { type: 'Polygon', coordinates: geom.coordinates || geom },
       properties: {
         id: idx + 1,
-        class_name: 'Flood Inundation Zone',
+        class_name: 'Identified Feature',
         area_km2: evidence.quantified_area_km2 || 0,
       },
     }));
@@ -227,7 +223,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
         type: 'fill',
         source: 'satquery-evidence-source',
         paint: {
-          'fill-color': '#06b6d4', // Cyan
+          'fill-color': '#06b6d4',
           'fill-opacity': 0.45,
         },
       });
@@ -237,7 +233,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
         type: 'line',
         source: 'satquery-evidence-source',
         paint: {
-          'line-color': '#22d3ee', // Bright Cyan Stroke
+          'line-color': '#22d3ee',
           'line-width': 2.5,
           'line-dasharray': [2, 1],
         },
@@ -253,6 +249,52 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
     }
   }, [evidence, showEvidence]);
 
+  // Update AOI Layer on Map
+  const updateAOILayer = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded()) return;
+
+    if (map.getLayer('aoi-fill-layer')) map.removeLayer('aoi-fill-layer');
+    if (map.getLayer('aoi-stroke-layer')) map.removeLayer('aoi-stroke-layer');
+    if (map.getSource('aoi-source')) map.removeSource('aoi-source');
+
+    if (!activeAOI) return;
+
+    try {
+      map.addSource('aoi-source', {
+        type: 'geojson',
+        data: {
+          type: 'Feature',
+          geometry: activeAOI,
+          properties: {},
+        },
+      });
+
+      map.addLayer({
+        id: 'aoi-fill-layer',
+        type: 'fill',
+        source: 'aoi-source',
+        paint: {
+          'fill-color': '#38bdf8',
+          'fill-opacity': 0.2,
+        },
+      });
+
+      map.addLayer({
+        id: 'aoi-stroke-layer',
+        type: 'line',
+        source: 'aoi-source',
+        paint: {
+          'line-color': '#38bdf8',
+          'line-width': 2.5,
+          'line-dasharray': [3, 2],
+        },
+      });
+    } catch (err) {
+      console.warn('MapLibre AOI layer warning:', err);
+    }
+  }, [activeAOI]);
+
   // Synchronize layers when map style loads
   useEffect(() => {
     const map = mapRef.current;
@@ -261,15 +303,17 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
     if (map.isStyleLoaded()) {
       updateRasterLayer();
       updateEvidenceLayer();
+      updateAOILayer();
     } else {
       map.once('style.load', () => {
         updateRasterLayer();
         updateEvidenceLayer();
+        updateAOILayer();
       });
     }
-  }, [updateRasterLayer, updateEvidenceLayer]);
+  }, [updateRasterLayer, updateEvidenceLayer, updateAOILayer]);
 
-  // Adjust raster opacity live without reloading source
+  // Adjust raster opacity live
   useEffect(() => {
     const map = mapRef.current;
     if (map && map.getLayer('satquery-raster-layer')) {
@@ -283,6 +327,40 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
     if (activeImage?.bounds_wgs84 && mapRef.current) {
       const b = activeImage.bounds_wgs84;
       mapRef.current.fitBounds([b.west, b.south, b.east, b.north], { padding: 50 });
+    }
+  };
+
+  // Tool: Drop 5km AOI around center
+  const handleDropCenterAOI = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const center = map.getCenter();
+    const dLat = 0.022; // ~2.5 km
+    const dLng = 0.025; // ~2.5 km
+    const poly = {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [center.lng - dLng, center.lat - dLat],
+          [center.lng + dLng, center.lat - dLat],
+          [center.lng + dLng, center.lat + dLat],
+          [center.lng - dLng, center.lat + dLat],
+          [center.lng - dLng, center.lat - dLat],
+        ],
+      ],
+    };
+    setActiveAOI(poly);
+    setAoiAreaHa(2500); // 25 km2 = 2500 hectares
+  };
+
+  const handleClearAOI = () => {
+    setActiveAOI(null);
+    setAoiAreaHa(null);
+  };
+
+  const handleAskThisAreaClick = () => {
+    if (activeAOI && onAskThisArea) {
+      onAskThisArea(activeAOI, 'Analyze what is happening in this designated Area of Interest.');
     }
   };
 
@@ -336,6 +414,31 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
         </div>
 
         <div className="h-4 w-px bg-slate-800 mx-1" />
+
+        {/* AOI Drawing Buttons */}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={handleDropCenterAOI}
+            className={`px-2.5 py-1 text-xs font-mono rounded-md transition-all flex items-center gap-1.5 ${
+              activeAOI
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/50'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800'
+            }`}
+            title="Designate Area of Interest (AOI)"
+          >
+            <Square className="w-3.5 h-3.5" />
+            <span>{activeAOI ? 'AOI Active' : 'Draw AOI'}</span>
+          </button>
+          {activeAOI && (
+            <button
+              onClick={handleClearAOI}
+              className="p-1 text-rose-400 hover:bg-rose-500/20 rounded transition-colors"
+              title="Clear AOI"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
 
         {/* Evidence Toggle */}
         {evidence?.geojson && evidence.geojson.length > 0 && (
@@ -404,6 +507,23 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence }) => {
           </button>
         </div>
       </div>
+
+      {/* "ASK THIS AREA" Floating Action Banner when AOI is designated */}
+      {activeAOI && (
+        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-30 flex items-center gap-3 bg-slate-900/95 backdrop-blur-md px-4 py-2 rounded-xl border border-cyan-500 shadow-2xl animate-in fade-in slide-in-from-bottom-4">
+          <div className="flex items-center gap-2 text-xs font-mono text-cyan-300">
+            <Activity className="w-4 h-4 text-cyan-400 animate-pulse" />
+            <span>AOI: ~25.0 km² (2,500 ha)</span>
+          </div>
+          <button
+            onClick={handleAskThisAreaClick}
+            className="px-3.5 py-1.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white text-xs font-medium rounded-lg shadow-lg flex items-center gap-1.5 transition-all"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>Ask This Area</span>
+          </button>
+        </div>
+      )}
 
       {/* MapLibre GL WebGL Map Container */}
       <div ref={mapContainerRef} className="w-full flex-1" />

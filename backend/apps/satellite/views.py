@@ -97,49 +97,28 @@ class CandidateSelectView(views.APIView):
         stac_item_id = request.data.get("stac_item_id")
         candidate = get_object_or_404(AcquisitionCandidate, request=acq_req, stac_item_id=stac_item_id)
 
-        candidate.selected = True
-        candidate.save()
-        acq_req.status = "INGESTED"
-        acq_req.save()
+        from apps.satellite.tasks import ingest_satellite_candidate_task
 
-        # Check if asset already exists or create simulated asset for the scene
-        sensor_type = "SENTINEL-2" if "S2" in stac_item_id else "SENTINEL-1"
-        modality_type = "MULTISPECTRAL" if sensor_type == "SENTINEL-2" else "SAR"
+        # Attempt async Celery task execution with immediate sync fallback
+        task_dispatched = False
+        try:
+            task = ingest_satellite_candidate_task.delay(str(candidate.id), str(request.user.id))
+            task_id = task.id
+            task_dispatched = True
+        except Exception:
+            # Synchronous fallback if Celery/Redis is not running
+            res = ingest_satellite_candidate_task(str(candidate.id), str(request.user.id))
+            task_id = "sync_completed"
 
-        created_asset, _ = ImageAsset.objects.get_or_create(
-            session=acq_req.session,
-            original_filename=f"{stac_item_id}.tif",
-            defaults={
-                "sensor": sensor_type,
-                "modality": modality_type,
-                "file_format": "GEOTIFF",
-                "width": 512,
-                "height": 512,
-                "band_count": 4 if sensor_type == "SENTINEL-2" else 2,
-                "crs": "EPSG:4326",
-                "affine_transform": [0.00048828125, 0.0, 93.00, 0.0, -0.00048828125, 26.75],
-                "bounds_wgs84": {"west": 93.00, "south": 26.50, "east": 93.25, "north": 26.75},
-                "resolution_m": 10.0,
-                "is_georeferenced": True,
-                "processing_status": "VALIDATED",
-                "preview_url": f"/media/previews/preview_pre_{acq_req.session.id}.png",
-                "provenance": {
-                    "source": "Copernicus Data Space Ecosystem",
-                    "stac_item_id": stac_item_id,
-                    "collection": candidate.collection,
-                    "cloud_cover": candidate.cloud_cover_pct,
-                },
-            }
-        )
-
-        log_audit_event(
-            request.user, "SELECT_SATELLITE_SCENE", "AcquisitionCandidate", str(candidate.id),
-            {"stac_item_id": stac_item_id, "request_id": str(acq_req.id), "asset_id": str(created_asset.id)}
-        )
+        # Refresh candidate to check if already completed
+        candidate.refresh_from_db()
+        asset = candidate.retrieved_image
 
         return Response({
-            "status": "INGESTED",
+            "status": "PROCESSING" if task_dispatched and not asset else "DONE",
+            "task_id": task_id,
             "stac_item_id": stac_item_id,
-            "asset_id": str(created_asset.id),
-            "asset_name": created_asset.original_filename,
+            "candidate_id": str(candidate.id),
+            "asset_id": str(asset.id) if asset else None,
+            "asset_name": asset.original_filename if asset else None,
         }, status=status.HTTP_202_ACCEPTED)

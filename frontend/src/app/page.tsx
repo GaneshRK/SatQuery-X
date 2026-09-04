@@ -136,6 +136,12 @@ export default function DashboardPage() {
     }
   };
 
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+
+  const handleAskThisArea = (aoi: any, promptText?: string) => {
+    setPendingPrompt(promptText || 'Analyze what is happening in this designated Area of Interest.');
+  };
+
   const handleQueryExecuted = (trace: ExecutionTrace) => {
     setCurrentTrace(trace);
   };
@@ -158,13 +164,19 @@ export default function DashboardPage() {
         {/* Left / Center Section: Map & Chat (7 Cols) */}
         <div className="lg:col-span-7 flex flex-col gap-6">
           <div className="h-[520px] w-full">
-            <MapViewer images={images} evidence={currentTrace?.evidence || null} />
+            <MapViewer
+              images={images}
+              evidence={currentTrace?.evidence || null}
+              onAskThisArea={handleAskThisArea}
+            />
           </div>
 
           <ChatConsole
             sessionId={sessionId}
             detectedMode={detectedMode}
             hasImages={images.length > 0}
+            pendingPrompt={pendingPrompt}
+            onClearPendingPrompt={() => setPendingPrompt(null)}
             onQueryExecuted={handleQueryExecuted}
           />
         </div>

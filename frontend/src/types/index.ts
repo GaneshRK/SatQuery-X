@@ -42,6 +42,26 @@ export interface EvidenceOutput {
   before_after_thumbnails?: string[];
 }
 
+export interface AnswerContract {
+  answer: string;
+  confidence: number;
+  findings: string[];
+  measurements: Array<{ metric: string; value: number | string; unit?: string }>;
+  regions: any[];
+  evidence: any[];
+  sources: any[];
+  models: string[];
+  methods: string[];
+  limitations: string[];
+}
+
+export interface AOIGeometry {
+  type: string;
+  coordinates: any;
+  bbox?: { west: number; south: number; east: number; north: number };
+  area_ha?: number;
+}
+
 export interface ExecutionTrace {
   query_id: string;
   session_id: string;
@@ -53,6 +73,7 @@ export interface ExecutionTrace {
   outputs: Record<string, any>;
   answer: string;
   confidence: number;
+  answer_contract?: AnswerContract;
   evidence: EvidenceOutput;
   timings_ms: Record<string, number>;
   errors: string[];
