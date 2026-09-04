@@ -48,6 +48,10 @@ export async function getQuery(sessionId: string, queryId: string): Promise<Quer
   return apiRequest(`/sessions/${sessionId}/queries/${queryId}/`);
 }
 
+export async function listQueries(sessionId: string): Promise<QueryDetailData[]> {
+  return apiRequest(`/sessions/${sessionId}/queries/`);
+}
+
 export function subscribeToQueryStream(
   sessionId: string,
   queryId: string,

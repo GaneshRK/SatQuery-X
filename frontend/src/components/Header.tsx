@@ -1,14 +1,19 @@
 'use client';
 
 import React from 'react';
-import { Satellite, ShieldCheck, Activity, Layers, Terminal, FileText } from 'lucide-react';
+import { Satellite, ShieldCheck, Activity, Layers, Terminal, FileText, ChevronDown, Plus } from 'lucide-react';
 import { InputMode } from '@/types';
+import { SessionData } from '@/services/sessions';
 
 interface HeaderProps {
   detectedMode: InputMode | null;
   onOpenUpload: () => void;
   onOpenReport: () => void;
   hasTrace: boolean;
+  sessions?: SessionData[];
+  activeSessionId?: string;
+  onSelectSession?: (id: string) => void;
+  onNewSession?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -16,6 +21,10 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenUpload,
   onOpenReport,
   hasTrace,
+  sessions = [],
+  activeSessionId,
+  onSelectSession,
+  onNewSession,
 }) => {
   const getModeBadge = () => {
     switch (detectedMode) {
@@ -34,17 +43,49 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="h-16 border-b border-border bg-surface/80 backdrop-blur-md px-6 flex items-center justify-between sticky top-0 z-40">
-      <div className="flex items-center gap-3">
-        <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
-          <Satellite className="w-5 h-5 text-white" />
-        </div>
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-lg tracking-tight text-white">SatQuery-X</span>
-            <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 border border-blue-700/50">SIH26167</span>
+      <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
+            <Satellite className="w-5 h-5 text-white" />
           </div>
-          <p className="text-xs text-slate-400 font-mono">Agentic Multimodal Satellite Reasoning Engine</p>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-lg tracking-tight text-white">SatQuery-X</span>
+              <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 border border-blue-700/50">SIH26167</span>
+            </div>
+            <p className="text-xs text-slate-400 font-mono">Agentic Multimodal Satellite Reasoning Engine</p>
+          </div>
         </div>
+
+        {/* Session Selector */}
+        {sessions.length > 0 && onSelectSession && (
+          <div className="hidden lg:flex items-center gap-2 ml-4 pl-4 border-l border-slate-800">
+            <div className="relative">
+              <select
+                value={activeSessionId || ''}
+                onChange={(e) => onSelectSession(e.target.value)}
+                className="bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded-lg px-3 py-1.5 pr-8 appearance-none focus:outline-none focus:border-blue-500 max-w-[280px] truncate"
+              >
+                {sessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            </div>
+
+            {onNewSession && (
+              <button
+                onClick={onNewSession}
+                title="Create New Session"
+                className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 transition-all"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex items-center gap-4">
@@ -72,7 +113,7 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         )}
 
-        <div className="hidden lg:flex items-center gap-1.5 text-xs text-emerald-400 font-mono bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-800/40">
+        <div className="hidden xl:flex items-center gap-1.5 text-xs text-emerald-400 font-mono bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-800/40">
           <ShieldCheck className="w-3.5 h-3.5" />
           <span>ISRO Evaluator Verified</span>
         </div>
