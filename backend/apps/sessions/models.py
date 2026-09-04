@@ -23,6 +23,9 @@ class Session(models.Model):
     name = models.CharField(max_length=255, default="Untitled Session")
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="active")
     conversation_history = models.JSONField(default=list, blank=True)
+    conversation_context = models.JSONField(
+        default=dict, blank=True, help_text="Multi-turn conversational Earth analyst context state"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

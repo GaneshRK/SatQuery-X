@@ -36,6 +36,8 @@ export interface QueryDetailData {
   follow_up_questions?: string[];
   evidence_graph?: any;
   external_evidence?: any[];
+  ui_actions?: any[];
+  clarification?: any;
 }
 
 export async function submitQuery(
@@ -43,11 +45,18 @@ export async function submitQuery(
   text: string,
   imageId?: string,
   pairId?: string,
-  aoiGeometry?: any
+  aoiGeometry?: any,
+  visualContext?: any
 ): Promise<{ query_id: string; status: string; plan: any }> {
   return apiRequest(`/sessions/${sessionId}/queries/`, {
     method: "POST",
-    body: JSON.stringify({ text, image_id: imageId, pair_id: pairId, aoi_geometry: aoiGeometry }),
+    body: JSON.stringify({
+      text,
+      image_id: imageId,
+      pair_id: pairId,
+      aoi_geometry: aoiGeometry,
+      visual_context: visualContext,
+    }),
   });
 }
 

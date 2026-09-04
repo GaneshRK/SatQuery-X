@@ -27,6 +27,9 @@ class QueryDetailSerializer(serializers.ModelSerializer):
     external_evidence = ExternalEvidenceSerializer(many=True, read_only=True)
     answer_contract = serializers.SerializerMethodField()
 
+    ui_actions = serializers.SerializerMethodField()
+    clarification = serializers.SerializerMethodField()
+
     class Meta:
         model = Query
         fields = (
@@ -45,6 +48,8 @@ class QueryDetailSerializer(serializers.ModelSerializer):
             "answer",
             "confidence",
             "answer_contract",
+            "ui_actions",
+            "clarification",
             "error",
             "created_at",
             "completed_at",
@@ -52,6 +57,18 @@ class QueryDetailSerializer(serializers.ModelSerializer):
             "evidence_regions",
             "external_evidence",
         )
+
+    def get_ui_actions(self, obj: Query) -> list:
+        return (obj.structured_plan or {}).get("ui_actions", [])
+
+    def get_clarification(self, obj: Query) -> dict | None:
+        prompt = (obj.structured_plan or {}).get("clarification_prompt")
+        if prompt:
+            return {
+                "prompt": prompt,
+                "options": (obj.structured_plan or {}).get("clarification_options", []),
+            }
+        return None
 
     def get_answer_contract(self, obj: Query) -> dict:
         """
@@ -187,4 +204,6 @@ class QueryDetailSerializer(serializers.ModelSerializer):
             "models": list(set(models_used)),
             "methods": list(set(methods_used)),
             "limitations": limitations,
+            "actions": self.get_ui_actions(obj),
+            "clarification": self.get_clarification(obj),
         }

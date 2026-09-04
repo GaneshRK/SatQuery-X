@@ -10,11 +10,14 @@ import { ExecutionTraceTimeline } from '@/components/ExecutionTraceTimeline';
 import { EvidenceDrawer } from '@/components/EvidenceDrawer';
 import { ReportModal } from '@/components/ReportModal';
 import { SatelliteSearchModal } from '@/components/SatelliteSearchModal';
-import { RasterMetadata, ExecutionTrace, InputMode } from '@/types';
+import { ContextBar } from '@/components/ContextBar';
+import { ClickToExplainModal, ExplainFeatureData } from '@/components/ClickToExplainModal';
+import { RasterMetadata, ExecutionTrace, InputMode, ConversationContext, UIAction } from '@/types';
 import { login } from '@/services/auth';
 import { listSessions, createSession, SessionData } from '@/services/sessions';
 import { listImages } from '@/services/images';
 import { listQueries } from '@/services/queries';
+import { getSessionContext, resetSessionContext } from '@/services/context';
 import { Globe, Compass } from 'lucide-react';
 
 export default function DashboardPage() {
@@ -29,10 +32,25 @@ export default function DashboardPage() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [viewMode, setViewMode] = useState<'3d_earth' | '2d_gis'>('3d_earth');
 
+  // Multi-turn interaction states
+  const [conversationContext, setConversationContext] = useState<ConversationContext | null>(null);
+  const [selectedFeatureForExplain, setSelectedFeatureForExplain] = useState<ExplainFeatureData | null>(null);
+  const [isExplainModalOpen, setIsExplainModalOpen] = useState(false);
+  const [isExpertMode, setIsExpertMode] = useState(false);
+  const [uiActions, setUiActions] = useState<UIAction[]>([]);
+
   // Helper to load all assets and queries for a given session
   const loadSessionData = useCallback(async (sid: string) => {
     try {
       setSessionId(sid);
+
+      // Fetch conversation memory context
+      try {
+        const ctxRes = await getSessionContext(sid);
+        setConversationContext(ctxRes.conversation_context);
+      } catch (ctxErr) {
+        console.warn('Could not load session conversation context:', ctxErr);
+      }
 
       // 1. Fetch images for session
       const assets = await listImages(sid);
@@ -145,8 +163,27 @@ export default function DashboardPage() {
     setPendingPrompt(promptText || 'Analyze what is happening in this designated Area of Interest.');
   };
 
+  const handleResetContext = async () => {
+    if (!sessionId) return;
+    try {
+      const res = await resetSessionContext(sessionId);
+      setConversationContext(res.conversation_context);
+    } catch (err) {
+      console.error('Failed to reset conversation context:', err);
+    }
+  };
+
   const handleQueryExecuted = (trace: ExecutionTrace) => {
     setCurrentTrace(trace);
+    if (trace.ui_actions && trace.ui_actions.length > 0) {
+      setUiActions(trace.ui_actions);
+    }
+    // Refresh conversation context memory
+    if (sessionId) {
+      getSessionContext(sessionId)
+        .then((res) => setConversationContext(res.conversation_context))
+        .catch((err) => console.warn('Could not refresh conversation context:', err));
+    }
   };
 
   return (
@@ -165,7 +202,16 @@ export default function DashboardPage() {
 
       <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-[1800px] w-full mx-auto">
         {/* Left / Center Section: Map & Chat (7 Cols) */}
-        <div className="lg:col-span-7 flex flex-col gap-6">
+        <div className="lg:col-span-7 flex flex-col gap-5">
+          {/* Multi-Turn AI Conversation Context Bar */}
+          <ContextBar
+            context={conversationContext}
+            onResetContext={handleResetContext}
+            onSelectPrompt={(prompt) => setPendingPrompt(prompt)}
+            isExpertMode={isExpertMode}
+            onToggleExpertMode={(expert) => setIsExpertMode(expert)}
+          />
+
           {/* Earth Observatory & 2D Scientific View Switcher */}
           <div className="flex items-center justify-between bg-[#0b1322] border border-slate-800 px-4 py-2.5 rounded-xl">
             <div className="flex items-center gap-2">
@@ -212,6 +258,11 @@ export default function DashboardPage() {
                 images={images}
                 evidence={currentTrace?.evidence || null}
                 onAskThisArea={handleAskThisArea}
+                onExplainFeature={(feature) => {
+                  setSelectedFeatureForExplain(feature);
+                  setIsExplainModalOpen(true);
+                }}
+                uiActions={uiActions}
               />
             )}
           </div>
@@ -257,6 +308,13 @@ export default function DashboardPage() {
         onClose={() => setIsReportOpen(false)}
         sessionId={sessionId}
         trace={currentTrace}
+      />
+
+      <ClickToExplainModal
+        isOpen={isExplainModalOpen}
+        onClose={() => setIsExplainModalOpen(false)}
+        feature={selectedFeatureForExplain}
+        onAskFollowUp={(prompt) => setPendingPrompt(prompt)}
       />
     </div>
   );

@@ -20,6 +20,9 @@ import {
   FileText,
   AlertTriangle,
   Globe,
+  Mic,
+  MicOff,
+  HelpCircle,
 } from 'lucide-react';
 import { ExecutionTrace, InputMode } from '@/types';
 import { submitQuery, listQueries, QueryDetailData, getExportUrl } from '@/services/queries';
@@ -83,6 +86,8 @@ export function formatQueryToTrace(queryData: QueryDetailData, sessionId: string
     follow_up_questions: queryData.follow_up_questions,
     evidence_graph: queryData.evidence_graph,
     external_evidence: queryData.external_evidence,
+    ui_actions: queryData.ui_actions,
+    clarification: queryData.clarification,
     timings_ms: timings,
     errors: queryData.status === 'FAILED' ? ['Execution error occurred.'] : [],
     created_at: new Date().toISOString(),
@@ -103,7 +108,59 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [queriesHistory, setQueriesHistory] = useState<QueryDetailData[]>([]);
   const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const toggleVoiceInput = () => {
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      alert('Speech Recognition is not supported by this browser. Please use Chrome, Edge, or Safari.');
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        setIsListening(true);
+      };
+
+      recognition.onresult = (event: any) => {
+        const transcript = event.results[0][0].transcript;
+        if (transcript) {
+          setQueryText((prev) => (prev ? `${prev} ${transcript}` : transcript));
+        }
+        setIsListening(false);
+      };
+
+      recognition.onerror = (event: any) => {
+        console.warn('Speech recognition error:', event.error);
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (err) {
+      console.error('Failed to start speech recognition:', err);
+      setIsListening(false);
+    }
+  };
 
   // Auto-fill and execute when pendingPrompt arrives from "Ask This Area"
   useEffect(() => {
@@ -314,6 +371,34 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
                   <div className="text-slate-200 leading-relaxed font-sans text-xs whitespace-pre-wrap">
                     {q.answer || 'Query processed successfully.'}
                   </div>
+
+                  {/* Ambiguity Clarification Options */}
+                  {q.clarification && q.clarification.clarification_prompt && (
+                    <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-800/50 space-y-2 mt-1">
+                      <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-300 font-mono">
+                        <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Clarification Requested</span>
+                      </div>
+                      <p className="text-xs text-amber-200/90 leading-relaxed">
+                        {q.clarification.clarification_prompt}
+                      </p>
+                      {q.clarification.clarification_options && q.clarification.clarification_options.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          {q.clarification.clarification_options.map((opt: any, optIdx: number) => (
+                            <button
+                              key={optIdx}
+                              type="button"
+                              onClick={() => handleSend(opt.query || opt.label)}
+                              className="px-2.5 py-1 bg-amber-900/40 hover:bg-amber-800/60 border border-amber-700/60 text-amber-200 rounded-lg text-xs font-mono transition-all flex items-center gap-1.5 hover:scale-105 active:scale-95 shadow-xs"
+                            >
+                              <Sparkles className="w-3 h-3 text-amber-300" />
+                              <span>{opt.label}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Structured Measurements from Answer Contract */}
                   {contract?.measurements && contract.measurements.length > 0 && (
@@ -538,6 +623,20 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
               </div>
             )}
           </div>
+
+          <button
+            type="button"
+            onClick={toggleVoiceInput}
+            disabled={loading || !hasImages}
+            className={`p-2.5 rounded-lg border transition-all flex items-center justify-center ${
+              isListening
+                ? 'bg-red-950 text-red-400 border-red-500 animate-pulse ring-2 ring-red-500/50'
+                : 'bg-slate-900 text-slate-400 hover:text-slate-200 hover:bg-slate-800 border-slate-800'
+            }`}
+            title={isListening ? 'Listening... click to stop' : 'Voice Input (Speech-to-Text)'}
+          >
+            {isListening ? <MicOff className="w-4 h-4 text-red-400" /> : <Mic className="w-4 h-4" />}
+          </button>
 
           <button
             type="submit"

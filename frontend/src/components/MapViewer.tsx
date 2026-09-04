@@ -14,7 +14,8 @@ import {
   Trash2,
   Activity,
 } from 'lucide-react';
-import { RasterMetadata, EvidenceOutput } from '@/types';
+import { RasterMetadata, EvidenceOutput, UIAction } from '@/types';
+import { ExplainFeatureData } from './ClickToExplainModal';
 import * as maplibregl from 'maplibre-gl';
 import type { Map as MapLibreMap } from 'maplibre-gl';
 
@@ -22,6 +23,8 @@ interface MapViewerProps {
   images: RasterMetadata[];
   evidence: EvidenceOutput | null;
   onAskThisArea?: (aoi: any, promptText?: string) => void;
+  onExplainFeature?: (feature: ExplainFeatureData) => void;
+  uiActions?: UIAction[];
 }
 
 type BasemapType = 'satellite' | 'dark' | 'osm';
@@ -75,7 +78,13 @@ const BASEMAP_STYLES: Record<BasemapType, any> = {
   },
 };
 
-export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence, onAskThisArea }) => {
+export const MapViewer: React.FC<MapViewerProps> = ({
+  images,
+  evidence,
+  onAskThisArea,
+  onExplainFeature,
+  uiActions,
+}) => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
 
@@ -91,7 +100,45 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence, onAskThi
   const [activeAOI, setActiveAOI] = useState<any | null>(null);
   const [aoiAreaHa, setAoiAreaHa] = useState<number | null>(null);
 
+  // Point-and-Ask Popover state
+  const [pointPromptCoord, setPointPromptCoord] = useState<{
+    lng: number;
+    lat: number;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Hover Intelligence state
+  const [hoveredFeature, setHoveredFeature] = useState<{
+    class_name: string;
+    confidence?: number;
+    area_km2?: number;
+    x: number;
+    y: number;
+  } | null>(null);
+
   const activeImage = images[activeImageIndex] || null;
+
+  // Handle UI Actions dispatched by assistant
+  useEffect(() => {
+    if (!uiActions || uiActions.length === 0 || !mapRef.current) return;
+
+    for (const action of uiActions) {
+      if (action.action === 'ZOOM_TO_REGION') {
+        const { bbox, coordinates } = action.parameters || {};
+        if (bbox && bbox.length === 4) {
+          mapRef.current.fitBounds([bbox[0], bbox[1], bbox[2], bbox[3]], { padding: 60, speed: 1.2 });
+        } else if (coordinates && coordinates.length === 2) {
+          mapRef.current.flyTo({ center: [coordinates[0], coordinates[1]], zoom: 12, speed: 1.2 });
+        }
+      } else if (action.action === 'SHOW_LAYER') {
+        const layerName = (action.parameters?.layer || '').toLowerCase();
+        if (layerName.includes('dark')) setBasemap('dark');
+        else if (layerName.includes('osm')) setBasemap('osm');
+        else if (layerName.includes('sat')) setBasemap('satellite');
+      }
+    }
+  }, [uiActions]);
 
   // Initialize MapLibre GL Map
   useEffect(() => {
@@ -118,6 +165,25 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence, onAskThi
       setCursorCoords({
         lng: Number(e.lngLat.lng.toFixed(5)),
         lat: Number(e.lngLat.lat.toFixed(5)),
+      });
+    });
+
+    // Map click for Point-and-Ask
+    map.on('click', (e) => {
+      // Check if evidence fill layer was clicked
+      const features = map.queryRenderedFeatures(e.point, {
+        layers: map.getLayer('evidence-fill-layer') ? ['evidence-fill-layer'] : [],
+      });
+      if (features && features.length > 0) {
+        // Handled by evidence click
+        return;
+      }
+
+      setPointPromptCoord({
+        lng: Number(e.lngLat.lng.toFixed(5)),
+        lat: Number(e.lngLat.lat.toFixed(5)),
+        x: e.point.x,
+        y: e.point.y,
       });
     });
 
@@ -239,15 +305,48 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence, onAskThi
         },
       });
 
+      map.on('mouseenter', 'evidence-fill-layer', () => {
+        map.getCanvas().style.cursor = 'pointer';
+      });
+
+      map.on('mousemove', 'evidence-fill-layer', (e) => {
+        if (e.features && e.features[0]) {
+          const props = e.features[0].properties || {};
+          setHoveredFeature({
+            class_name: props.class_name || 'Detected Feature',
+            confidence: props.confidence ? Number(props.confidence) : 0.92,
+            area_km2: props.area_km2 ? Number(props.area_km2) : evidence.quantified_area_km2 || undefined,
+            x: e.point.x,
+            y: e.point.y,
+          });
+        }
+      });
+
+      map.on('mouseleave', 'evidence-fill-layer', () => {
+        map.getCanvas().style.cursor = '';
+        setHoveredFeature(null);
+      });
+
       map.on('click', 'evidence-fill-layer', (e) => {
         if (e.features && e.features[0]) {
-          setSelectedFeature(e.features[0].properties);
+          const props = e.features[0].properties || {};
+          setSelectedFeature(props);
+          if (onExplainFeature) {
+            onExplainFeature({
+              id: props.id ? String(props.id) : undefined,
+              class_name: props.class_name || 'Detected Feature',
+              confidence: props.confidence ? Number(props.confidence) : 0.92,
+              area_km2: props.area_km2 ? Number(props.area_km2) : evidence.quantified_area_km2 || undefined,
+              area_ha: props.area_km2 ? Number(props.area_km2) * 100 : (evidence.quantified_area_hectares || undefined),
+              centroid: [Number(e.lngLat.lng.toFixed(5)), Number(e.lngLat.lat.toFixed(5))],
+            });
+          }
         }
       });
     } catch (err) {
       console.warn('MapLibre evidence layer warning:', err);
     }
-  }, [evidence, showEvidence]);
+  }, [evidence, showEvidence, onExplainFeature]);
 
   // Update AOI Layer on Map
   const updateAOILayer = useCallback(() => {
@@ -528,25 +627,97 @@ export const MapViewer: React.FC<MapViewerProps> = ({ images, evidence, onAskThi
       {/* MapLibre GL WebGL Map Container */}
       <div ref={mapContainerRef} className="w-full flex-1" />
 
-      {/* Feature Inspector Tooltip when clicking a GeoJSON polygon */}
-      {selectedFeature && (
-        <div className="absolute bottom-12 left-4 z-20 bg-slate-900/95 backdrop-blur-md p-3 rounded-lg border border-cyan-500/40 text-xs font-mono shadow-2xl space-y-1">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-cyan-400 font-bold flex items-center gap-1.5">
+      {/* Hover Intelligence Tooltip */}
+      {hoveredFeature && (
+        <div
+          className="pointer-events-none absolute z-40 bg-slate-950/90 backdrop-blur-md border border-cyan-500/60 rounded-lg p-2.5 shadow-xl text-xs font-mono text-slate-200"
+          style={{
+            left: Math.min(hoveredFeature.x + 15, (mapContainerRef.current?.clientWidth || 500) - 200),
+            top: Math.max(hoveredFeature.y - 45, 20),
+          }}
+        >
+          <div className="flex items-center gap-1.5 text-cyan-300 font-bold capitalize">
+            <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+            <span>{hoveredFeature.class_name.replace(/_/g, ' ')}</span>
+          </div>
+          <div className="flex items-center gap-3 mt-1 text-[11px] text-slate-400">
+            {hoveredFeature.confidence && (
+              <span>
+                Conf: <strong className="text-emerald-400">{(hoveredFeature.confidence * 100).toFixed(1)}%</strong>
+              </span>
+            )}
+            {hoveredFeature.area_km2 && (
+              <span>
+                Area: <strong className="text-cyan-400">{hoveredFeature.area_km2.toFixed(2)} km²</strong>
+              </span>
+            )}
+          </div>
+          <div className="text-[10px] text-slate-500 mt-0.5">Click polygon to inspect full explanation</div>
+        </div>
+      )}
+
+      {/* Point & Ask Popover */}
+      {pointPromptCoord && (
+        <div
+          className="absolute z-40 bg-slate-900/95 backdrop-blur-md border border-cyan-500/70 rounded-xl p-3 shadow-2xl text-xs text-slate-200 animate-in fade-in zoom-in-95 duration-150 w-64"
+          style={{
+            left: Math.min(Math.max(pointPromptCoord.x - 120, 20), (mapContainerRef.current?.clientWidth || 600) - 270),
+            top: Math.min(Math.max(pointPromptCoord.y - 140, 20), (mapContainerRef.current?.clientHeight || 500) - 180),
+          }}
+        >
+          <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800">
+            <div className="flex items-center gap-1.5 text-cyan-400 font-mono font-semibold">
               <MapPin className="w-3.5 h-3.5" />
-              {selectedFeature.class_name || 'Evidence Polygon'}
-            </span>
+              <span>Point & Ask</span>
+            </div>
             <button
-              onClick={() => setSelectedFeature(null)}
-              className="text-slate-500 hover:text-white text-xs"
+              onClick={() => setPointPromptCoord(null)}
+              className="text-slate-500 hover:text-slate-300 text-xs px-1"
             >
               &times;
             </button>
           </div>
-          <p className="text-slate-300">
-            Metric Area: <strong className="text-white">{selectedFeature.area_km2} km²</strong>
-          </p>
-          <p className="text-slate-500 text-[10px]">CRS Grounded: EPSG:4326 &bull; Geodesic Reprojection</p>
+          <div className="text-[10px] font-mono text-slate-400 mt-1 mb-2">
+            [{pointPromptCoord.lat}°N, {pointPromptCoord.lng}°E]
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <button
+              onClick={() => {
+                onAskThisArea?.(
+                  { center: [pointPromptCoord.lng, pointPromptCoord.lat], point: true },
+                  `What features and land-cover are located at coordinates [${pointPromptCoord.lat}°N, ${pointPromptCoord.lng}°E]?`
+                );
+                setPointPromptCoord(null);
+              }}
+              className="px-2.5 py-1.5 bg-slate-800/90 hover:bg-cyan-950/70 hover:border-cyan-700/60 border border-slate-700/60 rounded-md text-left text-slate-200 transition-colors"
+            >
+              🔍 What is here?
+            </button>
+            <button
+              onClick={() => {
+                onAskThisArea?.(
+                  { center: [pointPromptCoord.lng, pointPromptCoord.lat], point: true },
+                  `Has this specific area changed compared to earlier satellite passes?`
+                );
+                setPointPromptCoord(null);
+              }}
+              className="px-2.5 py-1.5 bg-slate-800/90 hover:bg-cyan-950/70 hover:border-cyan-700/60 border border-slate-700/60 rounded-md text-left text-slate-200 transition-colors"
+            >
+              ⏱️ Has this changed over time?
+            </button>
+            <button
+              onClick={() => {
+                onAskThisArea?.(
+                  { center: [pointPromptCoord.lng, pointPromptCoord.lat], point: true },
+                  `Analyze vegetation vigor and moisture indices at this point.`
+                );
+                setPointPromptCoord(null);
+              }}
+              className="px-2.5 py-1.5 bg-slate-800/90 hover:bg-cyan-950/70 hover:border-cyan-700/60 border border-slate-700/60 rounded-md text-left text-slate-200 transition-colors"
+            >
+              🌿 Analyze vegetation / water index
+            </button>
+          </div>
         </div>
       )}
 

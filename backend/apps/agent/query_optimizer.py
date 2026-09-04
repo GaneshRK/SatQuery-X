@@ -21,6 +21,8 @@ class StructuredQueryPlan:
     requested_measurements: List[str] = field(default_factory=list)
     confidence_threshold: float = 0.70
     uncertainty_notes: List[str] = field(default_factory=list)
+    clarification_prompt: Optional[str] = None
+    clarification_options: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -37,6 +39,8 @@ class StructuredQueryPlan:
             "requested_measurements": self.requested_measurements,
             "confidence_threshold": self.confidence_threshold,
             "uncertainty_notes": self.uncertainty_notes,
+            "clarification_prompt": self.clarification_prompt,
+            "clarification_options": self.clarification_options,
         }
 
 
@@ -87,7 +91,17 @@ class QueryOptimizer:
 
     def optimize(self, text: str, session_context: Optional[Dict[str, Any]] = None) -> StructuredQueryPlan:
         session_context = session_context or {}
-        q = text.lower().strip()
+        from apps.agent.conversation_engine import ConversationEngine
+        conv_engine = ConversationEngine()
+
+        # Check for ambiguity
+        ambiguity = conv_engine.detect_ambiguity(text, session_context)
+        clarification_prompt = ambiguity["clarification_prompt"] if ambiguity else None
+        clarification_options = ambiguity["options"] if ambiguity else []
+
+        # Resolve references/pronouns in query text using conversation context
+        resolved_text, updated_context = conv_engine.resolve_references(text, session_context)
+        q = resolved_text.lower().strip()
         now = timezone.now().date()
 
         # 1. Resolve Location / AOI
@@ -97,8 +111,6 @@ class QueryOptimizer:
         time_range = self._resolve_time_range(q, now)
 
         # 3. Detect External Web Evidence Requirement
-        # External evidence is required when the query asks for causes, validation against
-        # official reports/warnings, weather context, drought, policy, or disaster declarations.
         external_required, ext_query = self._detect_external_necessity(q, aoi["name"])
 
         # 4. Classify Intent, Modalities, and Analysis Types
@@ -109,7 +121,7 @@ class QueryOptimizer:
         # 5. Check if Conversational Follow-up
         is_follow_up = False
         history = session_context.get("conversation_history", [])
-        if history and any(k in q for k in ("only show", "filter", "which of these", "how many of them", "why", "what about")):
+        if history and any(k in q for k in ("only show", "filter", "which of these", "how many of them", "why", "what about", "focus on", "were they", "how much did")):
             is_follow_up = True
 
         return StructuredQueryPlan(
@@ -125,6 +137,8 @@ class QueryOptimizer:
             is_follow_up=is_follow_up,
             requested_measurements=measurements,
             confidence_threshold=0.75 if external_required else 0.70,
+            clarification_prompt=clarification_prompt,
+            clarification_options=clarification_options,
         )
 
     def _resolve_aoi(self, q: str, session_context: Dict[str, Any]) -> Dict[str, Any]:
@@ -231,6 +245,32 @@ class QueryOptimizer:
         modalities = ["optical"]
         analysis = []
         measurements = []
+
+        # UI Navigation command check
+        if any(w in q for w in ("show vegetation", "show changes", "show me 2020", "zoom to", "zoom in", "where is it", "show where")):
+            analysis.append("ui_action_dispatch")
+            return (
+                "ui_navigation_command",
+                "ui_control",
+                "action_dispatch",
+                modalities,
+                analysis,
+                [],
+            )
+
+        # Multi-intent check: e.g. "expanded" or "buildings" AND "vegetation"
+        if (any(k in q for k in ("urban", "building", "construction", "expansion", "city", "expanded")) and
+            any(k in q for k in ("vegetation", "forest", "crop", "canopy", "trees", "greenery"))):
+            analysis.extend(["calculate_ndbi", "calculate_ndvi", "bitemporal_built_up_differencing", "bitemporal_ndvi_differencing"])
+            measurements.extend(["expansion_hectares", "canopy_loss_hectares", "mean_ndvi"])
+            return (
+                "multi_intent_urban_vegetation_analysis",
+                "mixed_urban_vegetation",
+                "fused_bitemporal_differencing",
+                modalities,
+                analysis,
+                measurements,
+            )
 
         # SAR / Flood check
         if any(k in q for k in ("flood", "sar", "radar", "water extent", "monsoon")):

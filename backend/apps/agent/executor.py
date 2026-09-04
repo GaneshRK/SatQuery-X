@@ -280,19 +280,22 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
         final_answer = f"Completed {len(steps)} analysis step(s). Evidence regions and metrics have been extracted."
 
     # Multi-Agent Synthesis & External Augmentation
+    from apps.agent.conversation_engine import ConversationEngine
     from apps.agent.query_optimizer import QueryOptimizer
     from apps.agent.web_research import WebResearchAgent, ExternalEvidenceDTO
     from apps.agent.georeason import GeoReasonAgent
     from apps.agent.followup_generator import FollowUpGenerator
     from apps.evidence.models import ExternalEvidence
 
+    session = query.session
+    conv_engine = ConversationEngine()
+    raw_ctx = getattr(session, "conversation_context", {}) or {}
+    session_ctx = dict(raw_ctx if raw_ctx else conv_engine.get_default_context(getattr(session, "name", "")))
+    session_ctx["conversation_history"] = getattr(session, "conversation_history", [])
+
     optimizer = QueryOptimizer()
-    session_ctx = {
-        "aoi_name": getattr(query.session, "name", ""),
-        "conversation_history": getattr(query.session, "conversation_history", []),
-    }
     opt_plan = optimizer.optimize(query.text, session_ctx)
-    query.structured_plan = opt_plan.to_dict()
+    plan_dict = opt_plan.to_dict()
 
     external_dtos: list[ExternalEvidenceDTO] = []
     if opt_plan.external_evidence_required:
@@ -343,7 +346,11 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
         measurements=measurements_dict,
         change_events=change_evts,
         external_evidence=external_dtos,
+        aoi_coords=opt_plan.aoi.get("coords"),
     )
+
+    plan_dict["ui_actions"] = reason_res.ui_actions
+    query.structured_plan = plan_dict
 
     if final_answer and final_answer not in (reason_res.synthesized_answer or ""):
         query.answer = f"{final_answer} {reason_res.synthesized_answer}".strip()
@@ -366,9 +373,8 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
     query.completed_at = timezone.now()
     query.save()
 
-    # Append to Session conversation_history for conversational memory
+    # Append to Session conversation_history and update conversation_context
     try:
-        session = query.session
         history = list(session.conversation_history or [])
         history.append({
             "query_id": str(query.id),
@@ -378,7 +384,18 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
             "timestamp": query.completed_at.isoformat(),
         })
         session.conversation_history = history[-10:]  # Keep last 10 turns
-        session.save(update_fields=["conversation_history"])
+
+        # Update conversation_context
+        updated_context = conv_engine.update_context_after_query(
+            context=session_ctx,
+            query_text=query.text,
+            answer=query.answer,
+            plan=plan_dict,
+            measurements=[{"metric": k, "value": v} for k, v in measurements_dict.items()],
+            ui_actions=reason_res.ui_actions,
+        )
+        session.conversation_context = updated_context
+        session.save(update_fields=["conversation_history", "conversation_context"])
     except Exception:
         pass
 
@@ -390,6 +407,11 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
         "confidence": query.confidence,
         "follow_up_questions": query.follow_up_questions,
         "evidence_graph": query.evidence_graph,
+        "ui_actions": reason_res.ui_actions,
+        "clarification": {
+            "prompt": opt_plan.clarification_prompt,
+            "options": opt_plan.clarification_options,
+        } if opt_plan.clarification_prompt else None,
     })
 
     return {

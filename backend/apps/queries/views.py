@@ -43,6 +43,16 @@ class SessionQueryListCreateView(views.APIView):
         if not image and not pair:
             image = session.imagery_assets.filter(processing_status="VALIDATED").first()
 
+        # Ingest visual context if passed from client
+        visual_ctx = request.data.get("visual_context")
+        if visual_ctx and isinstance(visual_ctx, dict):
+            current_ctx = dict(session.conversation_context or {})
+            current_ctx["current_visual_state"] = visual_ctx
+            if visual_ctx.get("active_region"):
+                current_ctx["active_region"] = visual_ctx["active_region"]
+            session.conversation_context = current_ctx
+            session.save(update_fields=["conversation_context"])
+
         query = Query.objects.create(
             session=session,
             user=request.user,
@@ -214,3 +224,38 @@ class QueryExportView(views.APIView):
             return Response({"error": "No PNG preview available for this query."}, status=status.HTTP_404_NOT_FOUND)
 
         return Response({"error": f"Unsupported export format '{format}'. Supported: geojson, csv, json, geotiff, png."}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SessionContextView(views.APIView):
+    """GET /api/v1/sessions/{session_id}/context/ - returns current multi-turn conversation context."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, session_id):
+        session = get_object_or_404(Session, id=session_id)
+        from apps.agent.conversation_engine import ConversationEngine
+        ctx = session.conversation_context or ConversationEngine.get_default_context()
+        return Response({
+            "session_id": str(session.id),
+            "conversation_context": ctx,
+        })
+
+
+class SessionContextResetView(views.APIView):
+    """POST /api/v1/sessions/{session_id}/context/reset/ - resets conversation context to fresh default."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, session_id):
+        session = get_object_or_404(Session, id=session_id)
+        from apps.agent.conversation_engine import ConversationEngine
+        session.conversation_context = ConversationEngine.get_default_context()
+        session.save(update_fields=["conversation_context"])
+        log_audit_event(
+            request.user, "RESET_CONTEXT", "Session", str(session.id),
+            {"message": "Conversation context reset to default."}
+        )
+        return Response({
+            "session_id": str(session.id),
+            "status": "reset",
+            "conversation_context": session.conversation_context,
+        })
+

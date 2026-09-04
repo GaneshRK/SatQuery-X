@@ -97,7 +97,59 @@ export interface ExecutionTrace {
   timings_ms: Record<string, number>;
   errors: string[];
   created_at: string;
+  ui_actions?: UIAction[];
+  clarification?: {
+    clarification_prompt?: string | null;
+    clarification_options?: ClarificationOption[];
+  } | null;
   completed_at?: string | null;
+}
+
+export interface UIAction {
+  action: 'ZOOM_TO_REGION' | 'SHOW_LAYER' | 'SET_TIMELINE' | 'HIGHLIGHT_FEATURE' | 'RESET_VIEW' | string;
+  parameters: Record<string, any>;
+  description?: string;
+}
+
+export interface ClarificationOption {
+  label: string;
+  query: string;
+  description?: string;
+}
+
+export interface ConversationContext {
+  active_region?: {
+    name?: string;
+    coordinates?: [number, number];
+    bbox?: [number, number, number, number];
+  } | null;
+  active_focus?: string | null;
+  active_observation_pair?: {
+    t1_date?: string;
+    t2_date?: string;
+    scene_id_t1?: string;
+    scene_id_t2?: string;
+  } | null;
+  active_layers?: string[];
+  current_visual_state?: {
+    center?: [number, number];
+    zoom?: number;
+    active_layer?: string;
+    drawn_polygon?: any;
+  } | null;
+  active_entities?: Array<{
+    class_name: string;
+    area_ha?: number;
+    confidence?: number;
+  }>;
+  conversation_history?: Array<{
+    turn: number;
+    user_query: string;
+    assistant_summary: string;
+    focus?: string;
+    timestamp?: string;
+  }>;
+  confidence_threshold?: number;
 }
 
 export interface ModelEntry {

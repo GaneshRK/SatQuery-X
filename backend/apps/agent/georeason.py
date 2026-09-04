@@ -24,6 +24,7 @@ class GeoReasonResult:
     uncertainties: List[str]
     evidence_graph: Dict[str, Any]
     external_citations: List[Dict[str, Any]]
+    ui_actions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class GeoReasonAgent:
@@ -42,6 +43,8 @@ class GeoReasonAgent:
         measurements: Dict[str, Any],
         change_events: List[Dict[str, Any]],
         external_evidence: List[ExternalEvidenceDTO],
+        aoi_coords: Optional[List[float]] = None,
+        explanation_mode: str = "simple",
     ) -> GeoReasonResult:
         drivers: List[str] = []
         uncertainties: List[str] = []
@@ -155,6 +158,22 @@ class GeoReasonAgent:
             f"Ground verification confidence is calibrated at {int(final_conf * 100)}% based on validated Copernicus STAC telemetry."
         )
 
+        # 6. Generate Contextual UI Actions
+        ui_actions = []
+        q_lower = query_text.lower()
+        if any(w in q_lower for w in ("zoom", "where", "show me exactly", "show the changes", "locate", "where is it")):
+            if aoi_coords:
+                ui_actions.append({"type": "ZOOM_TO_REGION", "coordinates": aoi_coords, "zoom": 13})
+            if has_change:
+                ui_actions.append({"type": "SHOW_LAYER", "layer": "change_mask"})
+        elif has_change:
+            ui_actions.append({"type": "SHOW_LAYER", "layer": "change_mask"})
+
+        if any(w in q_lower for w in ("show vegetation", "ndvi layer", "show trees", "vegetation map")):
+            ui_actions.append({"type": "SHOW_LAYER", "layer": "ndvi"})
+        elif any(w in q_lower for w in ("show water", "ndwi layer", "show floods")):
+            ui_actions.append({"type": "SHOW_LAYER", "layer": "ndwi"})
+
         return GeoReasonResult(
             synthesized_answer=" ".join(lines),
             calibrated_confidence=final_conf,
@@ -163,4 +182,5 @@ class GeoReasonAgent:
             uncertainties=uncertainties,
             evidence_graph={"nodes": nodes, "edges": edges},
             external_citations=citations,
+            ui_actions=ui_actions,
         )

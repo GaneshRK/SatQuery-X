@@ -19,6 +19,8 @@ from apps.queries.views import (
     QueryDetailView,
     QueryExportView,
     QueryStreamView,
+    SessionContextResetView,
+    SessionContextView,
     SessionQueryListCreateView,
 )
 from apps.reports.views import ReportDetailView, ReportDownloadView, SessionReportListCreateView
@@ -44,6 +46,8 @@ api_v1_patterns = [
 
     # Sessions
     path("sessions/", include("apps.sessions.urls")),
+    path("sessions/<uuid:session_id>/context/", SessionContextView.as_view(), name="session_context"),
+    path("sessions/<uuid:session_id>/context/reset/", SessionContextResetView.as_view(), name="session_context_reset"),
 
     # Imagery & Pairs under Session
     path("sessions/<uuid:session_id>/images/", SessionImageListCreateView.as_view(), name="session_images"),

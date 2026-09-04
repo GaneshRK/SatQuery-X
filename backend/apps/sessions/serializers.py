@@ -14,6 +14,7 @@ class SessionSerializer(serializers.ModelSerializer):
             "status",
             "project",
             "conversation_history",
+            "conversation_context",
             "created_at",
             "updated_at",
             "image_count",
