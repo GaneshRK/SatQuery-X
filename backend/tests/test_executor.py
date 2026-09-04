@@ -1,67 +1,58 @@
-"""Unit tests for PlanExecutor and sequential execution trace synthesis."""
+"""Unit tests for Executor component and live step logging per §8.4."""
 
-import uuid
-from backend.planner.executor import PlanExecutor
-from backend.planner.schemas import PlanStep
+import pytest
+from django.contrib.auth import get_user_model
+from django.core.files.base import ContentFile
+
+from apps.agent.executor import execute_plan
+from apps.imagery.models import ImageAsset
+from apps.queries.models import Query
+from apps.sessions.models import Session
+
+User = get_user_model()
 
 
-def test_executor_single_image(synthetic_optical_png):
-    executor = PlanExecutor()
-    session_id = uuid.uuid4()
-    query_id = uuid.uuid4()
+@pytest.mark.django_db
+def test_executor_execution_steps_and_quantifier(synthetic_optical_png):
+    user = User.objects.create_user(username="execuser", password="password")
+    session = Session.objects.create(user=user, name="Executor Session")
 
-    plan = [
-        PlanStep(step=1, tool="RS_VQA", version="v0.1-baseline", params={"question": "What is visible?"}),
-    ]
+    asset = ImageAsset.objects.create(
+        session=session,
+        original_filename="opt.png",
+        file_format="PNG",
+        modality="OPTICAL",
+        sensor="SENTINEL-2",
+        processing_status="VALIDATED",
+        affine_transform=[10.0, 0.0, 1000.0, 0.0, -10.0, 5000.0],
+        crs="EPSG:32643",
+    )
+    asset.file.save("opt.png", ContentFile(synthetic_optical_png))
 
-    trace = executor.execute(
-        query="What is visible?",
-        plan=plan,
-        task_classification="vqa",
-        detected_mode="single_image",
-        image_bytes=[synthetic_optical_png],
-        image_metadata=[{"width": 256, "height": 256, "sensor_type": "optical"}],
-        session_id=session_id,
-        query_id=query_id,
+    query = Query.objects.create(
+        session=session,
+        user=user,
+        text="Highlight vegetation",
+        image=asset,
     )
 
-    assert trace.query == "What is visible?"
-    assert trace.detected_mode == "single_image"
-    assert trace.answer is not None
-    assert trace.confidence > 0.0
-    assert "step1" in trace.timings_ms
-    assert "total" in trace.timings_ms
-    assert len(trace.errors) == 0
-
-
-def test_executor_bitemporal_pipeline(synthetic_bitemporal_pngs):
-    t1_bytes, t2_bytes = synthetic_bitemporal_pngs
-    executor = PlanExecutor()
-    session_id = uuid.uuid4()
-    query_id = uuid.uuid4()
-
-    plan = [
-        PlanStep(step=1, tool="CHANGE_DETECTION", version="v0.1-baseline", params={}),
-        PlanStep(step=2, tool="CHANGE_VQA", version="v0.1-baseline", params={"question": "Has area increased?", "change_mask_ref": "step1.change_mask"}),
-    ]
-
-    trace = executor.execute(
-        query="Has area increased?",
-        plan=plan,
-        task_classification="change_vqa",
-        detected_mode="bi_temporal",
-        image_bytes=[t1_bytes, t2_bytes],
-        image_metadata=[
-            {"width": 256, "height": 256, "sensor_type": "optical"},
-            {"width": 256, "height": 256, "sensor_type": "optical"},
+    plan = {
+        "mode": "SINGLE_IMAGE",
+        "task": "GROUNDING",
+        "steps": [
+            {"step": 1, "tool": "RS_GROUNDING", "parameters": {"prompt": "vegetation"}},
+            {"step": 2, "tool": "AREA_QUANTIFIER", "parameters": {}},
         ],
-        session_id=session_id,
-        query_id=query_id,
-    )
+    }
 
-    assert trace.detected_mode == "bi_temporal"
-    assert "step1" in trace.outputs
-    assert "step2" in trace.outputs
-    assert trace.evidence.change_mask_url is not None
-    assert trace.evidence.quantified_area_km2 is not None
-    assert trace.confidence > 0.0
+    res = execute_plan(query, plan, [asset])
+    assert res["status"] == "COMPLETED"
+    assert query.execution_steps.count() == 2
+
+    step1 = query.execution_steps.get(step_number=1)
+    assert step1.status == "DONE"
+    assert step1.tool_name == "RS_GROUNDING"
+
+    step2 = query.execution_steps.get(step_number=2)
+    assert step2.status == "DONE"
+    assert step2.tool_name == "AREA_QUANTIFIER"

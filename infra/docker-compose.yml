@@ -52,62 +52,59 @@ services:
       - minio_data:/data
 
   # ---------------------------------------------------------------------------
-  # SatQuery-X FastAPI Backend Service
+  # SatQuery AI Django REST Framework Backend
   # ---------------------------------------------------------------------------
   backend:
     build:
       context: ..
       dockerfile: infra/Dockerfile.backend
     container_name: satquery-backend
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-    environment:
-      SATQUERY_ENV: development
-      DATABASE_URL: postgresql+asyncpg://satquery:satquery_dev_password@db:5432/satquery
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadminpassword
-      S3_BUCKET: satquery
+    command: sh -c "python manage.py migrate && python manage.py seed_demo_user && python manage.py runserver 0.0.0.0:8000"
+    volumes:
+      - ../backend:/app/backend
+      - backend_media:/app/backend/media
     ports:
       - "8000:8000"
+    environment:
+      - DJANGO_SECRET_KEY=dev-secret-key-satquery-ai-sih26167
+      - DJANGO_DEBUG=True
+      - DATABASE_URL=postgresql://satquery:satquery_dev_password@db:5432/satquery
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_KEY=minioadmin
+      - MINIO_SECRET=minioadminpassword
+      - CELERY_TASK_ALWAYS_EAGER=False
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ../backend:/app/backend
-      - ../data:/app/data
 
   # ---------------------------------------------------------------------------
-  # Asynchronous Specialist Inference Worker (Celery)
+  # SatQuery AI Celery Worker (Async Ingestion, Inferences, Reports)
   # ---------------------------------------------------------------------------
   celery-worker:
     build:
       context: ..
       dockerfile: infra/Dockerfile.backend
-    container_name: satquery-worker
-    command: celery -A backend.jobs.celery_app.celery_app worker --loglevel=info
-    environment:
-      SATQUERY_ENV: development
-      DATABASE_URL: postgresql+asyncpg://satquery:satquery_dev_password@db:5432/satquery
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadminpassword
-      S3_BUCKET: satquery
-    depends_on:
-      redis:
-        condition: service_healthy
+    container_name: satquery-celery-worker
+    command: celery -A config worker --loglevel=info --concurrency=2
     volumes:
       - ../backend:/app/backend
-      - ../data:/app/data
+      - backend_media:/app/backend/media
+    environment:
+      - DJANGO_SECRET_KEY=dev-secret-key-satquery-ai-sih26167
+      - DATABASE_URL=postgresql://satquery:satquery_dev_password@db:5432/satquery
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_TASK_ALWAYS_EAGER=False
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # Frontend Application (Next.js)
+  # SatQuery AI Frontend (React + TypeScript)
   # ---------------------------------------------------------------------------
   frontend:
     build:
@@ -117,10 +114,11 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
     depends_on:
       - backend
 
 volumes:
   postgres_data:
   minio_data:
+  backend_media:

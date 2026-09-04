@@ -38,6 +38,9 @@ checkpoints/
 *.ckpt
 mlruns/
 wandb/
+*.sqlite3
+backend/media/
+media/
 
 # Docker volumes
 infra/volumes/

@@ -4,12 +4,12 @@ const nextConfig = {
   async rewrites() {
     return [
       {
-        source: '/api/:path*',
-        destination: 'http://localhost:8000/:path*',
+        source: '/api/v1/:path*',
+        destination: 'http://127.0.0.1:8000/api/v1/:path*',
       },
       {
-        source: '/v1/:path*',
-        destination: 'http://localhost:8000/v1/:path*',
+        source: '/media/:path*',
+        destination: 'http://127.0.0.1:8000/media/:path*',
       },
     ];
   },

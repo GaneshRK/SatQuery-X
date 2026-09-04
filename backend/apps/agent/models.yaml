@@ -1,0 +1,49 @@
+RS_VQA:
+  task: visual_question_answering
+  input_modes: [single_image]
+  framework: pytorch
+  version: "1.0-baseline"
+  adaptation: baseline
+  base_model: blip-vqa-base
+  wrapper: apps.models_ai.rs_vqa.wrapper.RSVQAModel
+
+RS_CAPTION:
+  task: image_captioning
+  input_modes: [single_image]
+  version: "1.0-baseline"
+  adaptation: baseline
+  base_model: blip-captioning-base
+  wrapper: apps.models_ai.rs_caption.wrapper.RSCaptionModel
+
+RS_GROUNDING:
+  task: text_guided_grounding
+  input_modes: [single_image]
+  version: "1.0-baseline"
+  adaptation: baseline
+  base_model: spectral-saliency-region-proposals
+  wrapper: apps.models_ai.rs_grounding.wrapper.RSGroundingModel
+
+CHANGE_DETECTION:
+  task: bi_temporal_change_map
+  input_modes: [bi_temporal]
+  version: "1.0-baseline"
+  adaptation: baseline
+  base_model: diff-connected-components
+  wrapper: apps.models_ai.change_detection.wrapper.ChangeDetectionModel
+
+CHANGE_VQA:
+  task: change_based_vqa
+  input_modes: [bi_temporal]
+  version: "1.0-baseline"
+  depends_on: [CHANGE_DETECTION]
+  adaptation: baseline
+  base_model: change-reasoning-over-masks
+  wrapper: apps.models_ai.change_vqa.wrapper.ChangeVQAModel
+
+OPTICAL_SAR_FUSION:
+  task: cross_modal_fusion_analysis
+  input_modes: [cross_modal_pair]
+  version: "1.0-baseline"
+  adaptation: baseline
+  base_model: dual-branch-fusion-classifier
+  wrapper: apps.models_ai.optical_sar_fusion.wrapper.OpticalSARFusionModel

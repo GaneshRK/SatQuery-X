@@ -1,0 +1,18 @@
+{
+  "model_id": "RS_VQA",
+  "version": "1.0-baseline",
+  "checkpoint_hash": "baseline-zero-shot",
+  "dataset": "RSVQA",
+  "split": "test",
+  "date": "2026-09-04T05:25:13.911141+00:00",
+  "hardware": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+    "python_version": "3.11.16"
+  },
+  "metrics": {
+    "accuracy": 0.824,
+    "exact_match": 0.791,
+    "sample_count": 1250
+  }
+}

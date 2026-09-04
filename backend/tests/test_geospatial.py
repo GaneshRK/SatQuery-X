@@ -1,60 +1,61 @@
-"""Unit tests for geospatial ingestion, CRS handling, and pair validation."""
-
 import numpy as np
-from backend.geospatial.ingestion import (
-    RasterMetadata,
-    detect_input_mode,
-    detect_sensor_type,
-    parse_raster,
-    pixel_bbox_to_geojson,
-    validate_pair,
-)
+import pytest
+
+from apps.geospatial.indices import compute_ndbi, compute_ndvi, compute_ndwi
+from apps.geospatial.ingestion import detect_sensor_and_modality
+from apps.geospatial.math import calculate_pixel_area_m2, polygonize_mask_to_geojson, quantify_mask_area
 
 
-def test_detect_sensor_type():
-    assert detect_sensor_type("sentinel1_sar_scene.tif", 1) == "sar"
-    assert detect_sensor_type("risat_sar_band.tif", 1) == "sar"
-    assert detect_sensor_type("cartosat_optical_rgb.png", 3) == "optical"
-    assert detect_sensor_type("sentinel2_l2a.png", 4) == "optical"
+def test_sensor_and_modality_detection():
+    sensor, mod = detect_sensor_and_modality("S2A_MSIL2A_20260815.tif", 12)
+    assert sensor == "SENTINEL-2"
+    assert mod == "MULTISPECTRAL"
+
+    sensor, mod = detect_sensor_and_modality("S1A_IW_GRDH_1SDV.tif", 1)
+    assert sensor == "SENTINEL-1"
+    assert mod == "SAR"
+
+    sensor, mod = detect_sensor_and_modality("Cartosat2S_optical.tif", 4)
+    assert sensor == "CARTOSAT-2S"
+    assert mod == "OPTICAL"
 
 
-def test_parse_plain_png(synthetic_optical_png):
-    meta = parse_raster(synthetic_optical_png, "test_optical.png", "image/png")
-    assert meta.width == 256
-    assert meta.height == 256
-    assert meta.band_count == 3
-    assert meta.sensor_type == "optical"
-    assert meta.geo_referenced is False
+def test_projection_aware_area_calculation():
+    # Projected CRS: 10m x 10m pixel = 100 m²
+    affine_utm = [10.0, 0.0, 500000.0, 0.0, -10.0, 4000000.0]
+    area_m2 = calculate_pixel_area_m2(affine_utm, "EPSG:32643")
+    assert abs(area_m2 - 100.0) < 1e-4
+
+    # Binary mask of 100 pixels
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[5:15, 5:15] = 255  # 10x10 = 100 pixels
+
+    quant = quantify_mask_area(mask, affine_utm, "EPSG:32643")
+    assert quant["valid_pixel_count"] == 100
+    assert quant["area_m2"] == 10000.0  # 100 * 100m² = 10,000 m²
+    assert quant["area_ha"] == 1.0       # 1 hectare
+    assert quant["area_km2"] == 0.01     # 0.01 km²
 
 
-def test_detect_input_mode(synthetic_optical_png, synthetic_sar_png):
-    meta_opt = parse_raster(synthetic_optical_png, "cartosat_optical.png", "image/png")
-    meta_sar = parse_raster(synthetic_sar_png, "risat_sar.png", "image/png")
+def test_spectral_indices():
+    red = np.array([[0.1, 0.2], [0.3, 0.4]])
+    nir = np.array([[0.5, 0.6], [0.7, 0.8]])
+    ndvi = compute_ndvi(red, nir)
+    assert ndvi.shape == (2, 2)
+    assert (ndvi > 0).all()
 
-    assert detect_input_mode([meta_opt]) == "single_image"
-    assert detect_input_mode([meta_opt, meta_sar]) == "cross_modal_pair"
-
-    meta_opt2 = parse_raster(synthetic_optical_png, "optical_t2.png", "image/png")
-    assert detect_input_mode([meta_opt, meta_opt2]) == "bi_temporal"
-
-
-def test_validate_pair(synthetic_optical_png, synthetic_sar_png):
-    meta_opt = parse_raster(synthetic_optical_png, "opt.png", "image/png")
-    meta_sar = parse_raster(synthetic_sar_png, "sar.png", "image/png")
-
-    result = validate_pair(meta_opt, meta_sar)
-    assert result.valid is True
-    assert "matching dimensions" in result.message
+    green = np.array([[0.4, 0.5], [0.2, 0.3]])
+    ndwi = compute_ndwi(green, nir)
+    assert ndwi.shape == (2, 2)
 
 
-def test_pixel_bbox_to_geojson():
-    bbox = [10.0, 20.0, 50.0, 60.0]
-    geojson = pixel_bbox_to_geojson(
-        bbox=bbox,
-        affine=[10.0, 0.0, 500000.0, 0.0, -10.0, 3000000.0],
-        crs="EPSG:32643",
-        bounds_wgs84={"west": 72.5, "south": 23.0, "east": 72.6, "north": 23.1},
-    )
-    assert geojson["type"] == "Polygon"
-    assert len(geojson["coordinates"]) == 1
-    assert len(geojson["coordinates"][0]) >= 4
+def test_polygonization_to_geojson():
+    mask = np.zeros((50, 50), dtype=np.uint8)
+    mask[10:30, 10:30] = 255
+    affine = [10.0, 0.0, 1000.0, 0.0, -10.0, 5000.0]
+
+    features = polygonize_mask_to_geojson(mask, affine, "EPSG:32643", class_label="change")
+    assert len(features) > 0
+    assert features[0]["type"] == "Feature"
+    assert features[0]["properties"]["label"] == "change"
+    assert "area_km2" in features[0]["properties"]

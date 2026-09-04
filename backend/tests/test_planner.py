@@ -1,55 +1,37 @@
-"""Unit tests for AgenticPlanner and PlanValidator."""
+"""Unit tests for Agent planner, understander, and validator per §8."""
 
 import pytest
-from backend.planner.planner import AgenticPlanner
-from backend.planner.schemas import PlanStep
-from backend.planner.understander import classify_query
-from backend.planner.validator import PlanValidationError, validate_plan
-from backend.registry.loader import ModelRegistry
+from apps.agent.planner import create_execution_plan
+from apps.agent.understander import understand_query
+from apps.agent.validator import validate_agent_inputs
 
 
-def test_classify_query_modes():
-    assert classify_query("What type of airplane is here?", "single_image", 1) == "vqa"
-    assert classify_query("Describe this satellite scene", "single_image", 1) == "caption"
-    assert classify_query("Locate solar panels", "single_image", 1) == "grounding"
-    assert classify_query("Analyze optical and SAR fusion data", "cross_modal_pair", 2) == "fusion"
-    assert classify_query("Has built-up area increased?", "bi_temporal", 2) == "change_vqa"
-    assert classify_query("What changed between these dates?", "bi_temporal", 2) == "change_vqa"
-    assert classify_query("Mission: Urban expansion assessment", "bi_temporal", 2) == "mission_mode"
+def test_planner_rules():
+    # 1. Single-Image VQA Plan
+    i_vqa = understand_query("What is the resolution of this image?")
+    p_vqa = create_execution_plan(i_vqa, "SINGLE_IMAGE")
+    assert p_vqa["task"] == "VQA"
+    assert len(p_vqa["steps"]) == 1
+    assert p_vqa["steps"][0]["tool"] == "RS_VQA"
+
+    # 2. Change-Based VQA Plan (Compound: CD -> Change_VQA -> Area_Quantifier)
+    i_cd_vqa = understand_query("Has the built-up area increased, decreased, or remained unchanged?")
+    p_cd_vqa = create_execution_plan(i_cd_vqa, "BI_TEMPORAL")
+    assert p_cd_vqa["task"] == "CHANGE_VQA"
+    assert len(p_cd_vqa["steps"]) == 3
+    tools = [s["tool"] for s in p_cd_vqa["steps"]]
+    assert tools == ["CHANGE_DETECTION", "CHANGE_VQA", "AREA_QUANTIFIER"]
+
+    # 3. Mission Mode Plan (6-step comprehensive workflow)
+    i_mission = understand_query("Analyze this region for urban expansion")
+    p_mission = create_execution_plan(i_mission, "BI_TEMPORAL")
+    assert p_mission["task"] == "MISSION"
+    assert len(p_mission["steps"]) >= 5
 
 
-def test_agentic_planner_rules():
-    planner = AgenticPlanner()
-
-    # Single Image VQA
-    plan, task = planner.create_plan("What is in this image?", "single_image", 1)
-    assert task == "vqa"
-    assert len(plan) == 1
-    assert plan[0].tool == "RS_VQA"
-
-    # Cross-Modal Fusion
-    plan, task = planner.create_plan("Analyze SAR backscatter and optical signature", "cross_modal_pair", 2)
-    assert task == "fusion"
-    assert plan[0].tool == "OPTICAL_SAR_FUSION"
-
-    # Bi-Temporal Multi-step Chain
-    plan, task = planner.create_plan("Has built-up area increased?", "bi_temporal", 2)
-    assert task == "change_vqa"
-    assert len(plan) == 2
-    assert plan[0].tool == "CHANGE_DETECTION"
-    assert plan[1].tool == "CHANGE_VQA"
-
-
-def test_plan_validator_guardrails():
-    registry = ModelRegistry()
-
-    # Valid bi-temporal plan
-    valid_plan = [
-        PlanStep(step=1, tool="CHANGE_DETECTION", version="v0.1-baseline", params={}),
-        PlanStep(step=2, tool="CHANGE_VQA", version="v0.1-baseline", params={"question": "trend"}),
-    ]
-    validate_plan(valid_plan, "bi_temporal", 2, registry)
-
-    # Invalid: change detection with only 1 image
-    with pytest.raises(PlanValidationError):
-        validate_plan(valid_plan, "single_image", 1, registry)
+def test_validator_rules():
+    # Missing images for bi-temporal
+    i_temp = understand_query("What changed between these two dates?")
+    val_fail = validate_agent_inputs(i_temp, image_assets=[])
+    assert val_fail["valid"] is False
+    assert any("requires 2 images" in r for r in val_fail["reasons"])

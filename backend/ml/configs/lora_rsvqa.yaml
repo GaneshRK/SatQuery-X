@@ -1,0 +1,14 @@
+base_model: Salesforce/blip-vqa-base
+method: lora
+lora_rank: 16
+lora_alpha: 32
+target_modules: [q_proj, v_proj]
+dataset: bigearthnet_text
+train_split: train
+eval_datasets: [rsvqa, vrsbench]
+epochs: 5
+learning_rate: 2e-4
+batch_size: 16
+output_dir: ml/checkpoints/rsvqa_lora_v1
+hardware: cuda
+fp16: true
