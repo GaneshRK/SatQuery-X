@@ -13,6 +13,7 @@ export interface ImageAssetData {
   resolution_m: number | null;
   preview_url: string | null;
   bounds_wgs84: { west: number; south: number; east: number; north: number } | null;
+  is_georeferenced?: boolean;
   processing_status: "UPLOADED" | "VALIDATING" | "VALIDATED" | "FAILED";
   validation_report: any;
 }

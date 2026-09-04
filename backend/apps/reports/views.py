@@ -87,4 +87,5 @@ class ReportDownloadView(views.APIView):
         if not report.file:
             raise Http404("Report file has not yet finished generating.")
         content_type = "application/pdf" if report.format == "PDF" else "text/html"
-        return FileResponse(report.file.open("rb"), content_type=content_type, filename=f"satquery_report_{report.id}.pdf")
+        ext = "html" if report.format == "HTML" else "pdf"
+        return FileResponse(report.file.open("rb"), content_type=content_type, filename=f"satquery_report_{report.id}.{ext}")

@@ -1,9 +1,21 @@
 import { apiRequest } from "./api";
 
+export interface ConversationItem {
+  query_id?: string;
+  role: "user" | "assistant";
+  content: string;
+  task?: string;
+  confidence?: number;
+  tools_executed?: string[];
+  timestamp?: string;
+}
+
 export interface SessionData {
   id: string;
   name: string;
   status: "active" | "archived";
+  project?: string | null;
+  conversation_history?: ConversationItem[];
   created_at: string;
   updated_at: string;
   image_count: number;

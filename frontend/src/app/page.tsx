@@ -8,6 +8,7 @@ import { ChatConsole, formatQueryToTrace } from '@/components/ChatConsole';
 import { ExecutionTraceTimeline } from '@/components/ExecutionTraceTimeline';
 import { EvidenceDrawer } from '@/components/EvidenceDrawer';
 import { ReportModal } from '@/components/ReportModal';
+import { SatelliteSearchModal } from '@/components/SatelliteSearchModal';
 import { RasterMetadata, ExecutionTrace, InputMode } from '@/types';
 import { login } from '@/services/auth';
 import { listSessions, createSession, SessionData } from '@/services/sessions';
@@ -21,6 +22,7 @@ export default function DashboardPage() {
   const [detectedMode, setDetectedMode] = useState<InputMode | null>(null);
   const [currentTrace, setCurrentTrace] = useState<ExecutionTrace | null>(null);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
+  const [isSatelliteSearchOpen, setIsSatelliteSearchOpen] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
 
@@ -38,7 +40,7 @@ export default function DashboardPage() {
         width: a.width,
         height: a.height,
         band_count: a.band_count,
-        geo_referenced: a.is_georeferenced,
+        geo_referenced: !!(a.is_georeferenced ?? a.bounds_wgs84),
         crs: a.crs,
         bounds_wgs84: a.bounds_wgs84,
         sensor_type: a.sensor,
@@ -149,6 +151,7 @@ export default function DashboardPage() {
         activeSessionId={sessionId}
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}
+        onOpenSatelliteSearch={() => setIsSatelliteSearchOpen(true)}
       />
 
       <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-[1800px] w-full mx-auto">
@@ -179,6 +182,13 @@ export default function DashboardPage() {
         onClose={() => setIsUploadOpen(false)}
         sessionId={sessionId}
         onUploadSuccess={handleUploadSuccess}
+      />
+
+      <SatelliteSearchModal
+        isOpen={isSatelliteSearchOpen}
+        onClose={() => setIsSatelliteSearchOpen(false)}
+        sessionId={sessionId}
+        onSceneIngested={() => loadSessionData(sessionId)}
       />
 
       <ReportModal

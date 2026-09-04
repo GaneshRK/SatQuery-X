@@ -90,6 +90,41 @@ def quantify_mask_area(
     }
 
 
+def calculate_polygon_ground_area_m2(poly_geom: Any, crs_str: str | None = None) -> float:
+    """Calculate true metric ground surface area in m² using equal-area projection."""
+    if not HAS_SHAPELY:
+        return 0.0
+
+    poly = shape(poly_geom) if isinstance(poly_geom, dict) else poly_geom
+    if poly.is_empty:
+        return 0.0
+
+    # If CRS is projected in meters (e.g. UTM)
+    if crs_str and any(proj in crs_str.lower() for proj in ("utm", "326", "327")):
+        return float(poly.area)
+
+    # In Web Mercator (EPSG:3857)
+    if crs_str and "3857" in crs_str:
+        lat_center = math.radians(poly.centroid.y)
+        return float(poly.area * (math.cos(lat_center) ** 2))
+
+    # WGS84 Geographic degrees (EPSG:4326)
+    centroid = poly.centroid
+    lon_c, lat_c = centroid.x, centroid.y
+    try:
+        from shapely.ops import transform
+        cea_crs = f"+proj=cea +lat_ts={lat_c:.4f} +lon_0={lon_c:.4f} +units=m"
+        transformer = Transformer.from_crs("EPSG:4326", cea_crs, always_xy=True)
+        poly_m = transform(transformer.transform, poly)
+        return float(poly_m.area)
+    except Exception:
+        # Fallback using degree length conversion at center latitude
+        lat_rad = math.radians(lat_c)
+        deg_lat_m = 111132.954 - 559.822 * math.cos(2 * lat_rad)
+        deg_lon_m = 111412.84 * math.cos(lat_rad)
+        return float(poly.area * deg_lat_m * deg_lon_m)
+
+
 def polygonize_mask_to_geojson(
     mask: np.ndarray,
     affine_list: list[float] | None,
@@ -121,10 +156,9 @@ def polygonize_mask_to_geojson(
                 except Exception:
                     pass
 
-            pixel_area = calculate_pixel_area_m2(affine_list, crs_str, bounds_wgs84)
-            # Estimate area
-            feature_area_m2 = round(poly_shape.area if (crs_str and "utm" in crs_str.lower()) else poly_shape.area * 1e10, 2)
-            feature_area_km2 = round(feature_area_m2 / 1e6, 4)
+            # Calculate accurate metric area using geodesic equal-area projection
+            feature_area_m2 = round(calculate_polygon_ground_area_m2(poly_shape, crs_str), 2)
+            feature_area_km2 = round(feature_area_m2 / 1e6, 6)
 
             features.append({
                 "type": "Feature",
