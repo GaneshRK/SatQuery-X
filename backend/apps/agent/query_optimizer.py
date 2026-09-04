@@ -1,0 +1,317 @@
+from __future__ import annotations
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from typing import Any, Dict, List, Optional
+from django.utils import timezone
+
+
+@dataclass
+class StructuredQueryPlan:
+    intent: str
+    target: str
+    operation: str
+    aoi: Dict[str, Any]
+    time_range: Dict[str, str]
+    modalities: List[str]
+    analysis: List[str]
+    external_evidence_required: bool
+    external_query: str = ""
+    is_follow_up: bool = False
+    requested_measurements: List[str] = field(default_factory=list)
+    confidence_threshold: float = 0.70
+    uncertainty_notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "intent": self.intent,
+            "target": self.target,
+            "operation": self.operation,
+            "aoi": self.aoi,
+            "time_range": self.time_range,
+            "modalities": self.modalities,
+            "analysis": self.analysis,
+            "external_evidence_required": self.external_evidence_required,
+            "external_query": self.external_query,
+            "is_follow_up": self.is_follow_up,
+            "requested_measurements": self.requested_measurements,
+            "confidence_threshold": self.confidence_threshold,
+            "uncertainty_notes": self.uncertainty_notes,
+        }
+
+
+class QueryOptimizer:
+    """
+    Optimizes natural language questions into structured, machine-verifiable execution plans.
+    Performs spatial reference grounding, temporal resolution, sensor selection,
+    and determines whether external web evidence is required.
+    """
+
+    KNOWN_LOCATIONS: Dict[str, Dict[str, Any]] = {
+        "chennai": {
+            "name": "Chennai Metropolitan Region",
+            "bbox": [80.15, 12.95, 80.35, 13.15],
+            "coords": [80.2707, 13.0827],
+        },
+        "pollachi": {
+            "name": "Pollachi Agricultural Belt",
+            "bbox": [76.92, 10.58, 77.08, 10.72],
+            "coords": [77.0064, 10.6582],
+        },
+        "kaziranga": {
+            "name": "Kaziranga National Park & Brahmaputra Basin",
+            "bbox": [93.05, 26.50, 93.30, 26.65],
+            "coords": [93.1711, 26.5775],
+        },
+        "brahmaputra": {
+            "name": "Brahmaputra River Basin",
+            "bbox": [93.00, 26.40, 93.40, 26.80],
+            "coords": [93.2000, 26.6000],
+        },
+        "bengaluru": {
+            "name": "Bengaluru IT Corridor",
+            "bbox": [77.60, 12.85, 77.78, 13.02],
+            "coords": [77.6974, 12.9352],
+        },
+        "bangalore": {
+            "name": "Bengaluru IT Corridor",
+            "bbox": [77.60, 12.85, 77.78, 13.02],
+            "coords": [77.6974, 12.9352],
+        },
+        "sundarbans": {
+            "name": "Sundarbans Mangrove Delta",
+            "bbox": [88.70, 21.80, 89.00, 22.10],
+            "coords": [88.8532, 21.9497],
+        },
+    }
+
+    def optimize(self, text: str, session_context: Optional[Dict[str, Any]] = None) -> StructuredQueryPlan:
+        session_context = session_context or {}
+        q = text.lower().strip()
+        now = timezone.now().date()
+
+        # 1. Resolve Location / AOI
+        aoi = self._resolve_aoi(q, session_context)
+
+        # 2. Resolve Temporal Window
+        time_range = self._resolve_time_range(q, now)
+
+        # 3. Detect External Web Evidence Requirement
+        # External evidence is required when the query asks for causes, validation against
+        # official reports/warnings, weather context, drought, policy, or disaster declarations.
+        external_required, ext_query = self._detect_external_necessity(q, aoi["name"])
+
+        # 4. Classify Intent, Modalities, and Analysis Types
+        intent, target, operation, modalities, analysis, measurements = self._classify_pipeline(
+            q, session_context, external_required
+        )
+
+        # 5. Check if Conversational Follow-up
+        is_follow_up = False
+        history = session_context.get("conversation_history", [])
+        if history and any(k in q for k in ("only show", "filter", "which of these", "how many of them", "why", "what about")):
+            is_follow_up = True
+
+        return StructuredQueryPlan(
+            intent=intent,
+            target=target,
+            operation=operation,
+            aoi=aoi,
+            time_range=time_range,
+            modalities=modalities,
+            analysis=analysis,
+            external_evidence_required=external_required,
+            external_query=ext_query,
+            is_follow_up=is_follow_up,
+            requested_measurements=measurements,
+            confidence_threshold=0.75 if external_required else 0.70,
+        )
+
+    def _resolve_aoi(self, q: str, session_context: Dict[str, Any]) -> Dict[str, Any]:
+        # Check explicit location mentions in query
+        for key, loc in self.KNOWN_LOCATIONS.items():
+            if key in q:
+                return loc
+
+        # Fall back to session context active AOI or default
+        if session_context.get("aoi_name") and session_context.get("bbox"):
+            return {
+                "name": session_context["aoi_name"],
+                "bbox": session_context["bbox"],
+                "coords": session_context.get("centroid", [80.25, 13.05]),
+            }
+
+        return {
+            "name": "Designated Area of Interest",
+            "bbox": [80.15, 12.95, 80.35, 13.15],
+            "coords": [80.2707, 13.0827],
+        }
+
+    def _resolve_time_range(self, q: str, now: date) -> Dict[str, str]:
+        def _make_range(s: str, e: str) -> Dict[str, str]:
+            return {"start": s, "end": e, "start_date": s, "end_date": e}
+
+        # Relative time: "over the last 5 years", "past 5 years"
+        last_years_match = re.search(r"(?:last|past|over the past|over the last)\s*(\d+)\s*years?", q)
+        if last_years_match:
+            n_years = int(last_years_match.group(1))
+            start_year = now.year - n_years
+            return _make_range(f"{start_year}-01-01", now.strftime("%Y-%m-%d"))
+
+        # Match explicit multi-year range, e.g. "between 2018 and 2026", "2018 to 2024"
+        range_match = re.search(r"(?:between|from)?\s*(201\d|202\d)\s*(?:and|to|-)\s*(201\d|202\d)", q)
+        if range_match:
+            y1 = int(range_match.group(1))
+            y2 = int(range_match.group(2))
+            start_y, end_y = min(y1, y2), max(y1, y2)
+            return _make_range(f"{start_y}-01-01", f"{end_y}-12-31")
+
+        # Match single year, e.g. "in 2018", "since 2020", "before 2022"
+        single_year_match = re.search(r"\b(201\d|202\d)\b", q)
+        if single_year_match:
+            year = int(single_year_match.group(1))
+            if "since" in q or "after" in q or "from" in q:
+                return _make_range(f"{year}-01-01", now.strftime("%Y-%m-%d"))
+            elif "before" in q:
+                return _make_range("2016-01-01", f"{year}-12-31")
+            else:
+                return _make_range(f"{year}-01-01", f"{year}-12-31")
+
+        # Relative time: "5 years ago"
+        rel_match = re.search(r"(\d+)\s*years?\s*ago", q)
+        if rel_match:
+            years_ago = int(rel_match.group(1))
+            target_year = now.year - years_ago
+            return _make_range(f"{target_year}-01-01", f"{target_year}-12-31")
+
+        if "recent" in q or "latest" in q or "now" in q or "currently" in q:
+            start_date = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+            return _make_range(start_date, now.strftime("%Y-%m-%d"))
+
+        if "earliest" in q:
+            return _make_range("2016-01-01", "2017-12-31")
+
+        # Default multi-year historical comparison window
+        return _make_range("2018-01-01", now.strftime("%Y-%m-%d"))
+
+    def _detect_external_necessity(self, q: str, aoi_name: str) -> tuple[bool, str]:
+        external_triggers = [
+            "why",
+            "reason",
+            "cause",
+            "warning",
+            "alert",
+            "official",
+            "government",
+            "drought",
+            "rainfall",
+            "precipitation",
+            "weather",
+            "cyclone",
+            "flood",
+            "inundation",
+            "disaster",
+            "project",
+            "announced",
+            "report",
+            "policy",
+        ]
+
+        if any(trig in q for trig in external_triggers):
+            # Formulate targeted web query
+            clean_q = re.sub(r"[^\w\s]", "", q).strip()
+            ext_query = f"{aoi_name} {clean_q}"
+            return True, ext_query
+
+        return False, ""
+
+    def _classify_pipeline(
+        self, q: str, session_context: Dict[str, Any], external_required: bool
+    ) -> tuple[str, str, str, List[str], List[str], List[str]]:
+        modalities = ["optical"]
+        analysis = []
+        measurements = []
+
+        # SAR / Flood check
+        if any(k in q for k in ("flood", "sar", "radar", "water extent", "monsoon")):
+            modalities = ["sar"] if "optical" not in q else ["optical", "sar"]
+            analysis.extend(["sar_thresholding", "water_masking"])
+            measurements.append("inundated_area_hectares")
+            return (
+                "flood_inundation_assessment",
+                "water_bodies",
+                "sar_water_segmentation",
+                modalities,
+                analysis,
+                measurements,
+            )
+
+        # Vegetation / Agriculture check
+        if any(k in q for k in ("vegetation", "agriculture", "forest", "crop", "canopy", "greenery")):
+            analysis.extend(["calculate_ndvi", "canopy_segmentation"])
+            measurements.extend(["mean_ndvi", "vegetation_coverage_pct", "canopy_loss_hectares"])
+            if any(k in q for k in ("change", "decrease", "increase", "loss", "difference", "between")):
+                analysis.append("bitemporal_ndvi_differencing")
+                return (
+                    "vegetation_temporal_change",
+                    "vegetation",
+                    "bitemporal_differencing",
+                    modalities,
+                    analysis,
+                    measurements,
+                )
+            return (
+                "vegetation_health_analysis",
+                "vegetation",
+                "spectral_index_calculation",
+                modalities,
+                analysis,
+                measurements,
+            )
+
+        # Urban Expansion / Building / Infrastructure check
+        if any(k in q for k in ("building", "urban", "construction", "structure", "expansion", "road")):
+            analysis.extend(["calculate_ndbi", "structure_detection", "canny_contours"])
+            measurements.extend(["built_up_coverage_pct", "structure_count", "expansion_hectares"])
+            if any(k in q for k in ("change", "new", "appeared", "increase", "growth", "between")):
+                analysis.append("bitemporal_built_up_differencing")
+                return (
+                    "urban_expansion_monitoring",
+                    "built_up",
+                    "structure_change_detection",
+                    modalities,
+                    analysis,
+                    measurements,
+                )
+            return (
+                "infrastructure_detection",
+                "structures",
+                "object_detection",
+                modalities,
+                analysis,
+                measurements,
+            )
+
+        # General Bi-temporal change detection
+        if any(k in q for k in ("change", "changed", "before and after", "evolution", "compare")):
+            analysis.extend(["spectral_differencing", "polygonization", "change_quantification"])
+            measurements.extend(["changed_area_hectares", "change_percentage"])
+            return (
+                "change_detection",
+                "surface_dynamics",
+                "bitemporal_differencing",
+                modalities,
+                analysis,
+                measurements,
+            )
+
+        # Default VQA / Scene Description
+        analysis.append("vlm_multimodal_description")
+        return (
+            "scene_understanding",
+            "general_landcover",
+            "vlm_reasoning",
+            modalities,
+            analysis,
+            measurements,
+        )

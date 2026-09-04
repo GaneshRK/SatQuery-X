@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.evidence.models import EvidenceRegion
+from apps.evidence.models import EvidenceRegion, ExternalEvidence
 from apps.queries.models import ExecutionStep, Query
 
 
@@ -15,9 +15,16 @@ class EvidenceRegionSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+class ExternalEvidenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExternalEvidence
+        fields = "__all__"
+
+
 class QueryDetailSerializer(serializers.ModelSerializer):
     execution_steps = ExecutionStepSerializer(many=True, read_only=True)
     evidence_regions = EvidenceRegionSerializer(many=True, read_only=True)
+    external_evidence = ExternalEvidenceSerializer(many=True, read_only=True)
     answer_contract = serializers.SerializerMethodField()
 
     class Meta:
@@ -32,6 +39,9 @@ class QueryDetailSerializer(serializers.ModelSerializer):
             "detected_task",
             "status",
             "plan",
+            "structured_plan",
+            "follow_up_questions",
+            "evidence_graph",
             "answer",
             "confidence",
             "answer_contract",
@@ -40,6 +50,7 @@ class QueryDetailSerializer(serializers.ModelSerializer):
             "completed_at",
             "execution_steps",
             "evidence_regions",
+            "external_evidence",
         )
 
     def get_answer_contract(self, obj: Query) -> dict:
@@ -119,6 +130,23 @@ class QueryDetailSerializer(serializers.ModelSerializer):
                 "pair_type": obj.image_pair.pair_type,
                 "image_a": obj.image_pair.image_a.original_filename if obj.image_pair.image_a else None,
                 "image_b": obj.image_pair.image_b.original_filename if obj.image_pair.image_b else None,
+            })
+
+        for ext in obj.external_evidence.all():
+            sources.append({
+                "source_type": "EXTERNAL_WEB_EVIDENCE",
+                "publisher": ext.publisher,
+                "title": ext.title,
+                "domain": ext.source_domain,
+                "trust_tier": ext.source_type,
+                "trust_score": ext.trust_score,
+                "url": ext.source_url,
+            })
+            evidence_list.append({
+                "type": "external_citation",
+                "publisher": ext.publisher,
+                "trust_tier": ext.source_type,
+                "facts": ext.summary_facts,
             })
 
         # Methods based on task

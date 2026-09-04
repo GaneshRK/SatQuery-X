@@ -19,6 +19,7 @@ import {
   FileSpreadsheet,
   FileText,
   AlertTriangle,
+  Globe,
 } from 'lucide-react';
 import { ExecutionTrace, InputMode } from '@/types';
 import { submitQuery, listQueries, QueryDetailData, getExportUrl } from '@/services/queries';
@@ -78,6 +79,10 @@ export function formatQueryToTrace(queryData: QueryDetailData, sessionId: string
       quantified_area_hectares: totalKm2 > 0 ? Number((totalKm2 * 100).toFixed(1)) : null,
       change_percentage: totalKm2 > 0 ? 41.3 : null,
     },
+    structured_plan: queryData.structured_plan,
+    follow_up_questions: queryData.follow_up_questions,
+    evidence_graph: queryData.evidence_graph,
+    external_evidence: queryData.external_evidence,
     timings_ms: timings,
     errors: queryData.status === 'FAILED' ? ['Execution error occurred.'] : [],
     created_at: new Date().toISOString(),
@@ -152,6 +157,9 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
   };
 
   const getFollowUps = (lastQuery?: QueryDetailData) => {
+    if (lastQuery?.follow_up_questions && lastQuery.follow_up_questions.length > 0) {
+      return lastQuery.follow_up_questions;
+    }
     const task = lastQuery?.detected_task;
     if (task === 'CHANGE_DETECTION') {
       return [
@@ -341,6 +349,36 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
                     <div className="p-2 rounded bg-amber-950/20 border border-amber-900/30 text-[10px] font-mono text-amber-300/80 flex items-start gap-1.5">
                       <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
                       <span>{contract.limitations[0]}</span>
+                    </div>
+                  )}
+
+                  {/* External Web Corroboration Badge */}
+                  {((q.external_evidence && q.external_evidence.length > 0) || (contract?.evidence && contract.evidence.some((e: any) => e.type === 'EXTERNAL_WEB_EVIDENCE'))) && (
+                    <div className="flex items-center gap-1.5 text-[10px] font-mono text-blue-300 bg-blue-950/40 border border-blue-800/40 px-2 py-1 rounded w-fit">
+                      <Globe className="w-3 h-3 text-blue-400" />
+                      <span>Corroborated with audited external agency intelligence</span>
+                    </div>
+                  )}
+
+                  {/* Dynamic Follow-up Suggestions on each message */}
+                  {q.follow_up_questions && q.follow_up_questions.length > 0 && (
+                    <div className="pt-2 border-t border-slate-800/80 space-y-1.5">
+                      <span className="text-[10px] font-mono text-cyan-400 flex items-center gap-1">
+                        <Sparkles className="w-3 h-3 text-cyan-400" />
+                        Suggested Inquiries:
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {q.follow_up_questions.map((fq, fIdx) => (
+                          <button
+                            key={fIdx}
+                            onClick={() => handleSend(fq)}
+                            disabled={loading}
+                            className="text-left px-2 py-1 rounded bg-slate-950/80 hover:bg-cyan-950/60 text-[11px] font-mono text-slate-300 hover:text-cyan-300 border border-slate-800 hover:border-cyan-700/60 transition-all disabled:opacity-40"
+                          >
+                            &bull; {fq}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   )}
 

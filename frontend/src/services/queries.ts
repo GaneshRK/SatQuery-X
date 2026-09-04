@@ -32,6 +32,10 @@ export interface QueryDetailData {
   answer_contract?: AnswerContract;
   execution_steps: ExecutionStepData[];
   evidence_regions: EvidenceRegionData[];
+  structured_plan?: any;
+  follow_up_questions?: string[];
+  evidence_graph?: any;
+  external_evidence?: any[];
 }
 
 export async function submitQuery(

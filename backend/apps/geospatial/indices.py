@@ -34,3 +34,14 @@ def compute_ndbi(swir_band: np.ndarray, nir_band: np.ndarray) -> np.ndarray:
     denominator[denominator == 0] = 1e-6
     ndbi = (swir - nir) / denominator
     return np.clip(ndbi, -1.0, 1.0)
+
+
+def compute_nbr(nir_band: np.ndarray, swir2_band: np.ndarray) -> np.ndarray:
+    """Normalized Burn Ratio: (NIR - SWIR2) / (NIR + SWIR2)."""
+    nir = nir_band.astype(np.float32)
+    swir2 = swir2_band.astype(np.float32)
+    denominator = nir + swir2
+    denominator[denominator == 0] = 1e-6
+    nbr = (nir - swir2) / denominator
+    return np.clip(nbr, -1.0, 1.0)
+

@@ -229,7 +229,11 @@ export default function DashboardPage() {
         {/* Right Section: Trace & Evidence (5 Cols) */}
         <div className="lg:col-span-5 flex flex-col gap-6">
           <ExecutionTraceTimeline trace={currentTrace} />
-          <EvidenceDrawer evidence={currentTrace?.evidence || null} />
+          <EvidenceDrawer
+            evidence={currentTrace?.evidence || null}
+            externalEvidence={currentTrace?.external_evidence || null}
+            trace={currentTrace}
+          />
         </div>
       </main>
 

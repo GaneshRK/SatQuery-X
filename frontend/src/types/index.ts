@@ -62,6 +62,21 @@ export interface AOIGeometry {
   area_ha?: number;
 }
 
+export interface ExternalEvidenceItem {
+  id?: string;
+  source_title: string;
+  source_url: string;
+  domain: string;
+  publisher?: string;
+  trust_tier: 'TIER_1_GOV_AGENCY' | 'TIER_2_ACADEMIC_PEER_REVIEW' | 'TIER_3_REPUTABLE_NEWS' | 'TIER_4_GENERAL_WEB' | string;
+  published_date?: string | null;
+  extracted_facts: string[];
+  relevance_score?: number;
+  content_sha256?: string;
+  cached_at?: string;
+  expires_at?: string;
+}
+
 export interface ExecutionTrace {
   query_id: string;
   session_id: string;
@@ -75,6 +90,10 @@ export interface ExecutionTrace {
   confidence: number;
   answer_contract?: AnswerContract;
   evidence: EvidenceOutput;
+  structured_plan?: any;
+  follow_up_questions?: string[];
+  evidence_graph?: any;
+  external_evidence?: ExternalEvidenceItem[];
   timings_ms: Record<string, number>;
   errors: string[];
   created_at: string;
