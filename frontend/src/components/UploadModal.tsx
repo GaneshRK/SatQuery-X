@@ -80,7 +80,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         width: img.width,
         height: img.height,
         band_count: img.band_count,
-        geo_referenced: img.is_georeferenced,
+        geo_referenced: !!(img.is_georeferenced ?? img.bounds_wgs84),
         crs: img.crs,
         bounds_wgs84: img.bounds_wgs84,
         sensor_type: img.sensor,

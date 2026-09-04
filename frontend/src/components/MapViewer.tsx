@@ -16,7 +16,8 @@ import {
   Moon,
 } from 'lucide-react';
 import { RasterMetadata, EvidenceOutput } from '@/types';
-import { Map as MapLibreMap, GeoJSONSource } from 'maplibre-gl';
+import * as maplibregl from 'maplibre-gl';
+import type { Map as MapLibreMap, GeoJSONSource } from 'maplibre-gl';
 
 interface MapViewerProps {
   images: RasterMetadata[];
