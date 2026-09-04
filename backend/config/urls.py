@@ -23,6 +23,16 @@ from apps.queries.views import (
 )
 from apps.reports.views import ReportDetailView, ReportDownloadView, SessionReportListCreateView
 from apps.satellite.views import CandidateListView, CandidateSelectView, SatelliteSearchView
+from apps.satellite.temporal_views import (
+    SatelliteSceneListView,
+    SatelliteSceneDetailView,
+    AOIListCreateView,
+    AOITimelineView,
+    ChangeAnalysisView,
+    ChangeEventListView,
+    SyncStatusView,
+    AOIMonitoringView,
+)
 from apps.system.views import SystemHealthView
 
 api_v1_patterns = [
@@ -57,10 +67,18 @@ api_v1_patterns = [
     path("sessions/<uuid:session_id>/reports/<uuid:report_id>/", ReportDetailView.as_view(), name="report_detail"),
     path("sessions/<uuid:session_id>/reports/<uuid:report_id>/download/", ReportDownloadView.as_view(), name="report_download"),
 
-    # Satellite Copernicus
+    # Satellite Copernicus & Temporal Observation Engine
     path("satellite/search/", SatelliteSearchView.as_view(), name="satellite_search"),
     path("satellite/search/<uuid:request_id>/candidates/", CandidateListView.as_view(), name="candidate_list"),
     path("satellite/search/<uuid:request_id>/select/", CandidateSelectView.as_view(), name="candidate_select"),
+    path("satellite/scenes/", SatelliteSceneListView.as_view(), name="satellite_scenes"),
+    path("satellite/scenes/<uuid:scene_id>/", SatelliteSceneDetailView.as_view(), name="satellite_scene_detail"),
+    path("satellite/aoi/", AOIListCreateView.as_view(), name="satellite_aoi_list_create"),
+    path("satellite/aoi/<uuid:aoi_id>/timeline/", AOITimelineView.as_view(), name="satellite_aoi_timeline"),
+    path("satellite/change-analysis/", ChangeAnalysisView.as_view(), name="satellite_change_analysis"),
+    path("satellite/change-events/", ChangeEventListView.as_view(), name="satellite_change_events"),
+    path("satellite/sync-status/", SyncStatusView.as_view(), name="satellite_sync_status"),
+    path("satellite/monitoring/", AOIMonitoringView.as_view(), name="satellite_monitoring"),
 
     # Model Registry
     path("models/", ModelRegistryListView.as_view(), name="models_list"),

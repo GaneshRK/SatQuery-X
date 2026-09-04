@@ -4,6 +4,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Header } from '@/components/Header';
 import { UploadModal } from '@/components/UploadModal';
 import { MapViewer } from '@/components/MapViewer';
+import { EarthObservatory } from '@/components/EarthObservatory';
 import { ChatConsole, formatQueryToTrace } from '@/components/ChatConsole';
 import { ExecutionTraceTimeline } from '@/components/ExecutionTraceTimeline';
 import { EvidenceDrawer } from '@/components/EvidenceDrawer';
@@ -14,6 +15,7 @@ import { login } from '@/services/auth';
 import { listSessions, createSession, SessionData } from '@/services/sessions';
 import { listImages } from '@/services/images';
 import { listQueries } from '@/services/queries';
+import { Globe, Compass } from 'lucide-react';
 
 export default function DashboardPage() {
   const [sessions, setSessions] = useState<SessionData[]>([]);
@@ -25,6 +27,7 @@ export default function DashboardPage() {
   const [isSatelliteSearchOpen, setIsSatelliteSearchOpen] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
+  const [viewMode, setViewMode] = useState<'3d_earth' | '2d_gis'>('3d_earth');
 
   // Helper to load all assets and queries for a given session
   const loadSessionData = useCallback(async (sid: string) => {
@@ -163,12 +166,54 @@ export default function DashboardPage() {
       <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-[1800px] w-full mx-auto">
         {/* Left / Center Section: Map & Chat (7 Cols) */}
         <div className="lg:col-span-7 flex flex-col gap-6">
-          <div className="h-[520px] w-full">
-            <MapViewer
-              images={images}
-              evidence={currentTrace?.evidence || null}
-              onAskThisArea={handleAskThisArea}
-            />
+          {/* Earth Observatory & 2D Scientific View Switcher */}
+          <div className="flex items-center justify-between bg-[#0b1322] border border-slate-800 px-4 py-2.5 rounded-xl">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-slate-300 font-mono tracking-wider">
+                VIEWPORT MODE:
+              </span>
+              <div className="flex items-center bg-slate-900 p-1 rounded-lg border border-slate-800 text-xs">
+                <button
+                  onClick={() => setViewMode('3d_earth')}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-md transition-all font-mono font-medium ${
+                    viewMode === '3d_earth'
+                      ? 'bg-cyan-950 text-cyan-300 border border-cyan-700 shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Globe className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>3D Earth from Orbit</span>
+                </button>
+                <button
+                  onClick={() => setViewMode('2d_gis')}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-md transition-all font-mono font-medium ${
+                    viewMode === '2d_gis'
+                      ? 'bg-indigo-950 text-indigo-300 border border-indigo-700 shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Compass className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>2D Scientific GIS Tiles</span>
+                </button>
+              </div>
+            </div>
+            <span className="text-[11px] text-slate-500 font-mono hidden sm:inline">
+              Copernicus Sentinel-1/2 Real-Time Pipeline
+            </span>
+          </div>
+
+          <div className="h-[560px] w-full">
+            {viewMode === '3d_earth' ? (
+              <EarthObservatory
+                onAskAI={(prompt) => setPendingPrompt(prompt)}
+              />
+            ) : (
+              <MapViewer
+                images={images}
+                evidence={currentTrace?.evidence || null}
+                onAskThisArea={handleAskThisArea}
+              />
+            )}
           </div>
 
           <ChatConsole
