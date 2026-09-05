@@ -181,7 +181,7 @@ export const Header: React.FC<HeaderProps> = ({
 
         <div className="hidden xl:flex items-center gap-1.5 text-xs text-emerald-400 font-mono bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-800/40">
           <ShieldCheck className="w-3.5 h-3.5" />
-          <span>ISRO Evaluator Verified</span>
+          <span>STAC & OGC Compliant</span>
         </div>
       </div>
     </header>

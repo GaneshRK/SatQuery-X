@@ -1,8 +1,8 @@
 # SatQuery-X API Specification (REST & OpenAPI Reference)
 
-**Base URL**: `/v1` or `/api/v1`  
-**Protocol**: HTTP/1.1 & HTTP/2 (FastAPI Async)  
-**Authentication**: Bearer JWT (`/v1/auth/token`)
+**Base URL**: `/api/v1`  
+**Protocol**: HTTP/1.1 & HTTP/2 (Django REST Framework ASGI/WSGI)  
+**Authentication**: Bearer JWT (`/api/v1/auth/login/`)
 
 ---
 
@@ -10,20 +10,21 @@
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/v1/health` | Service liveness, readiness, and component diagnostics |
-| `POST` | `/v1/auth/token` | Obtain role-based JWT authentication token |
-| `POST` | `/v1/sessions` | Create a new analysis session |
-| `GET` | `/v1/sessions/{id}` | Retrieve session details and list of ingested rasters |
-| `POST` | `/v1/sessions/{id}/images` | Upload 1 or 2 satellite rasters (GeoTIFF/PNG) |
-| `GET` | `/v1/sessions/{id}/images/{img_id}/preview` | Get rendered web PNG thumbnail of raster |
-| `GET` | `/v1/sessions/{id}/images/{img_id}` | Get metadata, CRS, resolution, and affine transform |
-| `POST` | `/v1/sessions/{id}/query` | Submit natural-language query to Agentic Planner & Executor |
-| `GET` | `/v1/sessions/{id}/query/{q_id}` | Retrieve execution trace and evidence for query |
-| `GET` | `/v1/sessions/{id}/query/{q_id}/stream` | Server-Sent Events (SSE) stream of execution progress |
-| `POST` | `/v1/sessions/{id}/report` | Generate auditable HTML/PDF intelligence report |
-| `GET` | `/v1/sessions/{id}/report/{rep_id}/view` | View HTML intelligence report in browser |
-| `GET` | `/v1/models` | List all registered specialist models and health status |
-| `GET` | `/v1/models/{model_id}` | Get specialist model specification and contracts |
+| `GET` | `/api/v1/health/` | Service liveness, readiness, and component diagnostics |
+| `POST` | `/api/v1/auth/login/` | Obtain role-based JWT access and refresh tokens |
+| `POST` | `/api/v1/sessions/` | Create a new analysis session |
+| `GET` | `/api/v1/sessions/` | List user sessions and workspaces |
+| `GET` | `/api/v1/sessions/{id}/` | Retrieve session details and list of ingested rasters |
+| `POST` | `/api/v1/sessions/{id}/images/` | Upload 1 or 2 satellite rasters (GeoTIFF/PNG) |
+| `GET` | `/api/v1/sessions/{id}/images/{img_id}/preview/` | Get rendered web PNG thumbnail of raster |
+| `GET` | `/api/v1/sessions/{id}/images/{img_id}/` | Get metadata, CRS, resolution, and affine transform |
+| `POST` | `/api/v1/sessions/{id}/queries/` | Submit natural-language query to Agentic Planner & Executor |
+| `GET` | `/api/v1/sessions/{id}/queries/{q_id}/` | Retrieve execution trace and evidence for query |
+| `GET` | `/api/v1/sessions/{id}/queries/{q_id}/stream/` | Server-Sent Events (SSE) stream of execution progress |
+| `POST` | `/api/v1/sessions/{id}/reports/` | Generate auditable HTML/PDF intelligence report |
+| `GET` | `/api/v1/reports/{id}/` | View or download HTML/PDF intelligence report |
+| `GET` | `/api/v1/models/` | List all registered specialist models and health status |
+| `GET` | `/api/v1/models/{model_id}/` | Get specialist model specification and contracts |
 
 ---
 

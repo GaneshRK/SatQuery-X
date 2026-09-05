@@ -13,7 +13,7 @@
                                   │
                                   ▼
                      ┌─────────────────────────┐
-                     │   API GATEWAY (FastAPI) │  <- JWT auth, rate limiting, Pydantic v2
+                     │ API GATEWAY (Django DRF)│  <- JWT auth, rate limiting, DRF Serializers
                      └────────────┬────────────┘
                                   │
                      ┌────────────▼────────────┐

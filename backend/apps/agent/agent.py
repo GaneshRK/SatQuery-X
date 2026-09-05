@@ -243,6 +243,20 @@ class Agent:
                 query.image = image_assets[0]
                 query.save(update_fields=["image"])
                 validation["mode"] = "SINGLE_IMAGE"
+            else:
+                query.status = "FAILED"
+                query.error = "SATELLITE_DATA_UNAVAILABLE: No suitable Earth observations found for the specified location and temporal range."
+                query.answer = "I was unable to retrieve suitable satellite observations for this area and time window from the Copernicus catalogue. Please consider broadening the temporal search window or adjusting cloud cover criteria."
+                query.confidence = 0.0
+                query.completed_at = timezone.now()
+                query.save()
+
+                publish_query_event(redis_client, str(query.id), {
+                    "event": "QUERY_FAILED",
+                    "query_id": str(query.id),
+                    "error": query.error,
+                })
+                return {"status": "FAILED", "error": query.error, "answer": query.answer}
 
         # 2c. MODE B — SINGLE USER IMAGE + SATELLITE MATCHING (§14, §55)
         elif validation["mode"] == "MODE_B_SATELLITE_MATCHING" and len(image_assets) == 1:
