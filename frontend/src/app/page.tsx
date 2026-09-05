@@ -233,22 +233,20 @@ export default function DashboardPage() {
               <div className="flex items-center bg-slate-900 p-1 rounded-lg border border-slate-800 text-xs">
                 <button
                   onClick={() => setViewMode('3d_earth')}
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-md transition-all font-mono font-medium ${
-                    viewMode === '3d_earth'
-                      ? 'bg-cyan-950 text-cyan-300 border border-cyan-700 shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-md transition-all font-mono font-medium ${viewMode === '3d_earth'
+                    ? 'bg-cyan-950 text-cyan-300 border border-cyan-700 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                    }`}
                 >
                   <Globe className="w-3.5 h-3.5 text-cyan-400" />
                   <span>3D Earth from Orbit</span>
                 </button>
                 <button
                   onClick={() => setViewMode('2d_gis')}
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-md transition-all font-mono font-medium ${
-                    viewMode === '2d_gis'
-                      ? 'bg-indigo-950 text-indigo-300 border border-indigo-700 shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-md transition-all font-mono font-medium ${viewMode === '2d_gis'
+                    ? 'bg-indigo-950 text-indigo-300 border border-indigo-700 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                    }`}
                 >
                   <Compass className="w-3.5 h-3.5 text-indigo-400" />
                   <span>2D Scientific GIS Tiles</span>

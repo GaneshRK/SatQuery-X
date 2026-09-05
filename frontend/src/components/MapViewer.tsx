@@ -491,7 +491,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({
     }
 
     const baseMap = mapRef.current;
-    const initialCenter = baseMap ? baseMap.getCenter() : [93.125, 26.625];
+    const initialCenter: maplibregl.LngLatLike = baseMap ? baseMap.getCenter() : [93.125, 26.625];
     const initialZoom = baseMap ? baseMap.getZoom() : 9;
     const initialBearing = baseMap ? baseMap.getBearing() : 0;
     const initialPitch = baseMap ? baseMap.getPitch() : 0;

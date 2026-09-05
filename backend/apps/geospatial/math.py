@@ -43,10 +43,10 @@ def calculate_pixel_area_m2(
     is_geographic = True
     if crs_str:
         lower_crs = crs_str.lower()
-        if "utm" in lower_crs or "3857" in lower_crs or "326" in lower_crs or "327" in lower_crs:
-            is_geographic = False
-        elif "4326" in lower_crs or "wgs 84" in lower_crs or "degree" in lower_crs:
+        if "4326" in lower_crs or "wgs 84" in lower_crs or "degree" in lower_crs:
             is_geographic = True
+        elif "utm" in lower_crs or "3857" in lower_crs or "epsg:326" in lower_crs or "epsg:327" in lower_crs:
+            is_geographic = False
 
     if not is_geographic:
         # Native units are already meters
@@ -99,12 +99,14 @@ def calculate_polygon_ground_area_m2(poly_geom: Any, crs_str: str | None = None)
     if poly.is_empty:
         return 0.0
 
+    # If CRS is explicitly geographic (degrees)
+    if crs_str and any(geo in crs_str.lower() for geo in ("4326", "wgs 84", "degree")):
+        pass
     # If CRS is projected in meters (e.g. UTM)
-    if crs_str and any(proj in crs_str.lower() for proj in ("utm", "326", "327")):
+    elif crs_str and any(proj in crs_str.lower() for proj in ("utm", "epsg:326", "epsg:327")):
         return float(poly.area)
-
     # In Web Mercator (EPSG:3857)
-    if crs_str and "3857" in crs_str:
+    elif crs_str and "3857" in crs_str:
         lat_center = math.radians(poly.centroid.y)
         return float(poly.area * (math.cos(lat_center) ** 2))
 

@@ -70,7 +70,7 @@ class RSGroundingModel:
             # Elongated linear feature threshold
             saliency = ((gray > 130) & (gray < 220)).astype(np.uint8)
             label = "transportation_infrastructure"
-            base_conf = 0.82
+            base_conf = round(float(min(0.92, 0.72 + (float(np.std(gray)) / 255.0) * 0.35)), 2)
         else:
             # Vegetation or generic land-cover target
             if len(arr.shape) == 3 and arr.shape[2] >= 3:

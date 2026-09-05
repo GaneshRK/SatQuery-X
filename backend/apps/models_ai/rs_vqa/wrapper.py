@@ -65,16 +65,16 @@ class RSVQAModel:
             has_water = water_ratio > 0.03
             if has_water:
                 answer = f"Yes, water bodies are identified with distinct spectral absorption, covering approximately {water_ratio * 100:.1f}% of the scene."
-                confidence = round(min(0.95, 0.82 + water_ratio * 0.3), 3)
+                confidence = round(min(0.95, 0.74 + water_ratio * 0.4), 3)
             else:
                 answer = "No significant open water bodies are detected within this scene."
                 confidence = 0.86
         elif any(k in question for k in ("vegetation", "forest", "crop", "farm", "green")):
             answer = f"Vegetation covers approximately {veg_ratio * 100:.1f}% of the visible scene."
-            confidence = round(min(0.95, 0.80 + veg_ratio * 0.25), 3)
+            confidence = round(min(0.95, 0.75 + veg_ratio * 0.35), 3)
         elif any(k in question for k in ("built-up", "urban", "building", "city", "settlement", "infrastructure")):
             answer = f"Built-up and impervious structures account for approximately {urban_ratio * 100:.1f}% of the territory."
-            confidence = round(min(0.94, 0.81 + urban_ratio * 0.25), 3)
+            confidence = round(min(0.94, 0.76 + urban_ratio * 0.30), 3)
         elif any(k in question for k in ("resolution", "sensor", "dimension", "size")):
             answer = f"Scene dimensions are {img.width}x{img.height} pixels across {arr.shape[2] if len(arr.shape) == 3 else 1} channels."
             confidence = 0.95
@@ -84,7 +84,7 @@ class RSVQAModel:
             confidence = 0.87
         else:
             answer = f"Remote-sensing analysis of this {img.width}x{img.height} scene indicates mixed terrain with {veg_ratio*100:.1f}% vegetation and {urban_ratio*100:.1f}% built-up features."
-            confidence = 0.82
+            confidence = round(min(0.92, max(0.68, 0.70 + (float(np.std(arr)) / 255.0) * 0.35)), 3)
 
         latency = int((time.perf_counter() - start_time) * 1000)
 
