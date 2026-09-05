@@ -154,6 +154,7 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
                     final_answer = f"Mean NDVI index is {mean_ndvi:.2f}, indicating {veg_pct:.1f}% vegetative land-cover."
                     confidences.append(0.94)
 
+                step_outputs[f"step_{step_num}"] = tool_result
                 step_row.status = "DONE"
                 step_row.completed_at = timezone.now()
                 step_row.latency_ms = int((time.perf_counter() - t_start) * 1000)
@@ -201,6 +202,7 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
                             source_step=step_row,
                         )
 
+                step_outputs[f"step_{step_num}"] = quant_result
                 step_row.status = "DONE"
                 step_row.completed_at = timezone.now()
                 step_row.latency_ms = int((time.perf_counter() - t_start) * 1000)
@@ -239,6 +241,11 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
                 if isinstance(model_out.change_mask, (bytes, bytearray)):
                     last_mask_bytes = bytes(model_out.change_mask)
 
+            step_outputs[f"step_{step_num}"] = {
+                "answer": model_out.answer,
+                "confidence": model_out.confidence,
+                "raw": model_out.raw,
+            }
             step_row.status = "DONE" if model_out.status == "ok" else "FAILED"
             step_row.completed_at = timezone.now()
             step_row.latency_ms = int((time.perf_counter() - t_start) * 1000)
@@ -332,12 +339,29 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
         if isinstance(s_out, dict):
             measurements_dict.update(s_out)
 
+    # Dynamically derive area metrics from real EvidenceRegion records
+    from apps.evidence.models import EvidenceRegion
+    ev_regions = EvidenceRegion.objects.filter(query=query)
+    if ev_regions.exists():
+        total_ev_km2 = sum(r.area_km2 or 0.0 for r in ev_regions)
+        if total_ev_km2 > 0:
+            measurements_dict["changed_area_km2"] = round(total_ev_km2, 4)
+            measurements_dict["changed_area_hectares"] = round(total_ev_km2 * 100.0, 2)
+
     change_evts = []
     if query.detected_task in ("CHANGE_DETECTION", "CHANGE_VQA"):
-        change_evts.append({
-            "area_hectares": measurements_dict.get("changed_area_hectares", 18.2),
-            "change_type": "URBAN_EXPANSION",
-        })
+        calc_ha = measurements_dict.get("changed_area_hectares")
+        if calc_ha is not None and calc_ha > 0:
+            change_evts.append({
+                "area_hectares": calc_ha,
+                "change_type": "URBAN_EXPANSION" if "urban" in query.text.lower() else "LANDCOVER_DYNAMICS",
+            })
+        elif measurements_dict.get("total_area_km2", 0) > 0:
+            tot_ha = measurements_dict["total_area_km2"] * 100.0
+            change_evts.append({
+                "area_hectares": round(tot_ha, 2),
+                "change_type": "SURFACE_CHANGE",
+            })
 
     reason_res = georeason.synthesize(
         query_text=query.text,

@@ -18,12 +18,34 @@ def validate_agent_inputs(
     elif intent.cross_modal or intent.intent == "optical_sar_fusion":
         mode = "CROSS_MODAL"
 
+    # 0. Clarification query check (§57)
+    if getattr(intent, "clarification_required", False) or getattr(intent, "intent", "") == "CLARIFICATION":
+        return {
+            "valid": True,
+            "mode": "CLARIFICATION",
+            "reasons": [],
+        }
+
+    # 0b. Mode A (Zero-Upload Autonomous Query) check (§1, §58)
+    has_location = bool(getattr(intent, "location", None))
+    is_satellite_query = getattr(intent, "intent", "") in ("SATELLITE_SEARCH", "LATEST_OBSERVATION")
+    if (has_location or is_satellite_query) and len(image_assets) == 0:
+        mode = "MODE_A_CHANGE" if intent.temporal else "AUTONOMOUS_EARTH_SEARCH"
+        return {
+            "valid": True,
+            "mode": mode,
+            "reasons": [],
+        }
+
     # 1. Image count check
     if mode in ("BI_TEMPORAL", "CROSS_MODAL"):
         count = len(image_assets)
         if image_pair:
             count = 2
-        if count < 2:
+        # Mode B check (§14): single image paired with catalogue observations
+        if count == 1 and mode == "BI_TEMPORAL":
+            mode = "MODE_B_SATELLITE_MATCHING"
+        elif count < 2:
             reasons.append(
                 f"Task '{intent.intent}' requires 2 images (mode: {mode}), but only {count} was provided."
             )

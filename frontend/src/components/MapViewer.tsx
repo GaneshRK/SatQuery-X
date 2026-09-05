@@ -13,6 +13,9 @@ import {
   Sparkles,
   Trash2,
   Activity,
+  ChevronLeft,
+  ChevronRight,
+  SplitSquareVertical,
 } from 'lucide-react';
 import { RasterMetadata, EvidenceOutput, UIAction } from '@/types';
 import { ExplainFeatureData } from './ClickToExplainModal';
@@ -117,7 +120,14 @@ export const MapViewer: React.FC<MapViewerProps> = ({
     y: number;
   } | null>(null);
 
-  const activeImage = images[activeImageIndex] || null;
+  // Before/After Split Swipe Slider state
+  const [isSplitMode, setIsSplitMode] = useState(false);
+  const [splitPosition, setSplitPosition] = useState(50);
+  const secondMapContainerRef = useRef<HTMLDivElement>(null);
+  const secondMapRef = useRef<MapLibreMap | null>(null);
+  const isDraggingSplitRef = useRef(false);
+
+  const activeImage = isSplitMode && images.length >= 2 ? images[0] : (images[activeImageIndex] || null);
 
   // Handle UI Actions dispatched by assistant
   useEffect(() => {
@@ -250,6 +260,52 @@ export const MapViewer: React.FC<MapViewerProps> = ({
       console.warn('MapLibre raster layer warning:', err);
     }
   }, [activeImage, rasterOpacity, showRaster]);
+
+  // Update Second Satellite Raster Layer for Split Slider Comparison
+  const updateSecondRasterLayer = useCallback(() => {
+    const map = secondMapRef.current;
+    if (!map || !map.isStyleLoaded()) return;
+
+    if (map.getLayer('satquery-raster-layer-2')) {
+      map.removeLayer('satquery-raster-layer-2');
+    }
+    if (map.getSource('satquery-raster-source-2')) {
+      map.removeSource('satquery-raster-source-2');
+    }
+
+    const img2 = images[1];
+    if (!showRaster || !img2 || !img2.bounds_wgs84 || !img2.preview_url) {
+      return;
+    }
+
+    const b = img2.bounds_wgs84;
+    const coordinates: [[number, number], [number, number], [number, number], [number, number]] = [
+      [b.west, b.north],
+      [b.east, b.north],
+      [b.east, b.south],
+      [b.west, b.south],
+    ];
+
+    try {
+      map.addSource('satquery-raster-source-2', {
+        type: 'image',
+        url: img2.preview_url,
+        coordinates: coordinates,
+      });
+
+      map.addLayer({
+        id: 'satquery-raster-layer-2',
+        type: 'raster',
+        source: 'satquery-raster-source-2',
+        paint: {
+          'raster-opacity': rasterOpacity,
+          'raster-fade-duration': 150,
+        },
+      });
+    } catch (err) {
+      console.warn('MapLibre second raster layer warning:', err);
+    }
+  }, [images, rasterOpacity, showRaster]);
 
   // Update Vector Evidence Layer on Map
   const updateEvidenceLayer = useCallback(() => {
@@ -418,7 +474,115 @@ export const MapViewer: React.FC<MapViewerProps> = ({
     if (map && map.getLayer('satquery-raster-layer')) {
       map.setPaintProperty('satquery-raster-layer', 'raster-opacity', rasterOpacity);
     }
+    const map2 = secondMapRef.current;
+    if (map2 && map2.getLayer('satquery-raster-layer-2')) {
+      map2.setPaintProperty('satquery-raster-layer-2', 'raster-opacity', rasterOpacity);
+    }
   }, [rasterOpacity]);
+
+  // Initialize and synchronize Second Map for Split Slider
+  useEffect(() => {
+    if (!isSplitMode || !secondMapContainerRef.current) {
+      if (secondMapRef.current) {
+        secondMapRef.current.remove();
+        secondMapRef.current = null;
+      }
+      return;
+    }
+
+    const baseMap = mapRef.current;
+    const initialCenter = baseMap ? baseMap.getCenter() : [93.125, 26.625];
+    const initialZoom = baseMap ? baseMap.getZoom() : 9;
+    const initialBearing = baseMap ? baseMap.getBearing() : 0;
+    const initialPitch = baseMap ? baseMap.getPitch() : 0;
+
+    const map2 = new maplibregl.Map({
+      container: secondMapContainerRef.current,
+      style: BASEMAP_STYLES[basemap],
+      center: initialCenter,
+      zoom: initialZoom,
+      bearing: initialBearing,
+      pitch: initialPitch,
+      attributionControl: false,
+    });
+
+    let isSyncing = false;
+    const syncMaps = (source: MapLibreMap, target: MapLibreMap) => {
+      if (isSyncing) return;
+      isSyncing = true;
+      target.jumpTo({
+        center: source.getCenter(),
+        zoom: source.getZoom(),
+        bearing: source.getBearing(),
+        pitch: source.getPitch(),
+      });
+      isSyncing = false;
+    };
+
+    const onBaseMove = () => {
+      if (secondMapRef.current && mapRef.current) {
+        syncMaps(mapRef.current, secondMapRef.current);
+      }
+    };
+    const onSecondMove = () => {
+      if (mapRef.current && secondMapRef.current) {
+        syncMaps(secondMapRef.current, mapRef.current);
+      }
+    };
+
+    map2.on('load', () => {
+      updateSecondRasterLayer();
+    });
+
+    baseMap?.on('move', onBaseMove);
+    map2.on('move', onSecondMove);
+
+    secondMapRef.current = map2;
+
+    return () => {
+      baseMap?.off('move', onBaseMove);
+      map2.remove();
+      secondMapRef.current = null;
+    };
+  }, [isSplitMode, basemap, updateSecondRasterLayer]);
+
+  // Mouse / Touch drag handlers for split slider
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDraggingSplitRef.current || !mapContainerRef.current) return;
+      const rect = mapContainerRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const pct = Math.max(5, Math.min(95, (x / rect.width) * 100));
+      setSplitPosition(pct);
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!isDraggingSplitRef.current || !mapContainerRef.current || e.touches.length === 0) return;
+      const rect = mapContainerRef.current.getBoundingClientRect();
+      const x = e.touches[0].clientX - rect.left;
+      const pct = Math.max(5, Math.min(95, (x / rect.width) * 100));
+      setSplitPosition(pct);
+    };
+
+    const handleMouseUp = () => {
+      if (isDraggingSplitRef.current) {
+        isDraggingSplitRef.current = false;
+        document.body.style.cursor = '';
+      }
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    window.addEventListener('touchmove', handleTouchMove);
+    window.addEventListener('touchend', handleMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      window.removeEventListener('touchmove', handleTouchMove);
+      window.removeEventListener('touchend', handleMouseUp);
+    };
+  }, []);
 
   const handleZoomIn = () => mapRef.current?.zoomIn();
   const handleZoomOut = () => mapRef.current?.zoomOut();
@@ -473,7 +637,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({
             key={img.image_id || idx}
             onClick={() => setActiveImageIndex(idx)}
             className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all ${
-              activeImageIndex === idx
+              activeImageIndex === idx && !isSplitMode
                 ? 'bg-blue-600 text-white font-semibold shadow-sm'
                 : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
             }`}
@@ -481,6 +645,21 @@ export const MapViewer: React.FC<MapViewerProps> = ({
             {img.sensor_type?.toUpperCase() || 'RASTER'} #{idx + 1}
           </button>
         ))}
+
+        {images.length >= 2 && (
+          <button
+            onClick={() => setIsSplitMode(!isSplitMode)}
+            className={`px-3 py-1.5 text-xs font-mono rounded-md transition-all flex items-center gap-1.5 ${
+              isSplitMode
+                ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white font-semibold shadow-md ring-1 ring-cyan-400'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800 border border-slate-700/60'
+            }`}
+            title="Toggle Before/After Split Swipe Slider"
+          >
+            <SplitSquareVertical className="w-3.5 h-3.5" />
+            <span>{isSplitMode ? 'Split: ON' : 'Split Slider'}</span>
+          </button>
+        )}
 
         <div className="h-4 w-px bg-slate-800 mx-1" />
 
@@ -624,8 +803,51 @@ export const MapViewer: React.FC<MapViewerProps> = ({
         </div>
       )}
 
-      {/* MapLibre GL WebGL Map Container */}
-      <div ref={mapContainerRef} className="w-full flex-1" />
+      {/* Map Container Area (Supports Single Map & Split Swipe Map) */}
+      <div className="relative w-full flex-1 overflow-hidden">
+        <div ref={mapContainerRef} className="w-full h-full" />
+
+        {isSplitMode && images.length >= 2 && (
+          <>
+            {/* Second Map Container clipped to split position */}
+            <div
+              ref={secondMapContainerRef}
+              className="absolute inset-0 w-full h-full"
+              style={{
+                clipPath: `polygon(${splitPosition}% 0, 100% 0, 100% 100%, ${splitPosition}% 100%)`,
+              }}
+            />
+
+            {/* Split Swipe Bar & Handle */}
+            <div
+              className="absolute top-0 bottom-0 z-30 flex flex-col items-center justify-center cursor-col-resize select-none"
+              style={{ left: `${splitPosition}%`, transform: 'translateX(-50%)' }}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                isDraggingSplitRef.current = true;
+                document.body.style.cursor = 'col-resize';
+              }}
+              onTouchStart={() => {
+                isDraggingSplitRef.current = true;
+              }}
+            >
+              <div className="w-0.5 h-full bg-cyan-400 shadow-[0_0_12px_rgba(6,182,212,0.9)]" />
+              <div className="absolute top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-slate-900/95 border-2 border-cyan-400 flex items-center justify-center shadow-2xl text-cyan-300 hover:scale-110 active:scale-95 transition-transform">
+                <ChevronLeft className="w-3.5 h-3.5 -mr-1" />
+                <ChevronRight className="w-3.5 h-3.5 -ml-1" />
+              </div>
+            </div>
+
+            {/* T1 / T2 Mode Badges */}
+            <div className="absolute top-14 left-4 z-20 bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-lg border border-cyan-500/40 text-xs font-mono text-cyan-300 pointer-events-none shadow-lg">
+              <span className="font-bold text-cyan-400">T1:</span> {images[0].filename || 'Image 1'} ({images[0].sensor_type || 'Optical'})
+            </div>
+            <div className="absolute top-14 right-4 z-20 bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-lg border border-purple-500/40 text-xs font-mono text-purple-300 pointer-events-none shadow-lg">
+              <span className="font-bold text-purple-400">T2:</span> {images[1].filename || 'Image 2'} ({images[1].sensor_type || 'SAR'})
+            </div>
+          </>
+        )}
+      </div>
 
       {/* Hover Intelligence Tooltip */}
       {hoveredFeature && (

@@ -39,11 +39,17 @@ class Project(models.Model):
 
 class User(AbstractUser):
     ROLE_CHOICES = [
+        ("OWNER", "Organization Owner"),
+        ("ADMIN", "Project Administrator"),
+        ("ANALYST", "Remote Sensing Analyst"),
+        ("VIEWER", "Read-Only Viewer"),
+        ("JUDGE", "SIH Technical Judge"),
+        # Legacy/backwards compatibility choices:
         ("demo", "Demo Analyst"),
         ("judge", "SIH Judge"),
         ("admin", "Administrator"),
     ]
-    role = models.CharField(max_length=32, choices=ROLE_CHOICES, default="demo")
+    role = models.CharField(max_length=32, choices=ROLE_CHOICES, default="ANALYST")
     organization = models.ForeignKey(
         Organization, on_delete=models.SET_NULL, null=True, blank=True, related_name="members"
     )

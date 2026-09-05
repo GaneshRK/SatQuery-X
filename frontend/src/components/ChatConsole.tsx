@@ -54,14 +54,28 @@ export function formatQueryToTrace(queryData: QueryDetailData, sessionId: string
   const evidenceRegions = queryData.evidence_regions || [];
   const totalKm2 = evidenceRegions.reduce((sum, e) => sum + (e.area_km2 || 0), 0);
 
-  const bboxes = evidenceRegions.map((e, idx) => ({
-    x1: 60 + idx * 50,
-    y1: 80 + idx * 40,
-    x2: 200 + idx * 50,
-    y2: 220 + idx * 40,
-    label: e.class_name,
-    confidence: e.confidence,
-  }));
+  // Extract real bboxes if provided by detection/grounding models, otherwise empty
+  const bboxes = evidenceRegions
+    .filter((e) => (e as any).bbox && Array.isArray((e as any).bbox) && (e as any).bbox.length === 4)
+    .map((e) => {
+      const b = (e as any).bbox;
+      return {
+        x1: b[0],
+        y1: b[1],
+        x2: b[2],
+        y2: b[3],
+        label: e.class_name,
+        confidence: e.confidence,
+      };
+    });
+
+  // Extract change percentage from real measurements if computed
+  const measurementPct = queryData.answer_contract?.measurements?.find(
+    (m: any) => m.metric && (m.metric.toLowerCase().includes('percent') || m.unit === '%')
+  );
+  const changePct = measurementPct && typeof measurementPct.value === 'number'
+    ? measurementPct.value
+    : null;
 
   return {
     query_id: queryData.id,
@@ -73,14 +87,14 @@ export function formatQueryToTrace(queryData: QueryDetailData, sessionId: string
     plan: planSteps,
     outputs: {},
     answer: queryData.answer || 'Query processed.',
-    confidence: queryData.confidence || 0.92,
+    confidence: typeof queryData.confidence === 'number' ? queryData.confidence : 0.0,
     answer_contract: queryData.answer_contract,
     evidence: {
       bboxes,
-      geojson: evidenceRegions.map((e) => e.geojson_geometry),
-      quantified_area_km2: totalKm2 > 0 ? Number(totalKm2.toFixed(2)) : null,
-      quantified_area_hectares: totalKm2 > 0 ? Number((totalKm2 * 100).toFixed(1)) : null,
-      change_percentage: totalKm2 > 0 ? 41.3 : null,
+      geojson: evidenceRegions.map((e) => e.geojson_geometry).filter(Boolean),
+      quantified_area_km2: totalKm2 > 0 ? Number(totalKm2.toFixed(3)) : null,
+      quantified_area_hectares: totalKm2 > 0 ? Number((totalKm2 * 100).toFixed(2)) : null,
+      change_percentage: changePct,
     },
     structured_plan: queryData.structured_plan,
     follow_up_questions: queryData.follow_up_questions,
@@ -585,7 +599,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
               <button
                 key={i}
                 onClick={() => handleSend(suggestion)}
-                disabled={loading || !hasImages}
+                disabled={loading || !sessionId}
                 className="px-2.5 py-1 text-[11px] rounded-md bg-slate-900/90 hover:bg-blue-600/20 hover:text-blue-300 hover:border-blue-500/40 text-slate-300 border border-slate-800 transition-all font-mono text-left disabled:opacity-40"
               >
                 &bull; {suggestion}
@@ -612,9 +626,9 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
               placeholder={
                 hasImages
                   ? 'Ask any geospatial query (e.g. Quantify surface water extent in km²)...'
-                  : 'Upload satellite imagery to activate vision-language reasoning...'
+                  : 'Ask anything about Earth (e.g. What is changing around Chennai?)...'
               }
-              disabled={loading || !hasImages}
+              disabled={loading || !sessionId}
               className="w-full bg-slate-900 border border-slate-800 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-lg pl-4 pr-10 py-2.5 text-xs text-white placeholder-slate-500 font-mono transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             />
             {loading && (
@@ -627,7 +641,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
           <button
             type="button"
             onClick={toggleVoiceInput}
-            disabled={loading || !hasImages}
+            disabled={loading || !sessionId}
             className={`p-2.5 rounded-lg border transition-all flex items-center justify-center ${
               isListening
                 ? 'bg-red-950 text-red-400 border-red-500 animate-pulse ring-2 ring-red-500/50'
@@ -640,7 +654,7 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
 
           <button
             type="submit"
-            disabled={loading || !queryText.trim() || !hasImages}
+            disabled={loading || !queryText.trim() || !sessionId}
             className="px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white text-xs font-medium font-mono flex items-center gap-2 transition-all shadow-md shadow-blue-600/20 disabled:shadow-none active:scale-95"
           >
             <span>Reason</span>

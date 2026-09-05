@@ -36,13 +36,16 @@ from apps.satellite.temporal_views import (
     AOIMonitoringView,
 )
 from apps.system.views import SystemHealthView
+from apps.system.demo_views import DemoScenariosListView, BootstrapDemoScenarioView
 
 api_v1_patterns = [
     # Auth
     path("auth/", include("apps.accounts.urls")),
 
-    # System Health
+    # System Health & Demo Scenarios
     path("health/", SystemHealthView.as_view(), name="system_health"),
+    path("demo-scenarios/", DemoScenariosListView.as_view(), name="demo_scenarios_list"),
+    path("demo-scenarios/bootstrap/<str:scenario_key>/", BootstrapDemoScenarioView.as_view(), name="bootstrap_demo_scenario"),
 
     # Sessions
     path("sessions/", include("apps.sessions.urls")),

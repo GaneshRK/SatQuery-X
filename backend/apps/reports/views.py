@@ -8,13 +8,15 @@ from apps.queries.models import Query
 from apps.reports.models import Report
 from apps.reports.tasks import generate_report_task
 from apps.sessions.models import Session
+from apps.sessions.permissions import get_session_for_user_or_403, user_can_access_session
+from rest_framework.exceptions import PermissionDenied
 
 
 class SessionReportListCreateView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         reports = session.reports.all()
         data = [
             {
@@ -28,7 +30,7 @@ class SessionReportListCreateView(views.APIView):
         return Response(data)
 
     def post(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         query_id = request.data.get("query_id")
         fmt = request.data.get("format", "PDF").upper()
 
@@ -69,7 +71,8 @@ class ReportDetailView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id, report_id):
-        report = get_object_or_404(Report, id=report_id, session_id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
+        report = get_object_or_404(Report, id=report_id, session_id=session.id)
         return Response({
             "id": str(report.id),
             "format": report.format,

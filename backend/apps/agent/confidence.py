@@ -112,3 +112,31 @@ class ConfidenceEngine:
         model_weight = 0.6
         calibrated = (quality_metrics.overall_confidence * data_weight) + (model_confidence * model_weight)
         return round(float(min(0.99, max(0.10, calibrated))), 2)
+
+    @staticmethod
+    def evaluate_model_disagreement(
+        model_a_result: dict[str, Any],
+        model_b_result: dict[str, Any],
+        target_class: str = "water",
+    ) -> dict[str, Any]:
+        """
+        Evaluates agreement vs disagreement between multiple models/sensors per §33:
+        If Model A -> target detected and Model B -> no target, status = DISAGREEMENT.
+        Never hides disagreement.
+        """
+        a_detected = bool(model_a_result.get("detected", False) or model_a_result.get("count", 0) > 0)
+        b_detected = bool(model_b_result.get("detected", False) or model_b_result.get("count", 0) > 0)
+
+        if a_detected != b_detected:
+            return {
+                "status": "DISAGREEMENT",
+                "message": f"The analysis has conflicting model evidence regarding {target_class}.",
+                "model_a_verdict": a_detected,
+                "model_b_verdict": b_detected,
+                "confidence_level": "LOW",
+            }
+        return {
+            "status": "AGREEMENT",
+            "message": f"Models concordantly {'detected' if a_detected else 'did not detect'} {target_class}.",
+            "confidence_level": "HIGH" if a_detected else "MEDIUM",
+        }

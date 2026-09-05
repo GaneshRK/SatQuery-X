@@ -1,0 +1,32 @@
+# RS-VQA LoRA / PEFT Training Configuration per §16 & §56
+model:
+  base_model: "Salesforce/blip-vqa-base"
+  adapter_type: "LORA"
+  task_type: "QUESTION_ANSWERING"
+
+lora:
+  r: 16
+  lora_alpha: 32
+  target_modules: ["q_proj", "v_proj", "k_proj", "out_proj"]
+  lora_dropout: 0.05
+  bias: "none"
+
+training:
+  output_dir: "training/runs/rsvqa"
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  num_epochs: 5
+  warmup_ratio: 0.1
+  fp16: true
+  logging_steps: 10
+  eval_steps: 50
+  save_total_limit: 2
+  early_stopping_patience: 2
+
+data:
+  dataset_source: "BigEarthNet-MM / VRSBench"
+  image_size: 384
+  max_question_length: 64
+  max_answer_length: 32

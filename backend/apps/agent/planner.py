@@ -10,6 +10,19 @@ def create_execution_plan(intent: Any, mode: str) -> dict[str, Any]:
     target = getattr(intent, "target", "general")
     steps = []
 
+    # 0. CLARIFICATION
+    if task == "CLARIFICATION" or mode == "CLARIFICATION":
+        return {"mode": "CLARIFICATION", "task": "CLARIFICATION", "steps": []}
+
+    # 0b. LATEST_OBSERVATION
+    if task in ("LATEST_OBSERVATION", "latest_observation"):
+        steps = [
+            {"step": 1, "tool": "search_satellite_imagery", "parameters": {"sensor": target or "SENTINEL-2"}, "description": "Search latest available Copernicus observation"},
+            {"step": 2, "tool": "geo_metadata", "parameters": {}, "description": "Extract acquisition time, resolution, and sensor properties"},
+            {"step": 3, "tool": "RS_CAPTION", "parameters": {}, "description": "Synthesize comprehensive scene assessment"},
+        ]
+        return {"mode": mode, "task": "LATEST_OBSERVATION", "steps": steps}
+
     # 1. VQA
     if task in ("vqa", "VQA"):
         steps = [

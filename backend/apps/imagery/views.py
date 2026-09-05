@@ -1,4 +1,5 @@
 import os
+import re
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status, views, viewsets
@@ -9,39 +10,89 @@ from apps.imagery.models import ImageAsset, ImagePair
 from apps.imagery.serializers import ImageAssetSerializer, ImagePairSerializer
 from apps.imagery.tasks import check_pair_compatibility_task, ingest_image_task
 from apps.sessions.models import Session
+from apps.sessions.permissions import get_session_for_user_or_403, user_can_access_session
+
+
+def validate_raster_upload(file_obj) -> tuple[str, str]:
+    """
+    Validates uploaded raster files using magic bytes, size limits, and filename sanitization.
+    Returns: (sanitized_filename, validated_format)
+    Raises: ValueError with user-friendly error message if validation fails.
+    """
+    raw_name = os.path.basename(file_obj.name or "upload.tif")
+    clean_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw_name)
+    if not clean_name:
+        clean_name = "raster_asset.tif"
+
+    if hasattr(file_obj, "size") and file_obj.size == 0:
+        raise ValueError("Uploaded file is empty (0 bytes).")
+    if hasattr(file_obj, "size") and file_obj.size > 262144000:  # 250MB
+        raise ValueError("File exceeds maximum allowed size of 250MB.")
+
+    # Inspect magic bytes
+    file_obj.seek(0)
+    header = file_obj.read(16)
+    file_obj.seek(0)
+
+    # TIFF / GeoTIFF signatures:
+    # 0x49 0x49 0x2A 0x00 ("II*\0" little-endian) or 0x4D 0x4D 0x00 0x2A ("MM\0*" big-endian)
+    # BigTIFF: "II+\0" or "MM\0+"
+    if (
+        header.startswith(b"II*\x00")
+        or header.startswith(b"MM\x00*")
+        or header.startswith(b"II+\x00")
+        or header.startswith(b"MM\x00+")
+    ):
+        return clean_name, "GEOTIFF"
+
+    # PNG signature: 0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return clean_name, "PNG"
+
+    # JPEG signature: 0xFF 0xD8 0xFF
+    if header.startswith(b"\xff\xd8\xff"):
+        return clean_name, "JPEG"
+
+    # Extension fallback for test fixtures or custom raw arrays
+    ext = os.path.splitext(clean_name)[1].lower()
+    format_map = {
+        ".tif": "GEOTIFF",
+        ".tiff": "GEOTIFF",
+        ".geotiff": "GEOTIFF",
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+    }
+    if ext in format_map:
+        return clean_name, format_map[ext]
+
+    raise ValueError("Invalid raster format. Only GeoTIFF, TIFF, PNG, and JPEG imagery are supported.")
 
 
 class SessionImageListCreateView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         assets = session.imagery_assets.all()
         serializer = ImageAssetSerializer(assets, many=True)
         return Response(serializer.data)
 
     def post(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         file_obj = request.FILES.get("file")
         if not file_obj:
             return Response({"error": "No file attached."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Detect format
-        ext = os.path.splitext(file_obj.name)[1].lower()
-        format_map = {
-            ".tif": "GEOTIFF",
-            ".tiff": "GEOTIFF",
-            ".geotiff": "GEOTIFF",
-            ".png": "PNG",
-            ".jpg": "JPEG",
-            ".jpeg": "JPEG",
-        }
-        file_format = format_map.get(ext, "GEOTIFF")
+        try:
+            clean_name, file_format = validate_raster_upload(file_obj)
+        except ValueError as val_err:
+            return Response({"error": str(val_err)}, status=status.HTTP_400_BAD_REQUEST)
 
         asset = ImageAsset.objects.create(
             session=session,
             file=file_obj,
-            original_filename=file_obj.name,
+            original_filename=clean_name,
             content_type=file_obj.content_type or "application/octet-stream",
             file_format=file_format,
             processing_status="UPLOADED",
@@ -76,7 +127,8 @@ class ImageAssetDetailView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id, image_id):
-        asset = get_object_or_404(ImageAsset, id=image_id, session_id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
+        asset = get_object_or_404(ImageAsset, id=image_id, session_id=session.id)
         return Response(ImageAssetSerializer(asset).data)
 
 
@@ -96,12 +148,12 @@ class SessionPairListCreateView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         pairs = session.image_pairs.all()
         return Response(ImagePairSerializer(pairs, many=True).data)
 
     def post(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         image_a_id = request.data.get("image_a_id")
         image_b_id = request.data.get("image_b_id")
         pair_type = request.data.get("pair_type", "BI_TEMPORAL")

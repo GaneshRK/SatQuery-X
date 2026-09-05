@@ -113,12 +113,24 @@ export default function DashboardPage() {
         const sessionList = res.results || (Array.isArray(res) ? res : []);
         setSessions(sessionList);
 
-        if (sessionList.length > 0) {
-          // Select the first session (showcase flood assessment session)
-          await loadSessionData(sessionList[0].id);
+        const isDemoSession = (name: string) =>
+          name.startsWith('[SIH Demo]') ||
+          name.toLowerCase().includes('smoke test') ||
+          name.toLowerCase().includes('ambiguity test');
+
+        const userSessions = sessionList.filter((s: SessionData) => !isDemoSession(s.name));
+
+        if (userSessions.length > 0) {
+          // Select the user's most recent active workspace
+          await loadSessionData(userSessions[0].id);
+        } else if (sessionList.length > 0) {
+          // Create a clean analysis session for the user so demo sessions don't dominate
+          const newSession = await createSession('Earth Intelligence Workspace', 'Interactive Multimodal Earth Observation Reasoning Workspace');
+          setSessions([newSession, ...sessionList]);
+          await loadSessionData(newSession.id);
         } else {
           // Create an initial default session if none exist
-          const newSession = await createSession('Kaziranga & Brahmaputra Basin Assessment');
+          const newSession = await createSession('Earth Intelligence Workspace', 'Interactive Multimodal Earth Observation Reasoning Workspace');
           setSessions([newSession]);
           await loadSessionData(newSession.id);
         }

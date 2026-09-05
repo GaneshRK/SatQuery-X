@@ -72,6 +72,14 @@ export const Header: React.FC<HeaderProps> = ({
     }
   };
 
+  const isDemoSession = (name: string) =>
+    name.startsWith('[SIH Demo]') ||
+    name.toLowerCase().includes('smoke test') ||
+    name.toLowerCase().includes('ambiguity test');
+
+  const mySessions = sessions.filter((s) => !isDemoSession(s.name));
+  const demoSessions = sessions.filter((s) => isDemoSession(s.name));
+
   return (
     <header className="h-16 border-b border-border bg-surface/80 backdrop-blur-md px-6 flex items-center justify-between sticky top-0 z-40">
       <div className="flex items-center gap-4">
@@ -99,11 +107,24 @@ export const Header: React.FC<HeaderProps> = ({
                 onChange={(e) => onSelectSession(e.target.value)}
                 className="bg-slate-900 border border-slate-800 text-xs font-mono text-slate-200 rounded-lg px-3 py-1.5 pr-8 appearance-none focus:outline-none focus:border-blue-500 max-w-[280px] truncate"
               >
-                {sessions.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
+                {mySessions.length > 0 && (
+                  <optgroup label="── My Workspaces ──">
+                    {mySessions.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {demoSessions.length > 0 && (
+                  <optgroup label="── Demo Scenarios ──">
+                    {demoSessions.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
               <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             </div>

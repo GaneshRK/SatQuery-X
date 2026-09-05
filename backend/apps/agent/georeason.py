@@ -139,10 +139,16 @@ class GeoReasonAgent:
 
         # 5. Synthesize Narrative
         lines = []
-        if has_change:
+        if has_change and total_ha > 0:
+            change_pct = measurements.get("change_percentage")
+            pct_clause = f" ({change_pct:.1f}% of the designated target area)" if change_pct is not None else ""
             lines.append(
                 f"Multispectral satellite observation analysis across {aoi_name} confirms significant {change_type_str.lower()} "
-                f"encompassing approximately {total_ha:.1f} hectares ({measurements.get('change_percentage', 18.2)}% of the designated target area)."
+                f"encompassing approximately {total_ha:.1f} hectares{pct_clause}."
+            )
+        elif has_change:
+            lines.append(
+                f"Multispectral satellite observation analysis across {aoi_name} identifies localized {change_type_str.lower()} dynamics within the designated region."
             )
         else:
             lines.append(
@@ -154,8 +160,9 @@ class GeoReasonAgent:
                 f"Official external intelligence corroborates this physical observation: {ext_summary_sentences[0]}"
             )
 
+        factors_desc = ", ".join(drivers[:3]) if drivers else "satellite telemetry, valid pixel coverage, and spatial consistency"
         lines.append(
-            f"Ground verification confidence is calibrated at {int(final_conf * 100)}% based on validated Copernicus STAC telemetry."
+            f"Analysis confidence is calibrated at {int(final_conf * 100)}% based on {factors_desc}."
         )
 
         # 6. Generate Contextual UI Actions

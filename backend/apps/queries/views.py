@@ -13,18 +13,19 @@ from apps.queries.models import ExecutionStep, Query
 from apps.queries.serializers import QueryDetailSerializer
 from apps.queries.tasks import run_query_task
 from apps.sessions.models import Session
+from apps.sessions.permissions import get_session_for_user_or_403
 
 
 class SessionQueryListCreateView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         queries = session.queries.all()
         return Response(QueryDetailSerializer(queries, many=True).data)
 
     def post(self, request, session_id):
-        session = get_object_or_404(Session, id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
         text = request.data.get("text", "").strip()
         if not text:
             return Response({"error": "Query text cannot be empty."}, status=status.HTTP_400_BAD_REQUEST)
@@ -92,7 +93,8 @@ class QueryDetailView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, session_id, query_id):
-        query = get_object_or_404(Query, id=query_id, session_id=session_id)
+        session = get_session_for_user_or_403(session_id, request.user)
+        query = get_object_or_404(Query, id=query_id, session_id=session.id)
         return Response(QueryDetailSerializer(query).data)
 
 

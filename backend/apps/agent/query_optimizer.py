@@ -87,6 +87,41 @@ class QueryOptimizer:
             "bbox": [88.70, 21.80, 89.00, 22.10],
             "coords": [88.8532, 21.9497],
         },
+        "mumbai": {
+            "name": "Mumbai Metropolitan Region",
+            "bbox": [72.77, 18.88, 72.99, 19.27],
+            "coords": [72.8777, 19.0760],
+        },
+        "delhi": {
+            "name": "Delhi-NCR Urban Belt",
+            "bbox": [77.00, 28.40, 77.35, 28.85],
+            "coords": [77.2090, 28.6139],
+        },
+        "delhi-ncr": {
+            "name": "Delhi-NCR Urban Belt",
+            "bbox": [77.00, 28.40, 77.35, 28.85],
+            "coords": [77.2090, 28.6139],
+        },
+        "kolkata": {
+            "name": "Kolkata Metropolitan Area",
+            "bbox": [88.25, 22.45, 88.45, 22.65],
+            "coords": [88.3639, 22.5726],
+        },
+        "hyderabad": {
+            "name": "Hyderabad Urban Agglomeration",
+            "bbox": [78.35, 17.30, 78.55, 17.50],
+            "coords": [78.4867, 17.3850],
+        },
+        "coimbatore": {
+            "name": "Coimbatore Industrial Basin",
+            "bbox": [76.90, 10.95, 77.05, 11.08],
+            "coords": [76.9558, 11.0168],
+        },
+        "western ghats": {
+            "name": "Western Ghats Ecological Reserve",
+            "bbox": [76.80, 10.20, 77.20, 10.60],
+            "coords": [77.0000, 10.4000],
+        },
     }
 
     def optimize(self, text: str, session_context: Optional[Dict[str, Any]] = None) -> StructuredQueryPlan:
