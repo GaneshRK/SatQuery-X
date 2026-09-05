@@ -29,6 +29,7 @@ dependencies = [
     "pydantic>=2.7.0",
     "python-dotenv>=1.0.1",
     "reportlab>=4.1.0",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.optional-dependencies]
