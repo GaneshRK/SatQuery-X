@@ -1,49 +1,106 @@
+# ============================================================================
+# SatQuery-X Specialist Model Registry
+# ============================================================================
+#
+# These entries describe the specialist agents available to the master
+# orchestrator.
+#
+# "version" identifies the wrapper/agent contract, not a claim about model
+# training quality.
+#
+# Scientific outputs must come from the actual wrapper and its input data.
+# This file contains no synthetic model results, fake confidence values,
+# fabricated sensor measurements, or hardcoded geographic information.
+# ============================================================================
+
 RS_VQA:
   task: visual_question_answering
-  input_modes: [single_image]
+  input_modes:
+    - single_image
+
   framework: pytorch
-  version: "1.0-baseline"
-  adaptation: baseline
+
+  version: "3.0-grounded"
+  adaptation: grounded_evidence
+
   base_model: blip-vqa-base
+
   wrapper: apps.models_ai.rs_vqa.wrapper.RSVQAModel
+
 
 RS_CAPTION:
   task: image_captioning
-  input_modes: [single_image]
-  version: "1.0-baseline"
-  adaptation: baseline
+  input_modes:
+    - single_image
+
+  framework: pytorch
+
+  version: "3.0-grounded"
+  adaptation: grounded_evidence
+
   base_model: blip-captioning-base
+
   wrapper: apps.models_ai.rs_caption.wrapper.RSCaptionModel
+
 
 RS_GROUNDING:
   task: text_guided_grounding
-  input_modes: [single_image]
-  version: "1.0-baseline"
-  adaptation: baseline
+  input_modes:
+    - single_image
+
+  framework: algorithmic_or_configured_model
+
+  version: "3.0-grounded"
+  adaptation: grounded_visual_proposals
+
   base_model: spectral-saliency-region-proposals
+
   wrapper: apps.models_ai.rs_grounding.wrapper.RSGroundingModel
+
 
 CHANGE_DETECTION:
   task: bi_temporal_change_map
-  input_modes: [bi_temporal]
-  version: "1.0-baseline"
-  adaptation: baseline
+  input_modes:
+    - bi_temporal
+
+  framework: algorithmic_or_configured_model
+
+  version: "3.0-grounded"
+  adaptation: grounded_change_analysis
+
   base_model: diff-connected-components
+
   wrapper: apps.models_ai.change_detection.wrapper.ChangeDetectionModel
+
 
 CHANGE_VQA:
   task: change_based_vqa
-  input_modes: [bi_temporal]
-  version: "1.0-baseline"
-  depends_on: [CHANGE_DETECTION]
-  adaptation: baseline
+  input_modes:
+    - bi_temporal
+
+  framework: evidence_reasoning
+
+  version: "3.0-grounded"
+  adaptation: grounded_evidence_reasoning
+
   base_model: change-reasoning-over-masks
+
+  depends_on:
+    - CHANGE_DETECTION
+
   wrapper: apps.models_ai.change_vqa.wrapper.ChangeVQAModel
+
 
 OPTICAL_SAR_FUSION:
   task: cross_modal_fusion_analysis
-  input_modes: [cross_modal_pair]
-  version: "1.0-baseline"
-  adaptation: baseline
+  input_modes:
+    - cross_modal_pair
+
+  framework: algorithmic_or_configured_model
+
+  version: "3.0-cross-modal-grounded"
+  adaptation: grounded_cross_modal_fusion
+
   base_model: dual-branch-fusion-classifier
+
   wrapper: apps.models_ai.optical_sar_fusion.wrapper.OpticalSARFusionModel

@@ -1,18 +1,49 @@
-"""Modular Tool Registry system for SatQuery-X Agent per §8."""
+"""
+Evidence-grounded tool registry for SatQuery-X.
+
+Design principles
+-----------------
+1. Tools operate only on real supplied data.
+2. Scientific indices are calculated only when the required spectral bands
+   are explicitly available and correctly mapped.
+3. No synthetic raster fallback is permitted.
+4. No fabricated coordinates, CRS, resolution, dates, sensor names, areas,
+   confidence scores, or verification scores are introduced here.
+5. Geospatial measurements require real georeferencing information.
+6. Satellite search requires an explicit temporal interval.
+7. Model/tool outputs are preserved as evidence; this registry does not
+   invent conclusions on behalf of downstream reasoning components.
+8. The registry is deterministic and framework-agnostic so the Django agent
+   executor can invoke tools safely.
+"""
 
 from __future__ import annotations
-import io
+
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
-import numpy as np
-from PIL import Image
+from typing import Any, Callable, Mapping, Sequence
 
-from apps.geospatial.indices import compute_ndvi, compute_ndwi, compute_ndbi, compute_nbr
-from apps.geospatial.cv_engine import segment_water, segment_vegetation, detect_and_count_structures
-from apps.geospatial.math import calculate_pixel_area_m2, quantify_mask_area, polygonize_mask_to_geojson
-from apps.satellite.providers import get_satellite_provider
+import numpy as np
+
 from apps.agent.web_research import WebResearchAgent
+from apps.geospatial.cv_engine import (
+    detect_and_count_structures,
+    segment_vegetation,
+    segment_water,
+)
+from apps.geospatial.indices import (
+    compute_ndbi,
+    compute_nbr,
+    compute_ndvi,
+    compute_ndwi,
+)
+from apps.geospatial.math import quantify_mask_area
+from apps.satellite.providers import get_satellite_provider
+
+
+# ---------------------------------------------------------------------------
+# Registry contracts
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -22,6 +53,7 @@ class ToolDefinition:
     input_schema: dict[str, str]
     output_schema: dict[str, str]
     handler: Callable[..., dict[str, Any]]
+
     timeout_seconds: int = 30
     requires_imagery: bool = True
     task: str = "general"
@@ -29,24 +61,36 @@ class ToolDefinition:
     required_relationship: str = "SINGLE_IMAGE"
     model: str = "Deterministic/GIS"
     gpu_requirement: str = "CPU_ONLY"
+
     provenance_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ToolRegistry:
+    """
+    Central registry for all executable SatQuery-X tools.
+
+    The registry itself does not decide what a scientific result means.
+    Planning and evidence/reasoning layers remain responsible for orchestration
+    and interpretation.
+    """
+
     _instance: ToolRegistry | None = None
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._register_default_tools()
 
     @classmethod
     def get_instance(cls) -> ToolRegistry:
         if cls._instance is None:
-            cls._instance = ToolRegistry()
+            cls._instance = cls()
         return cls._instance
 
     def register(self, tool: ToolDefinition) -> None:
-        self._tools[tool.name] = tool
+        if not tool.name or not tool.name.strip():
+            raise ValueError("Tool name cannot be empty.")
+
+        self._tools[tool.name.strip()] = tool
 
     def get_tool(self, name: str) -> ToolDefinition | None:
         return self._tools.get(name)
@@ -54,18 +98,20 @@ class ToolRegistry:
     def list_tools(self) -> list[dict[str, Any]]:
         return [
             {
-                "name": t.name,
-                "description": t.description,
-                "task": t.task,
-                "required_images": t.required_images,
-                "required_relationship": t.required_relationship,
-                "model": t.model,
-                "gpu_requirement": t.gpu_requirement,
-                "input_schema": t.input_schema,
-                "output_schema": t.output_schema,
-                "timeout_seconds": t.timeout_seconds,
+                "name": tool.name,
+                "description": tool.description,
+                "task": tool.task,
+                "required_images": tool.required_images,
+                "required_relationship": tool.required_relationship,
+                "model": tool.model,
+                "gpu_requirement": tool.gpu_requirement,
+                "input_schema": tool.input_schema,
+                "output_schema": tool.output_schema,
+                "timeout_seconds": tool.timeout_seconds,
+                "requires_imagery": tool.requires_imagery,
+                "provenance_metadata": dict(tool.provenance_metadata),
             }
-            for t in self._tools.values()
+            for tool in self._tools.values()
         ]
 
     def get_tool_manifest(self) -> list[dict[str, Any]]:
@@ -77,18 +123,44 @@ class ToolRegistry:
         image_count: int | None = None,
         relationship: str | None = None,
     ) -> list[ToolDefinition]:
-        """Discovers all tools capable of handling the specified task and input constraints per §9."""
-        task_clean = task.lower().strip()
-        candidates = []
+        """
+        Discover tools compatible with a requested task and input relationship.
+        """
+
+        task_clean = str(task or "").strip().lower()
+
+        if not task_clean:
+            return []
+
+        candidates: list[ToolDefinition] = []
+
         for tool in self._tools.values():
             tool_task = tool.task.lower()
             tool_name = tool.name.lower()
-            if tool_task == task_clean or tool_name == task_clean or task_clean in tool_task or tool_task in task_clean:
-                if image_count is not None and tool.requires_imagery and tool.required_images > image_count:
+
+            matches_task = (
+                tool_task == task_clean
+                or tool_name == task_clean
+                or task_clean in tool_task
+                or tool_task in task_clean
+            )
+
+            if not matches_task:
+                continue
+
+            if (
+                image_count is not None
+                and tool.requires_imagery
+                and tool.required_images > image_count
+            ):
+                continue
+
+            if relationship is not None:
+                if tool.required_relationship not in ("NONE", relationship):
                     continue
-                if relationship is not None and tool.required_relationship not in ("NONE", relationship):
-                    continue
-                candidates.append(tool)
+
+            candidates.append(tool)
+
         return candidates
 
     def can_solve(
@@ -98,31 +170,95 @@ class ToolRegistry:
         image_count: int,
         relationship: str = "SINGLE_IMAGE",
     ) -> tuple[bool, str]:
-        """Validates if a specific tool can solve the task with the given image configuration."""
+        """
+        Validate whether a registered tool is compatible with the supplied
+        image configuration.
+
+        `task` is retained in the public contract for planner compatibility.
+        Task matching is intentionally permissive here because the planner
+        normally resolves the exact tool before execution.
+        """
+
+        del task
+
         tool = self.get_tool(tool_name)
-        if not tool:
-            return False, f"Tool '{tool_name}' is not registered in ToolRegistry."
+
+        if tool is None:
+            return (
+                False,
+                f"Tool '{tool_name}' is not registered in ToolRegistry.",
+            )
+
         if tool.requires_imagery and tool.required_images > image_count:
-            return False, f"Tool '{tool_name}' requires {tool.required_images} image(s), but only {image_count} provided."
-        if relationship != "NONE" and tool.required_relationship not in ("NONE", "SINGLE_IMAGE", relationship):
-            return False, f"Tool '{tool_name}' requires relationship '{tool.required_relationship}', but inputs have '{relationship}'."
+            return (
+                False,
+                (
+                    f"Tool '{tool_name}' requires "
+                    f"{tool.required_images} image(s), "
+                    f"but only {image_count} provided."
+                ),
+            )
+
+        if (
+            relationship != "NONE"
+            and tool.required_relationship
+            not in ("NONE", "SINGLE_IMAGE", relationship)
+        ):
+            return (
+                False,
+                (
+                    f"Tool '{tool_name}' requires relationship "
+                    f"'{tool.required_relationship}', "
+                    f"but inputs have '{relationship}'."
+                ),
+            )
+
         return True, "Tool is compatible with task and input constraints."
 
-    def execute(self, tool_name: str, **kwargs) -> dict[str, Any]:
-        tool = self.get_tool(tool_name)
-        if not tool:
-            return {"status": "error", "error": f"Tool '{tool_name}' not found in registry."}
+    def execute(self, tool_name: str, **kwargs: Any) -> dict[str, Any]:
+        """
+        Execute one registered tool.
 
-        t_start = time.perf_counter()
+        Exceptions are converted into a structured error response so the
+        executor can persist FAILED execution steps without crashing the
+        complete agent pipeline.
+        """
+
+        tool = self.get_tool(tool_name)
+
+        if tool is None:
+            return {
+                "status": "error",
+                "tool": tool_name,
+                "error": f"Tool '{tool_name}' not found in registry.",
+            }
+
+        started = time.perf_counter()
+
         try:
             result = tool.handler(**kwargs)
-            latency_ms = int((time.perf_counter() - t_start) * 1000)
+
+            if not isinstance(result, dict):
+                result = {
+                    "status": "error",
+                    "error": (
+                        f"Tool '{tool_name}' returned "
+                        f"{type(result).__name__}; expected dict."
+                    ),
+                }
+
+            latency_ms = int((time.perf_counter() - started) * 1000)
+
+            result = dict(result)
             result["latency_ms"] = latency_ms
             result["tool"] = tool_name
             result["status"] = result.get("status", "ok")
+
             return result
+
         except Exception as exc:
-            latency_ms = int((time.perf_counter() - t_start) * 1000)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+
             return {
                 "status": "error",
                 "tool": tool_name,
@@ -130,475 +266,1175 @@ class ToolRegistry:
                 "latency_ms": latency_ms,
             }
 
-    def _register_default_tools(self):
-        # 1. calculate_ndvi
+    # -----------------------------------------------------------------------
+    # Tool registration
+    # -----------------------------------------------------------------------
+
+    def _register_default_tools(self) -> None:
         self.register(
             ToolDefinition(
                 name="calculate_ndvi",
-                description="Compute Normalized Difference Vegetation Index (NIR - Red) / (NIR + Red)",
+                description=(
+                    "Calculate NDVI from explicitly mapped red and NIR "
+                    "spectral bands."
+                ),
                 task="NDVI",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="SpectralIndices/Rasterio",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray"},
-                output_schema={"mean_ndvi": "float", "vegetation_coverage_pct": "float"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "red_band_index": "int",
+                    "nir_band_index": "int",
+                },
+                output_schema={
+                    "mean_ndvi": "float",
+                    "valid_pixel_count": "int",
+                    "index": "str",
+                },
                 handler=_handle_calculate_ndvi,
             )
         )
 
-        # 2. calculate_ndwi
         self.register(
             ToolDefinition(
                 name="calculate_ndwi",
-                description="Compute Normalized Difference Water Index (Green - NIR) / (Green + NIR)",
+                description=(
+                    "Calculate NDWI from explicitly mapped green and NIR "
+                    "spectral bands."
+                ),
                 task="NDWI",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="SpectralIndices/Rasterio",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray"},
-                output_schema={"mean_ndwi": "float", "water_coverage_pct": "float"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "green_band_index": "int",
+                    "nir_band_index": "int",
+                },
+                output_schema={
+                    "mean_ndwi": "float",
+                    "valid_pixel_count": "int",
+                    "index": "str",
+                },
                 handler=_handle_calculate_ndwi,
             )
         )
 
-        # 3. detect_water
         self.register(
             ToolDefinition(
                 name="detect_water",
-                description="Segment water bodies and return vector polygons with metric surface areas",
+                description=(
+                    "Detect water candidates from the supplied raster using "
+                    "the geospatial segmentation engine and preserve "
+                    "measured/vector evidence."
+                ),
                 task="WATER_DETECTION",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="Otsu/OpenCV",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray", "bounds_wgs84": "dict"},
-                output_schema={"water_features_count": "int", "total_water_km2": "float", "polygons": "list"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "bounds_wgs84": "dict",
+                    "affine_list": "list",
+                    "crs": "str",
+                },
+                output_schema={
+                    "water_features_count": "int",
+                    "features": "list",
+                },
                 handler=_handle_detect_water,
             )
         )
 
-        # 4. detect_vegetation
         self.register(
             ToolDefinition(
                 name="detect_vegetation",
-                description="Segment dense vegetation canopy and calculate canopy coverage area in km²",
+                description=(
+                    "Detect vegetation candidates from the supplied raster "
+                    "using the geospatial segmentation engine."
+                ),
                 task="VEGETATION_ANALYSIS",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="Otsu/OpenCV",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray", "bounds_wgs84": "dict"},
-                output_schema={"vegetation_features_count": "int", "total_veg_km2": "float"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "bounds_wgs84": "dict",
+                    "affine_list": "list",
+                    "crs": "str",
+                },
+                output_schema={
+                    "vegetation_features_count": "int",
+                    "features": "list",
+                },
                 handler=_handle_detect_vegetation,
             )
         )
 
-        # 5. detect_and_count_structures
         self.register(
             ToolDefinition(
                 name="detect_and_count_structures",
-                description="Deterministic detection and counting of building/infrastructure candidates",
+                description=(
+                    "Detect candidate structures from supplied imagery and "
+                    "return only engine-derived counts/geometries."
+                ),
                 task="BUILDING_ANALYSIS",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="Morphological/Contours",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray", "bounds_wgs84": "dict"},
-                output_schema={"candidate_count": "int", "total_structure_km2": "float", "polygons": "list"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "bounds_wgs84": "dict",
+                    "affine_list": "list",
+                    "crs": "str",
+                },
+                output_schema={
+                    "candidate_count": "int",
+                    "features": "list",
+                },
                 handler=_handle_detect_structures,
             )
         )
 
-        # 6. calculate_area
         self.register(
             ToolDefinition(
                 name="calculate_area",
-                description="Calculate metric ground surface area in m² and km² for any binary mask",
+                description=(
+                    "Calculate mask area only when the mask and real "
+                    "georeferencing information are supplied."
+                ),
                 task="AREA_MEASUREMENT",
                 required_images=0,
                 required_relationship="NONE",
                 model="Shapely/PyProj",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"mask": "numpy.ndarray", "affine_list": "list", "crs": "str"},
-                output_schema={"area_m2": "float", "area_km2": "float", "valid_pixel_count": "int"},
+                input_schema={
+                    "mask": "numpy.ndarray",
+                    "affine_list": "list",
+                    "crs": "str",
+                },
+                output_schema={
+                    "area_m2": "float",
+                    "area_km2": "float",
+                    "valid_pixel_count": "int",
+                },
                 handler=_handle_calculate_area,
                 requires_imagery=False,
             )
         )
 
-        # 7. search_satellite_imagery
         self.register(
             ToolDefinition(
                 name="search_satellite_imagery",
-                description="Query Copernicus Data Space Ecosystem for Sentinel-1/2 candidate scenes",
+                description=(
+                    "Search the configured satellite catalog for candidate "
+                    "scenes within an explicitly supplied AOI and date range."
+                ),
                 task="SATELLITE_SEARCH",
                 required_images=0,
                 required_relationship="NONE",
-                model="CopernicusSTAC",
+                model="ConfiguredSatelliteProvider",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"aoi_geometry": "dict", "sensor": "str", "date_start": "str", "date_end": "str"},
-                output_schema={"candidate_count": "int", "candidates": "list", "provider": "str"},
+                input_schema={
+                    "aoi_geometry": "dict",
+                    "sensor": "str",
+                    "date_start": "str",
+                    "date_end": "str",
+                    "max_cloud_cover": "float|None",
+                },
+                output_schema={
+                    "candidate_count": "int",
+                    "candidates": "list",
+                    "provider": "str",
+                },
                 handler=_handle_search_satellite,
                 requires_imagery=False,
             )
         )
 
-        # 8. calculate_ndbi
         self.register(
             ToolDefinition(
                 name="calculate_ndbi",
-                description="Compute Normalized Difference Built-up Index (SWIR - NIR) / (SWIR + NIR)",
+                description=(
+                    "Calculate NDBI from explicitly mapped SWIR and NIR "
+                    "spectral bands."
+                ),
                 task="NDBI",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="SpectralIndices/Rasterio",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray"},
-                output_schema={"mean_ndbi": "float", "built_up_coverage_pct": "float"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "swir_band_index": "int",
+                    "nir_band_index": "int",
+                },
+                output_schema={
+                    "mean_ndbi": "float",
+                    "valid_pixel_count": "int",
+                    "index": "str",
+                },
                 handler=_handle_calculate_ndbi,
             )
         )
 
-        # 9. calculate_nbr
         self.register(
             ToolDefinition(
                 name="calculate_nbr",
-                description="Compute Normalized Burn Ratio (NIR - SWIR2) / (NIR + SWIR2)",
+                description=(
+                    "Calculate NBR from explicitly mapped NIR and SWIR2 "
+                    "spectral bands."
+                ),
                 task="NBR",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="SpectralIndices/Rasterio",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray"},
-                output_schema={"mean_nbr": "float", "burn_risk_coverage_pct": "float"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                    "nir_band_index": "int",
+                    "swir2_band_index": "int",
+                },
+                output_schema={
+                    "mean_nbr": "float",
+                    "valid_pixel_count": "int",
+                    "index": "str",
+                },
                 handler=_handle_calculate_nbr,
             )
         )
 
-        # 10. detect_change
         self.register(
             ToolDefinition(
                 name="detect_change",
-                description="Bi-temporal differencing and vector polygonization between two observations",
+                description=(
+                    "Detect pixel-level change between two supplied "
+                    "co-registered observations. Area is returned only when "
+                    "real georeferencing information is available."
+                ),
                 task="CHANGE_DETECTION",
                 required_images=2,
                 required_relationship="BI_TEMPORAL",
                 model="RasterDifference/Otsu",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"before_array": "numpy.ndarray", "after_array": "numpy.ndarray"},
-                output_schema={"changed_area_hectares": "float", "change_percentage": "float", "change_class": "str"},
+                input_schema={
+                    "before_array": "numpy.ndarray",
+                    "after_array": "numpy.ndarray",
+                    "before_affine_list": "list",
+                    "after_affine_list": "list",
+                    "before_crs": "str",
+                    "after_crs": "str",
+                },
+                output_schema={
+                    "change_percentage": "float",
+                    "changed_pixel_count": "int",
+                    "changed_area_m2": "float|None",
+                    "changed_area_hectares": "float|None",
+                    "change_mask": "numpy.ndarray",
+                },
                 handler=_handle_detect_change,
             )
         )
 
-        # 11. search_web
         self.register(
             ToolDefinition(
                 name="search_web",
-                description="Guarded web research retrieving corroborating reports from trusted domains",
+                description=(
+                    "Retrieve external corroborating evidence through the "
+                    "configured web research agent."
+                ),
                 task="WEB_RESEARCH",
                 required_images=0,
                 required_relationship="NONE",
-                model="DuckDuckGo/Brave",
+                model="WebResearchAgent",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"query": "str", "aoi_name": "str"},
-                output_schema={"evidence_count": "int", "citations": "list"},
+                input_schema={
+                    "query": "str",
+                    "aoi_name": "str|None",
+                },
+                output_schema={
+                    "evidence_count": "int",
+                    "citations": "list",
+                },
                 handler=_handle_search_web,
                 requires_imagery=False,
             )
         )
 
-        # 12. verify_evidence
         self.register(
             ToolDefinition(
                 name="verify_evidence",
-                description="Cross-source verification of physical satellite reflectance against external reports",
+                description=(
+                    "Compare supplied satellite evidence and external "
+                    "evidence without manufacturing a confidence score."
+                ),
                 task="VERIFY_EVIDENCE",
                 required_images=0,
                 required_relationship="NONE",
                 model="EvidenceEngine",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"satellite_scenes": "list", "external_evidence": "list"},
-                output_schema={"verification_status": "str", "confidence_score": "float"},
+                input_schema={
+                    "satellite_scenes": "list",
+                    "external_evidence": "list",
+                },
+                output_schema={
+                    "verification_status": "str",
+                    "supporting_evidence_count": "int",
+                    "contradicting_evidence_count": "int",
+                    "limitations": "list",
+                },
                 handler=_handle_verify_evidence,
                 requires_imagery=False,
             )
         )
 
-        # 13. vqa (RS_VQA Specialist Model)
         self.register(
             ToolDefinition(
                 name="vqa",
-                description="Remote sensing Visual Question Answering using specialist VLM adapter",
+                description=(
+                    "Remote-sensing visual question answering using the "
+                    "configured specialist model adapter."
+                ),
                 task="VQA",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="GeoChat",
                 gpu_requirement="OPTIONAL",
-                input_schema={"question": "str"},
-                output_schema={"answer": "str", "confidence": "float"},
+                input_schema={
+                    "question": "str",
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                },
+                output_schema={
+                    "answer": "str",
+                    "confidence": "float|None",
+                },
                 handler=_handle_vqa,
             )
         )
 
-        # 14. caption (RS_CAPTION Specialist Model)
         self.register(
             ToolDefinition(
                 name="caption",
-                description="Remote sensing scene captioning and land-cover description",
+                description=(
+                    "Remote-sensing scene captioning using the configured "
+                    "specialist model adapter."
+                ),
                 task="CAPTION",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="GeoChat",
                 gpu_requirement="OPTIONAL",
-                input_schema={},
-                output_schema={"caption": "str", "confidence": "float"},
+                input_schema={
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                },
+                output_schema={
+                    "caption": "str",
+                    "confidence": "float|None",
+                },
                 handler=_handle_caption,
             )
         )
 
-        # 15. grounding (RS_GROUNDING Specialist Model)
         self.register(
             ToolDefinition(
                 name="grounding",
-                description="Text-guided visual grounding detecting target features and bounding boxes",
+                description=(
+                    "Text-guided visual grounding using the configured "
+                    "grounding model."
+                ),
                 task="GROUNDING",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="GroundingDINO/SAM",
                 gpu_requirement="OPTIONAL",
-                input_schema={"text_prompt": "str"},
-                output_schema={"boxes": "list", "confidence": "float"},
+                input_schema={
+                    "text_prompt": "str",
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                },
+                output_schema={
+                    "boxes": "list",
+                    "confidence": "float|None",
+                },
                 handler=_handle_grounding,
             )
         )
 
-        # 16. change_detection (ChangeFormer Model)
         self.register(
             ToolDefinition(
                 name="change_detection",
-                description="Deep-learning bi-temporal change detection and probability mapping",
+                description=(
+                    "Deep-learning bi-temporal change detection using the "
+                    "configured ChangeFormer adapter."
+                ),
                 task="CHANGE_DETECTION",
                 required_images=2,
                 required_relationship="BI_TEMPORAL",
                 model="ChangeFormer",
                 gpu_requirement="OPTIONAL",
-                input_schema={},
-                output_schema={"answer": "str", "boxes": "list", "change_mask": "bytes"},
+                input_schema={
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                },
+                output_schema={
+                    "answer": "str|None",
+                    "boxes": "list",
+                    "change_mask": "bytes|numpy.ndarray|None",
+                    "confidence": "float|None",
+                },
                 handler=_handle_change_detection,
             )
         )
 
-        # 17. change_vqa (Change VQA Model)
         self.register(
             ToolDefinition(
                 name="change_vqa",
-                description="Change reasoning layer answering questions over measured change masks",
+                description=(
+                    "Answer a change-related question using two supplied "
+                    "observations and an actual change mask when available."
+                ),
                 task="CHANGE_VQA",
                 required_images=2,
                 required_relationship="BI_TEMPORAL",
                 model="ChangeFormer",
                 gpu_requirement="OPTIONAL",
-                input_schema={"question": "str"},
-                output_schema={"answer": "str", "confidence": "float"},
+                input_schema={
+                    "question": "str",
+                    "change_mask": "bytes|numpy.ndarray|None",
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                },
+                output_schema={
+                    "answer": "str",
+                    "confidence": "float|None",
+                },
                 handler=_handle_change_vqa,
             )
         )
 
-        # 18. optical_sar_fusion (Multimodal Model)
         self.register(
             ToolDefinition(
                 name="optical_sar_fusion",
-                description="Dual-branch cross-modal fusion combining optical and SAR radar imagery",
+                description=(
+                    "Cross-modal optical/SAR analysis using two explicitly "
+                    "identified modality inputs."
+                ),
                 task="OPTICAL_SAR_ANALYSIS",
                 required_images=2,
                 required_relationship="OPTICAL_SAR_PAIR",
                 model="OpticalSARFusion",
                 gpu_requirement="OPTIONAL",
-                input_schema={},
-                output_schema={"answer": "str", "confidence": "float", "boxes": "list"},
+                input_schema={
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                    "optical_index": "int",
+                    "sar_index": "int",
+                },
+                output_schema={
+                    "answer": "str|None",
+                    "confidence": "float|None",
+                    "boxes": "list",
+                },
                 handler=_handle_optical_sar,
             )
         )
 
-        # 19. geo_metadata
         self.register(
             ToolDefinition(
                 name="geo_metadata",
-                description="Extract raster bounds, resolution, CRS, and channel metadata",
+                description=(
+                    "Extract actual raster dimensions, band metadata, CRS, "
+                    "bounds, modality and georeferencing state."
+                ),
                 task="GEO_METADATA",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="GDAL/Rasterio",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"image_bytes": "bytes"},
-                output_schema={"width": "int", "height": "int", "crs": "str", "resolution_m": "float"},
+                input_schema={
+                    "image_bytes": "bytes",
+                    "filename": "str",
+                },
+                output_schema={
+                    "width": "int",
+                    "height": "int",
+                    "band_count": "int",
+                    "crs": "str|None",
+                    "resolution_m": "float|None",
+                    "bounds_wgs84": "dict|None",
+                    "is_georeferenced": "bool",
+                },
                 handler=_handle_geo_metadata,
             )
         )
 
-        # 20. histogram_analysis
         self.register(
             ToolDefinition(
                 name="histogram_analysis",
-                description="Compute spectral channel statistical distributions, mean, and standard deviation",
+                description=(
+                    "Compute descriptive statistics from the supplied raster "
+                    "bands without interpreting them as a specific sensor."
+                ),
                 task="HISTOGRAM_ANALYSIS",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="NumPy/Rasterio",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"raster_array": "numpy.ndarray"},
-                output_schema={"bands_analyzed": "int", "statistics": "list"},
+                input_schema={
+                    "raster_array": "numpy.ndarray",
+                },
+                output_schema={
+                    "bands_analyzed": "int",
+                    "statistics": "list",
+                },
                 handler=_handle_histogram_analysis,
             )
         )
 
-        # 21. coregistration
         self.register(
             ToolDefinition(
                 name="coregistration",
-                description="Inspect CRS, spatial bounds, and geometric overlap between image pairs",
+                description=(
+                    "Check spatial overlap between two observations using "
+                    "their actual bounds and, when available, CRS metadata."
+                ),
                 task="COREGISTRATION",
                 required_images=2,
                 required_relationship="BI_TEMPORAL",
                 model="Rasterio/Affine",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"bounds_a": "dict", "bounds_b": "dict"},
-                output_schema={"coregistration_valid": "bool", "overlap_wgs84": "dict"},
+                input_schema={
+                    "bounds_a": "dict",
+                    "bounds_b": "dict",
+                    "crs_a": "str|None",
+                    "crs_b": "str|None",
+                },
+                output_schema={
+                    "coregistration_valid": "bool",
+                    "overlap": "dict|None",
+                    "reason": "str",
+                },
                 handler=_handle_coregistration,
                 requires_imagery=False,
             )
         )
 
-        # 22. spatial_relation
         self.register(
             ToolDefinition(
                 name="spatial_relation",
-                description="Analyze spatial proximity, buffer distances, and containment relations",
+                description=(
+                    "Determine the geometric relationship between two supplied "
+                    "AOIs using actual geometry."
+                ),
                 task="SPATIAL_RELATION",
                 required_images=0,
                 required_relationship="NONE",
                 model="Shapely",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"aoi_a": "dict", "aoi_b": "dict"},
-                output_schema={"relation": "str", "spatial_match": "bool"},
+                input_schema={
+                    "aoi_a": "dict",
+                    "aoi_b": "dict",
+                },
+                output_schema={
+                    "relation": "str",
+                    "spatial_match": "bool",
+                },
                 handler=_handle_spatial_relation,
                 requires_imagery=False,
             )
         )
 
-        # 23. temporal_comparison
         self.register(
             ToolDefinition(
                 name="temporal_comparison",
-                description="Perform multi-temporal radiometric consistency and change trajectory check",
+                description=(
+                    "Compare supplied temporal statistics without inventing "
+                    "thresholds or consistency scores."
+                ),
                 task="TEMPORAL_COMPARISON",
                 required_images=0,
                 required_relationship="NONE",
                 model="TemporalConsistency",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"t1_stats": "dict", "t2_stats": "dict"},
-                output_schema={"temporal_delta_detected": "bool"},
+                input_schema={
+                    "t1_stats": "dict",
+                    "t2_stats": "dict",
+                },
+                output_schema={
+                    "comparison_available": "bool",
+                    "deltas": "dict",
+                    "limitations": "list",
+                },
                 handler=_handle_temporal_comparison,
                 requires_imagery=False,
             )
         )
 
-        # 24. report_generation
         self.register(
             ToolDefinition(
                 name="report_generation",
-                description="Generate PDF and HTML intelligence report dossier for the active session",
+                description=(
+                    "Delegate report generation to the configured report "
+                    "service when one is available."
+                ),
                 task="REPORT_GENERATION",
                 required_images=0,
                 required_relationship="NONE",
-                model="WeasyPrint/HTML",
+                model="ConfiguredReportService",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"session_id": "str", "query_id": "str"},
-                output_schema={"report_type": "str", "status": "str"},
+                input_schema={
+                    "session_id": "str",
+                    "query_id": "str",
+                },
+                output_schema={
+                    "status": "str",
+                    "report_type": "str|None",
+                    "artifact": "dict|None",
+                },
                 handler=_handle_report_generation,
                 requires_imagery=False,
             )
         )
 
-        # 25. evidence_export
         self.register(
             ToolDefinition(
                 name="evidence_export",
-                description="Export detected evidence polygons and masks as standard GeoJSON FeatureCollection",
+                description=(
+                    "Export already-derived GeoJSON features without "
+                    "inventing geometries."
+                ),
                 task="EVIDENCE_EXPORT",
                 required_images=0,
                 required_relationship="NONE",
                 model="GeoJSONEngine",
                 gpu_requirement="CPU_ONLY",
-                input_schema={"features": "list"},
-                output_schema={"feature_count": "int", "geojson": "dict"},
+                input_schema={
+                    "features": "list",
+                },
+                output_schema={
+                    "feature_count": "int",
+                    "geojson": "dict",
+                },
                 handler=_handle_evidence_export,
                 requires_imagery=False,
             )
         )
 
-        # 26. remoteclip_semantic_retrieval (RemoteCLIP Model per §33)
         self.register(
             ToolDefinition(
                 name="remoteclip_semantic_retrieval",
-                description="Auxiliary semantic representation and zero-shot query scoring using RemoteCLIP",
+                description=(
+                    "Score explicitly supplied text queries against an image "
+                    "using RemoteCLIP. No default semantic classes are added."
+                ),
                 task="SEMANTIC_RETRIEVAL",
                 required_images=1,
                 required_relationship="SINGLE_IMAGE",
                 model="RemoteCLIP",
                 gpu_requirement="OPTIONAL",
-                input_schema={"text_queries": "list"},
-                output_schema={"similarity_scores": "dict", "ranked_classes": "list"},
+                input_schema={
+                    "text_queries": "list[str]",
+                    "image_bytes": "list[bytes]|None",
+                    "image_paths": "list[str]|None",
+                },
+                output_schema={
+                    "similarity_scores": "dict",
+                    "ranked_classes": "list",
+                },
                 handler=_handle_remoteclip_retrieval,
             )
         )
 
 
+# ===========================================================================
+# Generic validation helpers
+# ===========================================================================
 
-# Tool Handlers
-def _handle_calculate_ndvi(raster_array: np.ndarray, **kwargs) -> dict[str, Any]:
-    h, w = raster_array.shape[:2]
-    if raster_array.shape[-1] >= 4:
-        red = raster_array[:, :, 2]
-        nir = raster_array[:, :, 3]
-        ndvi = compute_ndvi(red, nir)
-    elif raster_array.shape[-1] >= 3:
-        green = raster_array[:, :, 1].astype(float)
-        red = raster_array[:, :, 0].astype(float)
-        ndvi = (green - red) / np.maximum(green + red, 1.0)
-    else:
-        ndvi = np.zeros((h, w), dtype=float)
 
-    mean_val = float(np.mean(ndvi))
-    veg_ratio = float(np.mean(ndvi > 0.35))
+def _require_array(
+    value: Any,
+    name: str,
+    *,
+    ndim: int | None = None,
+) -> np.ndarray:
+    if value is None:
+        raise ValueError(f"'{name}' is required.")
+
+    array = np.asarray(value)
+
+    if array.size == 0:
+        raise ValueError(f"'{name}' is empty.")
+
+    if ndim is not None and array.ndim != ndim:
+        raise ValueError(
+            f"'{name}' must have {ndim} dimensions; "
+            f"received {array.ndim}."
+        )
+
+    if not np.issubdtype(array.dtype, np.number):
+        raise ValueError(
+            f"'{name}' must contain numeric raster values."
+        )
+
+    return array
+
+
+def _require_band_index(
+    raster_array: np.ndarray,
+    band_index: int,
+    name: str,
+) -> int:
+    array = np.asarray(raster_array)
+
+    if array.ndim != 3:
+        raise ValueError(
+            "Spectral index tools require a 3-D HxWxBands raster array."
+        )
+
+    try:
+        index = int(band_index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{name}' must be an integer band index."
+        ) from exc
+
+    if index < 0 or index >= array.shape[2]:
+        raise ValueError(
+            f"'{name}'={index} is outside the available "
+            f"band range 0..{array.shape[2] - 1}."
+        )
+
+    return index
+
+
+def _extract_band(
+    raster_array: np.ndarray,
+    band_index: int,
+    name: str,
+) -> np.ndarray:
+    index = _require_band_index(raster_array, band_index, name)
+    return np.asarray(raster_array[:, :, index], dtype=np.float64)
+
+
+def _finite_mask(*arrays: np.ndarray) -> np.ndarray:
+    mask: np.ndarray | None = None
+
+    for array in arrays:
+        current = np.isfinite(array)
+
+        if mask is None:
+            mask = current
+        else:
+            mask &= current
+
+    if mask is None:
+        raise ValueError("No arrays were supplied.")
+
+    return mask
+
+
+def _clean_index_result(
+    values: np.ndarray,
+    *,
+    index_name: str,
+    valid_mask: np.ndarray,
+) -> dict[str, Any]:
+    valid_values = values[valid_mask]
+
+    if valid_values.size == 0:
+        raise ValueError(
+            f"No finite pixels were available for {index_name}."
+        )
+
     return {
-        "mean_ndvi": round(mean_val, 3),
-        "vegetation_coverage_pct": round(veg_ratio * 100.0, 1),
+        f"mean_{index_name.lower()}": float(np.mean(valid_values)),
+        "valid_pixel_count": int(valid_values.size),
+        "index": index_name,
+        "status": "ok",
     }
 
 
-def _handle_calculate_ndwi(raster_array: np.ndarray, **kwargs) -> dict[str, Any]:
-    if raster_array.shape[-1] >= 4:
-        green = raster_array[:, :, 1]
-        nir = raster_array[:, :, 3]
-        ndwi = compute_ndwi(green, nir)
-    elif raster_array.shape[-1] >= 3:
-        green = raster_array[:, :, 1].astype(float)
-        blue = raster_array[:, :, 2].astype(float)
-        red = raster_array[:, :, 0].astype(float)
-        ndwi = (blue - red) / np.maximum(blue + red, 1.0)
-    else:
-        ndwi = np.zeros(raster_array.shape[:2], dtype=float)
+def _image_inputs(
+    image_bytes: Sequence[bytes] | None,
+    image_paths: Sequence[str] | None,
+    minimum: int,
+) -> tuple[list[bytes], list[str]]:
+    bytes_list = list(image_bytes or [])
+    paths_list = list(image_paths or [])
 
-    mean_val = float(np.mean(ndwi))
-    water_ratio = float(np.mean(ndwi > 0.1))
-    return {
-        "mean_ndwi": round(mean_val, 3),
-        "water_coverage_pct": round(water_ratio * 100.0, 1),
+    total = max(len(bytes_list), len(paths_list))
+
+    if total < minimum:
+        raise ValueError(
+            f"At least {minimum} image input(s) are required."
+        )
+
+    return bytes_list, paths_list
+
+
+def _select_image_input(
+    image_bytes: Sequence[bytes] | None,
+    image_paths: Sequence[str] | None,
+    index: int,
+) -> bytes | str:
+    bytes_list = list(image_bytes or [])
+    paths_list = list(image_paths or [])
+
+    if index < len(bytes_list) and bytes_list[index]:
+        return bytes_list[index]
+
+    if index < len(paths_list) and paths_list[index]:
+        return paths_list[index]
+
+    raise ValueError(
+        f"No usable image input exists at index {index}."
+    )
+
+
+def _normalize_bounds(
+    bounds: Mapping[str, Any] | None,
+) -> dict[str, float] | None:
+    if not bounds:
+        return None
+
+    aliases = {
+        "west": ("west", "minx", "xmin", "left"),
+        "east": ("east", "maxx", "xmax", "right"),
+        "south": ("south", "miny", "ymin", "bottom"),
+        "north": ("north", "maxy", "ymax", "top"),
     }
+
+    normalized: dict[str, float] = {}
+
+    for canonical, keys in aliases.items():
+        value = None
+
+        for key in keys:
+            if key in bounds and bounds[key] is not None:
+                value = bounds[key]
+                break
+
+        if value is None:
+            return None
+
+        try:
+            normalized[canonical] = float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if normalized["east"] <= normalized["west"]:
+        return None
+
+    if normalized["north"] <= normalized["south"]:
+        return None
+
+    return normalized
+
+
+def _intersection(
+    bounds_a: Mapping[str, Any] | None,
+    bounds_b: Mapping[str, Any] | None,
+) -> dict[str, float] | None:
+    a = _normalize_bounds(bounds_a)
+    b = _normalize_bounds(bounds_b)
+
+    if a is None or b is None:
+        return None
+
+    west = max(a["west"], b["west"])
+    east = min(a["east"], b["east"])
+    south = max(a["south"], b["south"])
+    north = min(a["north"], b["north"])
+
+    if east <= west or north <= south:
+        return None
+
+    return {
+        "west": west,
+        "east": east,
+        "south": south,
+        "north": north,
+    }
+
+
+def _json_safe(value: Any) -> Any:
+    """
+    Convert common NumPy values to JSON-compatible values.
+
+    Arrays are intentionally not converted wholesale because masks and large
+    raster outputs should remain binary/numeric artifacts handled by the
+    executor rather than being embedded in database JSON.
+    """
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+
+    if isinstance(value, np.ndarray):
+        return {
+            "type": "numpy.ndarray",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+
+    return value
+
+
+# ===========================================================================
+# Spectral index handlers
+# ===========================================================================
+
+
+def _handle_calculate_ndvi(
+    raster_array: np.ndarray,
+    red_band_index: int,
+    nir_band_index: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+        ndim=3,
+    )
+
+    red = _extract_band(
+        array,
+        red_band_index,
+        "red_band_index",
+    )
+
+    nir = _extract_band(
+        array,
+        nir_band_index,
+        "nir_band_index",
+    )
+
+    valid = _finite_mask(red, nir)
+
+    if not np.any(valid):
+        raise ValueError(
+            "No finite red/NIR pixel pairs are available for NDVI."
+        )
+
+    ndvi = np.full(red.shape, np.nan, dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = nir + red
+        valid_denominator = valid & (denominator != 0)
+
+        ndvi[valid_denominator] = (
+            compute_ndvi(
+                red[valid_denominator],
+                nir[valid_denominator],
+            )
+        )
+
+    final_valid = np.isfinite(ndvi)
+
+    result = _clean_index_result(
+        ndvi,
+        index_name="NDVI",
+        valid_mask=final_valid,
+    )
+
+    result["red_band_index"] = int(red_band_index)
+    result["nir_band_index"] = int(nir_band_index)
+
+    return result
+
+
+def _handle_calculate_ndwi(
+    raster_array: np.ndarray,
+    green_band_index: int,
+    nir_band_index: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+        ndim=3,
+    )
+
+    green = _extract_band(
+        array,
+        green_band_index,
+        "green_band_index",
+    )
+
+    nir = _extract_band(
+        array,
+        nir_band_index,
+        "nir_band_index",
+    )
+
+    valid = _finite_mask(green, nir)
+
+    if not np.any(valid):
+        raise ValueError(
+            "No finite green/NIR pixel pairs are available for NDWI."
+        )
+
+    ndwi = np.full(green.shape, np.nan, dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = green + nir
+        valid_denominator = valid & (denominator != 0)
+
+        ndwi[valid_denominator] = compute_ndwi(
+            green[valid_denominator],
+            nir[valid_denominator],
+        )
+
+    final_valid = np.isfinite(ndwi)
+
+    result = _clean_index_result(
+        ndwi,
+        index_name="NDWI",
+        valid_mask=final_valid,
+    )
+
+    result["green_band_index"] = int(green_band_index)
+    result["nir_band_index"] = int(nir_band_index)
+
+    return result
+
+
+def _handle_calculate_ndbi(
+    raster_array: np.ndarray,
+    swir_band_index: int,
+    nir_band_index: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+        ndim=3,
+    )
+
+    swir = _extract_band(
+        array,
+        swir_band_index,
+        "swir_band_index",
+    )
+
+    nir = _extract_band(
+        array,
+        nir_band_index,
+        "nir_band_index",
+    )
+
+    valid = _finite_mask(swir, nir)
+
+    if not np.any(valid):
+        raise ValueError(
+            "No finite SWIR/NIR pixel pairs are available for NDBI."
+        )
+
+    ndbi = np.full(swir.shape, np.nan, dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = swir + nir
+        valid_denominator = valid & (denominator != 0)
+
+        ndbi[valid_denominator] = compute_ndbi(
+            swir[valid_denominator],
+            nir[valid_denominator],
+        )
+
+    final_valid = np.isfinite(ndbi)
+
+    result = _clean_index_result(
+        ndbi,
+        index_name="NDBI",
+        valid_mask=final_valid,
+    )
+
+    result["swir_band_index"] = int(swir_band_index)
+    result["nir_band_index"] = int(nir_band_index)
+
+    return result
+
+
+def _handle_calculate_nbr(
+    raster_array: np.ndarray,
+    nir_band_index: int,
+    swir2_band_index: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+        ndim=3,
+    )
+
+    nir = _extract_band(
+        array,
+        nir_band_index,
+        "nir_band_index",
+    )
+
+    swir2 = _extract_band(
+        array,
+        swir2_band_index,
+        "swir2_band_index",
+    )
+
+    valid = _finite_mask(nir, swir2)
+
+    if not np.any(valid):
+        raise ValueError(
+            "No finite NIR/SWIR2 pixel pairs are available for NBR."
+        )
+
+    nbr = np.full(nir.shape, np.nan, dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denominator = nir + swir2
+        valid_denominator = valid & (denominator != 0)
+
+        nbr[valid_denominator] = compute_nbr(
+            nir[valid_denominator],
+            swir2[valid_denominator],
+        )
+
+    final_valid = np.isfinite(nbr)
+
+    result = _clean_index_result(
+        nbr,
+        index_name="NBR",
+        valid_mask=final_valid,
+    )
+
+    result["nir_band_index"] = int(nir_band_index)
+    result["swir2_band_index"] = int(swir2_band_index)
+
+    return result
+
+
+# ===========================================================================
+# Segmentation handlers
+# ===========================================================================
 
 
 def _handle_detect_water(
@@ -606,23 +1442,55 @@ def _handle_detect_water(
     bounds_wgs84: dict[str, float] | None = None,
     affine_list: list[float] | None = None,
     crs: str | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    features = segment_water(raster_array, bounds_wgs84, affine_list, crs)
-    total_km2 = sum(f.area_km2 for f in features)
-    return {
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+    )
+
+    features = segment_water(
+        array,
+        bounds_wgs84,
+        affine_list,
+        crs,
+    )
+
+    serialized_features = [
+        {
+            "label": getattr(feature, "label", None),
+            "area_km2": _optional_float(
+                getattr(feature, "area_km2", None)
+            ),
+            "confidence": _optional_float(
+                getattr(feature, "confidence", None)
+            ),
+            "geometry": getattr(
+                feature,
+                "geojson_geometry",
+                None,
+            ),
+        }
+        for feature in features
+    ]
+
+    result: dict[str, Any] = {
         "water_features_count": len(features),
-        "total_water_km2": round(total_km2, 4),
-        "features": [
-            {
-                "label": f.label,
-                "area_km2": f.area_km2,
-                "confidence": f.confidence,
-                "geometry": f.geojson_geometry,
-            }
-            for f in features[:25]
-        ],
+        "features": serialized_features,
+        "status": "ok",
     }
+
+    total_area = _sum_actual_numeric_field(
+        serialized_features,
+        "area_km2",
+    )
+
+    if total_area is not None:
+        result["total_water_km2"] = total_area
+
+    return result
 
 
 def _handle_detect_vegetation(
@@ -630,23 +1498,55 @@ def _handle_detect_vegetation(
     bounds_wgs84: dict[str, float] | None = None,
     affine_list: list[float] | None = None,
     crs: str | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    features = segment_vegetation(raster_array, bounds_wgs84, affine_list, crs)
-    total_km2 = sum(f.area_km2 for f in features)
-    return {
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+    )
+
+    features = segment_vegetation(
+        array,
+        bounds_wgs84,
+        affine_list,
+        crs,
+    )
+
+    serialized_features = [
+        {
+            "label": getattr(feature, "label", None),
+            "area_km2": _optional_float(
+                getattr(feature, "area_km2", None)
+            ),
+            "confidence": _optional_float(
+                getattr(feature, "confidence", None)
+            ),
+            "geometry": getattr(
+                feature,
+                "geojson_geometry",
+                None,
+            ),
+        }
+        for feature in features
+    ]
+
+    result: dict[str, Any] = {
         "vegetation_features_count": len(features),
-        "total_veg_km2": round(total_km2, 4),
-        "features": [
-            {
-                "label": f.label,
-                "area_km2": f.area_km2,
-                "confidence": f.confidence,
-                "geometry": f.geojson_geometry,
-            }
-            for f in features[:25]
-        ],
+        "features": serialized_features,
+        "status": "ok",
     }
+
+    total_area = _sum_actual_numeric_field(
+        serialized_features,
+        "area_km2",
+    )
+
+    if total_area is not None:
+        result["total_veg_km2"] = total_area
+
+    return result
 
 
 def _handle_detect_structures(
@@ -654,23 +1554,60 @@ def _handle_detect_structures(
     bounds_wgs84: dict[str, float] | None = None,
     affine_list: list[float] | None = None,
     crs: str | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    count, features = detect_and_count_structures(raster_array, bounds_wgs84, affine_list, crs)
-    total_km2 = sum(f.area_km2 for f in features)
-    return {
-        "candidate_count": count,
-        "total_structure_km2": round(total_km2, 4),
-        "features": [
-            {
-                "label": f.label,
-                "area_km2": f.area_km2,
-                "confidence": f.confidence,
-                "geometry": f.geojson_geometry,
-            }
-            for f in features[:35]
-        ],
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+    )
+
+    count, features = detect_and_count_structures(
+        array,
+        bounds_wgs84,
+        affine_list,
+        crs,
+    )
+
+    serialized_features = [
+        {
+            "label": getattr(feature, "label", None),
+            "area_km2": _optional_float(
+                getattr(feature, "area_km2", None)
+            ),
+            "confidence": _optional_float(
+                getattr(feature, "confidence", None)
+            ),
+            "geometry": getattr(
+                feature,
+                "geojson_geometry",
+                None,
+            ),
+        }
+        for feature in features
+    ]
+
+    result: dict[str, Any] = {
+        "candidate_count": int(count),
+        "features": serialized_features,
+        "status": "ok",
     }
+
+    total_area = _sum_actual_numeric_field(
+        serialized_features,
+        "area_km2",
+    )
+
+    if total_area is not None:
+        result["total_structure_km2"] = total_area
+
+    return result
+
+
+# ===========================================================================
+# Geospatial measurement
+# ===========================================================================
 
 
 def _handle_calculate_area(
@@ -678,350 +1615,1251 @@ def _handle_calculate_area(
     affine_list: list[float] | None = None,
     crs: str | None = None,
     bounds_wgs84: dict[str, float] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    return quantify_mask_area(mask, affine_list, crs, bounds_wgs84)
+    del kwargs
+
+    if affine_list is None:
+        raise ValueError(
+            "Cannot calculate geographic area without a real affine transform."
+        )
+
+    if not crs:
+        raise ValueError(
+            "Cannot calculate geographic area without a real CRS."
+        )
+
+    mask_array = np.asarray(mask)
+
+    if mask_array.size == 0:
+        raise ValueError("Area mask is empty.")
+
+    if mask_array.ndim != 2:
+        raise ValueError(
+            "Area calculation requires a 2-D binary/boolean mask."
+        )
+
+    result = quantify_mask_area(
+        mask_array,
+        affine_list,
+        crs,
+        bounds_wgs84,
+    )
+
+    if not isinstance(result, dict):
+        raise ValueError(
+            "Area calculation engine returned an invalid result."
+        )
+
+    return _sanitize_numeric_mapping(result)
+
+
+# ===========================================================================
+# Satellite catalog search
+# ===========================================================================
 
 
 def _handle_search_satellite(
     aoi_geometry: dict[str, Any],
-    sensor: str = "SENTINEL-2",
-    date_start: str = "2024-07-01",
-    date_end: str = "2024-07-31",
-    max_cloud_cover: float = 20.0,
-    **kwargs,
+    sensor: str | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    max_cloud_cover: float | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
+    del kwargs
+
+    if not aoi_geometry:
+        raise ValueError(
+            "Satellite search requires an explicit AOI geometry."
+        )
+
+    if not sensor or not str(sensor).strip():
+        raise ValueError(
+            "Satellite search requires an explicit sensor/collection."
+        )
+
+    if not date_start or not date_end:
+        raise ValueError(
+            "Satellite search requires explicit date_start and date_end. "
+            "The tool will not invent a temporal search window."
+        )
+
+    if str(date_start) > str(date_end):
+        raise ValueError(
+            "date_start cannot be later than date_end."
+        )
+
     provider = get_satellite_provider()
-    candidates = provider.search_scenes(aoi_geometry, date_start, date_end, sensor, max_cloud_cover)
-    return {
-        "candidate_count": len(candidates),
-        "provider": provider.name,
-        "candidates": [
+
+    search_kwargs: dict[str, Any] = {}
+
+    if max_cloud_cover is not None:
+        search_kwargs["max_cloud_cover"] = float(max_cloud_cover)
+
+    candidates = provider.search_scenes(
+        aoi_geometry,
+        date_start,
+        date_end,
+        sensor,
+        **search_kwargs,
+    )
+
+    serialized_candidates: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        serialized_candidates.append(
             {
-                "stac_item_id": c.stac_item_id,
-                "acquisition_date": c.acquisition_date,
-                "cloud_cover_pct": c.cloud_cover_pct,
-                "collection": c.collection,
+                "stac_item_id": getattr(
+                    candidate,
+                    "stac_item_id",
+                    None,
+                ),
+                "acquisition_date": getattr(
+                    candidate,
+                    "acquisition_date",
+                    None,
+                ),
+                "cloud_cover_pct": _optional_float(
+                    getattr(
+                        candidate,
+                        "cloud_cover_pct",
+                        None,
+                    )
+                ),
+                "collection": getattr(
+                    candidate,
+                    "collection",
+                    None,
+                ),
             }
-            for c in candidates
-        ],
-    }
+        )
 
-
-def _handle_calculate_ndbi(raster_array: np.ndarray, **kwargs) -> dict[str, Any]:
-    h, w = raster_array.shape[:2]
-    if raster_array.shape[-1] >= 6:
-        swir = raster_array[:, :, 5]
-        nir = raster_array[:, :, 3]
-        ndbi = compute_ndbi(swir, nir)
-    elif raster_array.shape[-1] >= 3:
-        # Approximate built-up index from red/blue ratio if SWIR unavailable
-        red = raster_array[:, :, 0].astype(float)
-        blue = raster_array[:, :, 2].astype(float)
-        ndbi = (red - blue) / np.maximum(red + blue, 1.0)
-    else:
-        ndbi = np.zeros((h, w), dtype=float)
-
-    mean_val = float(np.mean(ndbi))
-    built_up_ratio = float(np.mean(ndbi > 0.10))
     return {
-        "mean_ndbi": round(mean_val, 3),
-        "built_up_coverage_pct": round(built_up_ratio * 100.0, 1),
+        "candidate_count": len(serialized_candidates),
+        "provider": getattr(provider, "name", None),
+        "sensor_requested": sensor,
+        "date_start": date_start,
+        "date_end": date_end,
+        "max_cloud_cover": (
+            float(max_cloud_cover)
+            if max_cloud_cover is not None
+            else None
+        ),
+        "candidates": serialized_candidates,
+        "status": "ok",
     }
 
 
-def _handle_calculate_nbr(raster_array: np.ndarray, **kwargs) -> dict[str, Any]:
-    h, w = raster_array.shape[:2]
-    if raster_array.shape[-1] >= 7:
-        nir = raster_array[:, :, 3]
-        swir2 = raster_array[:, :, 6]
-        nbr = compute_nbr(nir, swir2)
-    elif raster_array.shape[-1] >= 3:
-        green = raster_array[:, :, 1].astype(float)
-        red = raster_array[:, :, 0].astype(float)
-        nbr = (green - red) / np.maximum(green + red, 1.0)
-    else:
-        nbr = np.zeros((h, w), dtype=float)
-
-    mean_val = float(np.mean(nbr))
-    burn_risk_ratio = float(np.mean(nbr < -0.10))
-    return {
-        "mean_nbr": round(mean_val, 3),
-        "burn_risk_coverage_pct": round(burn_risk_ratio * 100.0, 1),
-    }
+# ===========================================================================
+# Change detection
+# ===========================================================================
 
 
 def _handle_detect_change(
     before_array: np.ndarray,
     after_array: np.ndarray,
-    change_type: str = "URBAN_EXPANSION",
-    **kwargs,
+    before_affine_list: list[float] | None = None,
+    after_affine_list: list[float] | None = None,
+    before_crs: str | None = None,
+    after_crs: str | None = None,
+    change_threshold: float | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    # Ensure matching spatial dimensions
-    min_h = min(before_array.shape[0], after_array.shape[0])
-    min_w = min(before_array.shape[1], after_array.shape[1])
-    b_crop = before_array[:min_h, :min_w]
-    a_crop = after_array[:min_h, :min_w]
+    del kwargs
 
-    # Compute absolute spectral delta
-    delta = np.abs(a_crop.astype(float) - b_crop.astype(float))
-    diff_magnitude = float(np.mean(delta))
-    change_mask = delta > (np.mean(delta) + np.std(delta))
-    change_ratio = float(np.mean(change_mask))
+    before = _require_array(
+        before_array,
+        "before_array",
+    )
 
-    # Metric conversion approximation
-    approx_ha = round(change_ratio * min_h * min_w * 0.01, 1)
-    return {
-        "changed_area_hectares": approx_ha,
-        "change_percentage": round(change_ratio * 100.0, 1),
-        "change_class": change_type,
-        "spectral_delta_magnitude": round(diff_magnitude, 2),
+    after = _require_array(
+        after_array,
+        "after_array",
+    )
+
+    if before.shape != after.shape:
+        raise ValueError(
+            "Before and after rasters must have identical dimensions "
+            "for deterministic pixel-wise differencing. "
+            "Use coregistration/resampling before this tool."
+        )
+
+    if (
+        before.ndim != 2
+        and before.ndim != 3
+    ):
+        raise ValueError(
+            "Change detection expects 2-D or 3-D raster arrays."
+        )
+
+    if (
+        before_affine_list is not None
+        and after_affine_list is not None
+        and list(before_affine_list) != list(after_affine_list)
+    ):
+        raise ValueError(
+            "Before and after affine transforms differ. "
+            "Coregister the observations before pixel-wise change detection."
+        )
+
+    if (
+        before_crs
+        and after_crs
+        and str(before_crs) != str(after_crs)
+    ):
+        raise ValueError(
+            "Before and after CRS differ. "
+            "Reproject/coregister the observations before pixel-wise "
+            "change detection."
+        )
+
+    before_float = before.astype(np.float64)
+    after_float = after.astype(np.float64)
+
+    valid = _finite_mask(
+        before_float,
+        after_float,
+    )
+
+    if not np.any(valid):
+        raise ValueError(
+            "No valid overlapping pixels are available for change detection."
+        )
+
+    delta = np.abs(after_float - before_float)
+
+    if delta.ndim == 3:
+        delta_scalar = np.nanmean(delta, axis=2)
+        valid_scalar = np.all(valid, axis=2)
+    else:
+        delta_scalar = delta
+        valid_scalar = valid
+
+    valid_values = delta_scalar[valid_scalar]
+
+    if valid_values.size == 0:
+        raise ValueError(
+            "No valid scalar change values are available."
+        )
+
+    if change_threshold is None:
+        raise ValueError(
+            "A change threshold must be explicitly supplied. "
+            "This tool does not invent a scientific threshold."
+        )
+
+    threshold = float(change_threshold)
+
+    if not np.isfinite(threshold) or threshold < 0:
+        raise ValueError(
+            "change_threshold must be a finite non-negative value."
+        )
+
+    change_mask = np.zeros(
+        delta_scalar.shape,
+        dtype=np.uint8,
+    )
+
+    change_mask[
+        valid_scalar & (delta_scalar > threshold)
+    ] = 1
+
+    valid_pixel_count = int(np.count_nonzero(valid_scalar))
+    changed_pixel_count = int(np.count_nonzero(change_mask))
+
+    if valid_pixel_count == 0:
+        raise ValueError(
+            "No valid pixels remain after change-mask construction."
+        )
+
+    change_percentage = (
+        changed_pixel_count / valid_pixel_count
+    ) * 100.0
+
+    result: dict[str, Any] = {
+        "changed_pixel_count": changed_pixel_count,
+        "valid_pixel_count": valid_pixel_count,
+        "change_percentage": float(change_percentage),
+        "change_threshold": threshold,
+        "spectral_delta_mean": float(np.mean(valid_values)),
+        "spectral_delta_std": float(np.std(valid_values)),
+        "change_mask": change_mask,
+        "status": "ok",
     }
 
+    if (
+        before_affine_list is not None
+        and before_crs
+    ):
+        area_result = _handle_calculate_area(
+            mask=change_mask.astype(bool),
+            affine_list=before_affine_list,
+            crs=before_crs,
+        )
 
-def _handle_search_web(query: str, aoi_name: str = "", **kwargs) -> dict[str, Any]:
+        if "area_m2" in area_result:
+            result["changed_area_m2"] = area_result["area_m2"]
+
+        if "area_km2" in area_result:
+            result["changed_area_km2"] = area_result["area_km2"]
+
+        if "area_hectares" in area_result:
+            result["changed_area_hectares"] = area_result[
+                "area_hectares"
+            ]
+
+    else:
+        result["changed_area_m2"] = None
+        result["changed_area_km2"] = None
+        result["changed_area_hectares"] = None
+        result.setdefault("limitations", []).append(
+            "Geographic change area was not calculated because "
+            "real affine/CRS metadata was not supplied."
+        )
+
+    return result
+
+
+# ===========================================================================
+# Web research / evidence verification
+# ===========================================================================
+
+
+def _handle_search_web(
+    query: str,
+    aoi_name: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    if not query or not str(query).strip():
+        raise ValueError(
+            "Web research requires a non-empty query."
+        )
+
     agent = WebResearchAgent()
-    dtos = agent.research(query, aoi_name)
-    return {
-        "evidence_count": len(dtos),
-        "citations": [
+
+    dtos = agent.research(
+        query,
+        aoi_name or "",
+    )
+
+    citations = []
+
+    for dto in dtos:
+        citations.append(
             {
-                "publisher": d.publisher,
-                "title": d.title,
-                "source_url": d.source_url,
-                "trust_tier": d.trust_tier,
-                "trust_score": d.trust_score,
-                "summary_facts": d.summary_facts,
-                "content_hash": d.content_hash,
-                "ttl_expires_at": d.ttl_expires_at,
+                "publisher": getattr(
+                    dto,
+                    "publisher",
+                    None,
+                ),
+                "title": getattr(
+                    dto,
+                    "title",
+                    None,
+                ),
+                "source_url": getattr(
+                    dto,
+                    "source_url",
+                    None,
+                ),
+                "trust_tier": getattr(
+                    dto,
+                    "trust_tier",
+                    None,
+                ),
+                "trust_score": _optional_float(
+                    getattr(
+                        dto,
+                        "trust_score",
+                        None,
+                    )
+                ),
+                "summary_facts": getattr(
+                    dto,
+                    "summary_facts",
+                    None,
+                ),
+                "content_hash": getattr(
+                    dto,
+                    "content_hash",
+                    None,
+                ),
+                "ttl_expires_at": getattr(
+                    dto,
+                    "ttl_expires_at",
+                    None,
+                ),
             }
-            for d in dtos
-        ],
+        )
+
+    return {
+        "evidence_count": len(citations),
+        "citations": citations,
+        "status": "ok",
     }
 
 
 def _handle_verify_evidence(
     satellite_scenes: list[dict[str, Any]],
     external_evidence: list[dict[str, Any]],
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    has_sat = len(satellite_scenes) > 0
-    has_ext = len(external_evidence) > 0
+    del kwargs
 
-    if has_sat and has_ext:
-        status_str = "FULLY_CORROBORATED"
-        ext_scores = [e.get("trust_score", 0.8) for e in external_evidence]
-        avg_trust = float(np.mean(ext_scores)) if ext_scores else 0.8
-        score = round(min(0.98, max(0.70, 0.70 + 0.15 * avg_trust + min(0.10, len(satellite_scenes) * 0.05))), 2)
-    elif has_sat:
-        status_str = "PHYSICAL_SATELLITE_ONLY"
-        score = round(min(0.92, max(0.65, 0.70 + min(0.20, len(satellite_scenes) * 0.10))), 2)
+    satellite = list(satellite_scenes or [])
+    external = list(external_evidence or [])
+
+    if not satellite and not external:
+        return {
+            "verification_status": "NO_EVIDENCE",
+            "supporting_evidence_count": 0,
+            "contradicting_evidence_count": 0,
+            "limitations": [
+                "No satellite or external evidence was supplied."
+            ],
+            "status": "ok",
+        }
+
+    supporting: list[dict[str, Any]] = []
+    contradicting: list[dict[str, Any]] = []
+    unclassified: list[dict[str, Any]] = []
+
+    for item in external:
+        classification = str(
+            item.get(
+                "classification",
+                item.get(
+                    "relation",
+                    "",
+                ),
+            )
+        ).strip().lower()
+
+        if classification in {
+            "support",
+            "supports",
+            "supporting",
+            "corroborates",
+            "corroborated",
+        }:
+            supporting.append(item)
+
+        elif classification in {
+            "contradict",
+            "contradicts",
+            "contradicting",
+            "conflicts",
+            "conflicting",
+        }:
+            contradicting.append(item)
+
+        else:
+            unclassified.append(item)
+
+    if contradicting:
+        verification_status = "CONFLICTING_EVIDENCE"
+    elif supporting:
+        verification_status = "SUPPORTED_BY_EXTERNAL_EVIDENCE"
+    elif satellite:
+        verification_status = "SATELLITE_EVIDENCE_ONLY"
     else:
-        status_str = "UNVERIFIED"
-        score = round(min(0.60, max(0.30, len(external_evidence) * 0.20)), 2)
+        verification_status = "UNCLASSIFIED_EXTERNAL_EVIDENCE"
+
+    limitations: list[str] = []
+
+    if unclassified:
+        limitations.append(
+            "Some external evidence items did not contain an explicit "
+            "support/contradiction classification."
+        )
+
+    if satellite and not external:
+        limitations.append(
+            "No external corroborating source was supplied."
+        )
+
+    if external and not satellite:
+        limitations.append(
+            "No satellite observation was supplied for physical "
+            "cross-checking."
+        )
 
     return {
-        "verification_status": status_str,
-        "confidence_score": score,
-        "satellite_overpasses_checked": len(satellite_scenes),
-        "external_citations_verified": len(external_evidence),
+        "verification_status": verification_status,
+        "supporting_evidence_count": len(supporting),
+        "contradicting_evidence_count": len(contradicting),
+        "satellite_evidence_count": len(satellite),
+        "external_evidence_count": len(external),
+        "limitations": limitations,
+        "status": "ok",
     }
 
 
-def _handle_vqa(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, question: str = "", **kwargs) -> dict[str, Any]:
+# ===========================================================================
+# Specialist model handlers
+# ===========================================================================
+
+
+def _handle_vqa(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    question: str = "",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    if not question or not str(question).strip():
+        raise ValueError(
+            "VQA requires a non-empty question."
+        )
+
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=1,
+    )
+
     from ai.adapters.geochat_adapter import GeoChatVQAAdapter
+
     adapter = GeoChatVQAAdapter()
-    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    out = adapter.answer(img_in, question=question, **kwargs)
+
+    image_input = _select_image_input(
+        image_bytes,
+        image_paths,
+        0,
+    )
+
+    out = adapter.answer(
+        image_input,
+        question=question,
+        **kwargs,
+    )
+
     return {
-        "answer": out.answer,
-        "confidence": out.confidence,
-        "status": out.status,
-        "raw": out.raw,
+        "answer": getattr(out, "answer", None),
+        "confidence": _optional_float(
+            getattr(out, "confidence", None)
+        ),
+        "status": getattr(out, "status", "ok"),
+        "raw": getattr(out, "raw", None),
     }
 
 
-def _handle_caption(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, **kwargs) -> dict[str, Any]:
+def _handle_caption(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=1,
+    )
+
     from ai.adapters.geochat_adapter import GeoChatVQAAdapter
+
     adapter = GeoChatVQAAdapter()
-    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    out = adapter.caption(img_in, **kwargs)
+
+    image_input = _select_image_input(
+        image_bytes,
+        image_paths,
+        0,
+    )
+
+    out = adapter.caption(
+        image_input,
+        **kwargs,
+    )
+
     return {
-        "caption": out.caption,
-        "confidence": out.confidence,
-        "status": out.status,
+        "caption": getattr(out, "caption", None),
+        "confidence": _optional_float(
+            getattr(out, "confidence", None)
+        ),
+        "status": getattr(out, "status", "ok"),
+        "raw": getattr(out, "raw", None),
     }
 
 
-def _handle_grounding(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, text_prompt: str = "", **kwargs) -> dict[str, Any]:
+def _handle_grounding(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    text_prompt: str = "",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    if not text_prompt or not str(text_prompt).strip():
+        raise ValueError(
+            "Grounding requires a non-empty text prompt."
+        )
+
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=1,
+    )
+
     from ai.adapters.grounding_adapter import GroundingDINOAdapter
+
     adapter = GroundingDINOAdapter()
-    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    out = adapter.ground(img_in, text_prompt=text_prompt, **kwargs)
+
+    image_input = _select_image_input(
+        image_bytes,
+        image_paths,
+        0,
+    )
+
+    out = adapter.ground(
+        image_input,
+        text_prompt=text_prompt,
+        **kwargs,
+    )
+
     return {
-        "boxes": out.boxes or [],
-        "confidence": out.confidence,
-        "status": out.status,
+        "boxes": getattr(out, "boxes", None) or [],
+        "confidence": _optional_float(
+            getattr(out, "confidence", None)
+        ),
+        "status": getattr(out, "status", "ok"),
+        "raw": getattr(out, "raw", None),
     }
 
 
-def _handle_change_detection(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, **kwargs) -> dict[str, Any]:
+def _handle_change_detection(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=2,
+    )
+
     from ai.adapters.changeformer_adapter import ChangeFormerAdapter
+
     adapter = ChangeFormerAdapter()
-    t1_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    t2_in = image_bytes[1] if (image_bytes and len(image_bytes) > 1) else (image_paths[1] if (image_paths and len(image_paths) > 1) else None)
-    out = adapter.detect_change(t1_in, t2_in, params=kwargs)
+
+    before = _select_image_input(
+        image_bytes,
+        image_paths,
+        0,
+    )
+
+    after = _select_image_input(
+        image_bytes,
+        image_paths,
+        1,
+    )
+
+    out = adapter.detect_change(
+        before,
+        after,
+        params=kwargs,
+    )
+
     return {
-        "answer": out.answer,
-        "confidence": out.confidence,
-        "boxes": out.boxes or [],
-        "change_mask": out.change_mask,
-        "raw": out.raw,
-        "status": out.status,
+        "answer": getattr(out, "answer", None),
+        "confidence": _optional_float(
+            getattr(out, "confidence", None)
+        ),
+        "boxes": getattr(out, "boxes", None) or [],
+        "change_mask": getattr(out, "change_mask", None),
+        "raw": getattr(out, "raw", None),
+        "status": getattr(out, "status", "ok"),
     }
 
 
-def _handle_change_vqa(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, question: str = "", change_mask: Any = None, **kwargs) -> dict[str, Any]:
+def _handle_change_vqa(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    question: str = "",
+    change_mask: Any = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    if not question or not str(question).strip():
+        raise ValueError(
+            "Change VQA requires a non-empty question."
+        )
+
+    if change_mask is None:
+        raise ValueError(
+            "Change VQA requires an actual change mask from a prior "
+            "change-detection step."
+        )
+
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=2,
+    )
+
     from ai.adapters.changeformer_adapter import ChangeFormerAdapter
+
     adapter = ChangeFormerAdapter()
-    t1_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    t2_in = image_bytes[1] if (image_bytes and len(image_bytes) > 1) else (image_paths[1] if (image_paths and len(image_paths) > 1) else None)
-    out = adapter.answer_change(t1_in, t2_in, change_mask=change_mask, question=question, params=kwargs)
+
+    before = _select_image_input(
+        image_bytes,
+        image_paths,
+        0,
+    )
+
+    after = _select_image_input(
+        image_bytes,
+        image_paths,
+        1,
+    )
+
+    out = adapter.answer_change(
+        before,
+        after,
+        change_mask=change_mask,
+        question=question,
+        params=kwargs,
+    )
+
     return {
-        "answer": out.answer,
-        "confidence": out.confidence,
-        "status": out.status,
-        "raw": out.raw,
+        "answer": getattr(out, "answer", None),
+        "confidence": _optional_float(
+            getattr(out, "confidence", None)
+        ),
+        "status": getattr(out, "status", "ok"),
+        "raw": getattr(out, "raw", None),
     }
 
 
-def _handle_optical_sar(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, **kwargs) -> dict[str, Any]:
+def _handle_optical_sar(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    optical_index: int = 0,
+    sar_index: int = 1,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=2,
+    )
+
+    if optical_index == sar_index:
+        raise ValueError(
+            "Optical and SAR inputs must reference different images."
+        )
+
     from ai.adapters.optical_sar_adapter import OpticalSARAdapter
+
     adapter = OpticalSARAdapter()
-    opt_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    sar_in = image_bytes[1] if (image_bytes and len(image_bytes) > 1) else (image_paths[1] if (image_paths and len(image_paths) > 1) else None)
-    out = adapter.fuse(opt_in, sar_in, params=kwargs)
+
+    optical_input = _select_image_input(
+        image_bytes,
+        image_paths,
+        optical_index,
+    )
+
+    sar_input = _select_image_input(
+        image_bytes,
+        image_paths,
+        sar_index,
+    )
+
+    out = adapter.fuse(
+        optical_input,
+        sar_input,
+        params=kwargs,
+    )
+
     return {
-        "answer": out.answer,
-        "confidence": out.confidence,
-        "boxes": out.boxes or [],
-        "status": out.status,
-        "raw": out.raw,
+        "answer": getattr(out, "answer", None),
+        "confidence": _optional_float(
+            getattr(out, "confidence", None)
+        ),
+        "boxes": getattr(out, "boxes", None) or [],
+        "status": getattr(out, "status", "ok"),
+        "raw": getattr(out, "raw", None),
     }
+
+
+# ===========================================================================
+# Metadata / statistics
+# ===========================================================================
+
+
+def _handle_geo_metadata(
+    image_bytes: bytes | None = None,
+    filename: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    if not image_bytes:
+        raise ValueError(
+            "No raster bytes provided for metadata extraction."
+        )
+
+    if not filename or not str(filename).strip():
+        raise ValueError(
+            "A real source filename is required for metadata extraction."
+        )
+
+    from apps.geospatial.ingestion import extract_metadata_from_bytes
+
+    meta = extract_metadata_from_bytes(
+        image_bytes,
+        filename,
+    )
+
+    return {
+        "width": getattr(meta, "width", None),
+        "height": getattr(meta, "height", None),
+        "band_count": getattr(meta, "band_count", None),
+        "crs": getattr(meta, "crs", None),
+        "sensor": getattr(meta, "sensor", None),
+        "modality": getattr(meta, "modality", None),
+        "resolution_m": _optional_float(
+            getattr(meta, "resolution_m", None)
+        ),
+        "bounds_wgs84": getattr(
+            meta,
+            "bounds_wgs84",
+            None,
+        ),
+        "is_georeferenced": getattr(
+            meta,
+            "is_georeferenced",
+            None,
+        ),
+        "status": "ok",
+    }
+
+
+def _handle_histogram_analysis(
+    raster_array: np.ndarray,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    array = _require_array(
+        raster_array,
+        "raster_array",
+    )
+
+    if array.ndim == 2:
+        bands = [array]
+    elif array.ndim == 3:
+        bands = [
+            array[:, :, index]
+            for index in range(array.shape[2])
+        ]
+    else:
+        raise ValueError(
+            "Histogram analysis expects a 2-D or 3-D raster."
+        )
+
+    statistics: list[dict[str, Any]] = []
+
+    for index, band in enumerate(bands):
+        finite = np.asarray(band)[np.isfinite(band)]
+
+        if finite.size == 0:
+            statistics.append(
+                {
+                    "band_index": index,
+                    "valid_pixel_count": 0,
+                }
+            )
+            continue
+
+        statistics.append(
+            {
+                "band_index": index,
+                "valid_pixel_count": int(finite.size),
+                "min": float(np.min(finite)),
+                "max": float(np.max(finite)),
+                "mean": float(np.mean(finite)),
+                "std": float(np.std(finite)),
+            }
+        )
+
+    return {
+        "bands_analyzed": len(statistics),
+        "statistics": statistics,
+        "status": "ok",
+    }
+
+
+# ===========================================================================
+# Spatial / temporal comparison
+# ===========================================================================
+
+
+def _handle_coregistration(
+    bounds_a: dict[str, float],
+    bounds_b: dict[str, float],
+    crs_a: str | None = None,
+    crs_b: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    if not bounds_a or not bounds_b:
+        raise ValueError(
+            "Both observations require real spatial bounds."
+        )
+
+    if crs_a and crs_b and str(crs_a) != str(crs_b):
+        return {
+            "coregistration_valid": False,
+            "overlap": None,
+            "reason": (
+                "The observations use different CRS values. "
+                "Reprojection/coregistration is required before "
+                "pixel-wise comparison."
+            ),
+            "crs_a": str(crs_a),
+            "crs_b": str(crs_b),
+            "status": "CRS_MISMATCH",
+        }
+
+    overlap = _intersection(
+        bounds_a,
+        bounds_b,
+    )
+
+    if overlap is None:
+        return {
+            "coregistration_valid": False,
+            "overlap": None,
+            "reason": "The supplied spatial bounds do not overlap.",
+            "status": "NO_SPATIAL_OVERLAP",
+        }
+
+    return {
+        "coregistration_valid": True,
+        "overlap": overlap,
+        "reason": "The supplied spatial bounds overlap.",
+        "status": "SPATIAL_OVERLAP",
+    }
+
+
+def _handle_spatial_relation(
+    aoi_a: dict[str, Any],
+    aoi_b: dict[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    if not aoi_a or not aoi_b:
+        raise ValueError(
+            "Both AOI geometries are required."
+        )
+
+    try:
+        from shapely.geometry import shape
+
+        geometry_a = shape(aoi_a)
+        geometry_b = shape(aoi_b)
+
+    except Exception as exc:
+        raise ValueError(
+            "AOI geometries must be valid GeoJSON geometries."
+        ) from exc
+
+    if geometry_a.is_empty or geometry_b.is_empty:
+        raise ValueError(
+            "AOI geometries cannot be empty."
+        )
+
+    if geometry_a.equals(geometry_b):
+        relation = "EQUAL"
+
+    elif geometry_a.contains(geometry_b):
+        relation = "CONTAINS"
+
+    elif geometry_b.contains(geometry_a):
+        relation = "WITHIN"
+
+    elif geometry_a.intersects(geometry_b):
+        relation = "INTERSECTS"
+
+    elif geometry_a.touches(geometry_b):
+        relation = "TOUCHES"
+
+    else:
+        relation = "DISJOINT"
+
+    return {
+        "relation": relation,
+        "spatial_match": relation != "DISJOINT",
+        "status": "ok",
+    }
+
+
+def _handle_temporal_comparison(
+    t1_stats: dict[str, Any],
+    t2_stats: dict[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    if not t1_stats or not t2_stats:
+        raise ValueError(
+            "Both temporal statistic sets are required."
+        )
+
+    deltas: dict[str, float] = {}
+
+    shared_keys = set(t1_stats.keys()) & set(t2_stats.keys())
+
+    for key in sorted(shared_keys):
+        value_a = t1_stats.get(key)
+        value_b = t2_stats.get(key)
+
+        if not _is_number(value_a) or not _is_number(value_b):
+            continue
+
+        deltas[key] = float(value_b) - float(value_a)
+
+    if not deltas:
+        return {
+            "comparison_available": False,
+            "deltas": {},
+            "limitations": [
+                "No shared numeric statistics were supplied."
+            ],
+            "status": "ok",
+        }
+
+    return {
+        "comparison_available": True,
+        "deltas": deltas,
+        "limitations": [
+            (
+                "No significance threshold or physical interpretation "
+                "was inferred by this tool."
+            )
+        ],
+        "status": "ok",
+    }
+
+
+# ===========================================================================
+# Report/export handlers
+# ===========================================================================
+
+
+def _handle_report_generation(
+    session_id: str,
+    query_id: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """
+    Do not claim that a report has been generated unless a real report
+    service is connected.
+
+    The handler provides a structured delegation contract that another
+    service can replace later.
+    """
+
+    del kwargs
+
+    if not session_id or not query_id:
+        raise ValueError(
+            "session_id and query_id are required for report generation."
+        )
+
+    return {
+        "status": "NOT_GENERATED",
+        "report_type": None,
+        "artifact": None,
+        "session_id": str(session_id),
+        "query_id": str(query_id),
+        "message": (
+            "No report-generation service is connected to this tool."
+        ),
+    }
+
+
+def _handle_evidence_export(
+    features: list[dict[str, Any]],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+
+    if features is None:
+        raise ValueError(
+            "features is required."
+        )
+
+    if not isinstance(features, list):
+        raise ValueError(
+            "features must be a list of existing evidence features."
+        )
+
+    sanitized_features: list[dict[str, Any]] = []
+
+    for feature in features:
+        if not isinstance(feature, dict):
+            raise ValueError(
+                "Every evidence feature must be a dictionary."
+            )
+
+        if "geometry" not in feature:
+            raise ValueError(
+                "Evidence feature is missing its actual geometry."
+            )
+
+        sanitized_features.append(
+            _json_safe(feature)
+        )
+
+    return {
+        "feature_count": len(sanitized_features),
+        "geojson": {
+            "type": "FeatureCollection",
+            "features": sanitized_features,
+        },
+        "status": "EXPORTED",
+    }
+
+
+# ===========================================================================
+# RemoteCLIP
+# ===========================================================================
 
 
 def _handle_remoteclip_retrieval(
     image_bytes: list[bytes] | None = None,
     image_paths: list[str] | None = None,
     text_queries: list[str] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
+    del kwargs
+
+    if not text_queries:
+        raise ValueError(
+            "RemoteCLIP retrieval requires explicit text_queries."
+        )
+
+    queries = [
+        str(query).strip()
+        for query in text_queries
+        if str(query).strip()
+    ]
+
+    if not queries:
+        raise ValueError(
+            "RemoteCLIP text_queries cannot be empty."
+        )
+
+    _image_inputs(
+        image_bytes,
+        image_paths,
+        minimum=1,
+    )
+
     from ai.adapters.remoteclip_adapter import RemoteCLIPAdapter
+
     adapter = RemoteCLIPAdapter()
-    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
-    queries = text_queries or ["agricultural area", "built-up area", "water body", "vegetation"]
-    scores = adapter.score_similarity(img_in, queries)
-    ranked = adapter.classify_region(img_in, queries)
+
+    image_input = _select_image_input(
+        image_bytes,
+        image_paths,
+        0,
+    )
+
+    scores = adapter.score_similarity(
+        image_input,
+        queries,
+    )
+
+    ranked = adapter.classify_region(
+        image_input,
+        queries,
+    )
+
     return {
         "similarity_scores": scores,
         "ranked_classes": ranked,
-        "top_class": ranked[0]["class"] if ranked else None,
-        "top_confidence": ranked[0]["confidence"] if ranked else 0.0,
         "status": "ok",
     }
 
 
-def _handle_geo_metadata(image_bytes: bytes | None = None, filename: str = "asset.tif", **kwargs) -> dict[str, Any]:
-    from apps.geospatial.ingestion import extract_metadata_from_bytes
-    if not image_bytes:
-        return {"status": "error", "error": "No raster bytes provided for metadata extraction."}
-    meta = extract_metadata_from_bytes(image_bytes, filename)
-    return {
-        "width": meta.width,
-        "height": meta.height,
-        "band_count": meta.band_count,
-        "crs": meta.crs,
-        "sensor": meta.sensor,
-        "modality": meta.modality,
-        "resolution_m": meta.resolution_m,
-        "bounds_wgs84": meta.bounds_wgs84,
-        "is_georeferenced": meta.is_georeferenced,
-    }
+# ===========================================================================
+# Small utility helpers
+# ===========================================================================
 
 
-def _handle_histogram_analysis(raster_array: np.ndarray, **kwargs) -> dict[str, Any]:
-    channels = []
-    if raster_array.ndim == 2:
-        bands = [raster_array]
-    elif raster_array.ndim == 3:
-        bands = [raster_array[:, :, c] for c in range(min(raster_array.shape[2], 8))]
-    else:
-        bands = []
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
 
-    for idx, b in enumerate(bands):
-        b_clean = b[~np.isnan(b)]
-        if len(b_clean) > 0:
-            channels.append({
-                "band_index": idx,
-                "min": round(float(np.min(b_clean)), 2),
-                "max": round(float(np.max(b_clean)), 2),
-                "mean": round(float(np.mean(b_clean)), 2),
-                "std": round(float(np.std(b_clean)), 2),
-            })
-    return {"bands_analyzed": len(channels), "statistics": channels}
+    if isinstance(value, bool):
+        return None
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not np.isfinite(number):
+        return None
+
+    return number
 
 
-def _handle_coregistration(bounds_a: dict[str, float], bounds_b: dict[str, float], **kwargs) -> dict[str, Any]:
-    overlap_w = max(bounds_a.get("west", 0.0), bounds_b.get("west", 0.0))
-    overlap_e = min(bounds_a.get("east", 0.0), bounds_b.get("east", 0.0))
-    overlap_s = max(bounds_a.get("south", 0.0), bounds_b.get("south", 0.0))
-    overlap_n = min(bounds_a.get("north", 0.0), bounds_b.get("north", 0.0))
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
 
-    has_overlap = (overlap_e > overlap_w) and (overlap_n > overlap_s)
-    return {
-        "coregistration_valid": has_overlap,
-        "overlap_wgs84": {"west": overlap_w, "east": overlap_e, "south": overlap_s, "north": overlap_n} if has_overlap else None,
-        "status": "COREGISTERED" if has_overlap else "NO_SPATIAL_OVERLAP",
-    }
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+
+    return bool(np.isfinite(number))
 
 
-def _handle_spatial_relation(aoi_a: dict[str, Any], aoi_b: dict[str, Any], relation_type: str = "contains", **kwargs) -> dict[str, Any]:
-    return {
-        "relation": relation_type,
-        "spatial_match": True,
-        "confidence": None,
-    }
+def _sum_actual_numeric_field(
+    items: Sequence[Mapping[str, Any]],
+    field_name: str,
+) -> float | None:
+    values: list[float] = []
+
+    for item in items:
+        value = item.get(field_name)
+
+        if _is_number(value):
+            values.append(float(value))
+
+    if not values:
+        return None
+
+    return float(sum(values))
 
 
-def _handle_temporal_comparison(t1_stats: dict[str, Any], t2_stats: dict[str, Any], **kwargs) -> dict[str, Any]:
-    mean1 = float(t1_stats.get("mean", 0.0))
-    mean2 = float(t2_stats.get("mean", 0.0))
-    delta = abs(mean1 - mean2)
-    consistency = round(max(0.50, 1.0 - min(0.50, delta / 1000.0)), 2) if (mean1 != 0 or mean2 != 0) else None
-    return {
-        "temporal_delta_detected": delta > 0.05,
-        "radiometric_consistency": consistency,
-        "status": "COMPARISON_COMPLETE",
-    }
+def _sanitize_numeric_mapping(
+    mapping: Mapping[str, Any],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
 
+    for key, value in mapping.items():
+        if isinstance(value, np.generic):
+            result[str(key)] = value.item()
 
-def _handle_report_generation(session_id: str, query_id: str, **kwargs) -> dict[str, Any]:
-    return {
-        "report_type": "PDF_AND_HTML",
-        "session_id": session_id,
-        "query_id": query_id,
-        "status": "READY_FOR_EXPORT",
-    }
+        elif isinstance(value, dict):
+            result[str(key)] = _sanitize_numeric_mapping(
+                value
+            )
 
+        elif isinstance(value, list):
+            result[str(key)] = [
+                item.item()
+                if isinstance(item, np.generic)
+                else item
+                for item in value
+            ]
 
-def _handle_evidence_export(features: list[dict[str, Any]], **kwargs) -> dict[str, Any]:
-    return {
-        "feature_count": len(features),
-        "geojson": {
-            "type": "FeatureCollection",
-            "features": features,
-        },
-        "status": "EXPORTED",
-    }
+        else:
+            result[str(key)] = value
 
-
+    return result

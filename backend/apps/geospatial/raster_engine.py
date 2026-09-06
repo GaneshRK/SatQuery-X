@@ -1,71 +1,208 @@
+"""
+Production raster processing engine for SatQuery-X.
+
+Responsibilities:
+- raster inspection
+- validation
+- windowed reads
+- geometry clipping
+- spectral-index generation
+- statistics
+- XYZ tile rendering
+
+Scientific principle:
+The engine never invents geospatial metadata or sensor band mappings.
+"""
+
 from __future__ import annotations
-import logging
+
 import math
 import os
 from io import BytesIO
-from typing import Any, Tuple
+from typing import Any
+
 import numpy as np
 from PIL import Image
 
-logger = logging.getLogger(__name__)
+from apps.geospatial.indices import (
+    compute_mndwi,
+    compute_nbr,
+    compute_ndbi,
+    compute_ndvi,
+    compute_ndwi,
+)
+from apps.geospatial.sensor_profiles import (
+    get_sensor_profile,
+)
 
 
 class RasterEngine:
     """
-    Production-grade raster processing engine.
-    Handles windowed chunked I/O, COG validation, clipping, reprojection,
-    spectral index math (NDVI, NDWI, NDBI, SAVI, EVI, MNDWI, NBR),
-    statistical summaries, and dynamic XYZ tile rendering.
+    Raster processing service.
+
+    All methods are static to preserve compatibility with existing
+    callers in the Django application.
     """
 
     @staticmethod
-    def inspect(filepath: str) -> dict[str, Any]:
+    def inspect(
+        filepath: str,
+    ) -> dict[str, Any]:
         import rasterio
-        with rasterio.open(filepath) as src:
+
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(
+                f"Raster file does not exist: {filepath}"
+            )
+
+        with rasterio.open(
+            filepath
+        ) as src:
+
             bounds = src.bounds
-            crs_str = str(src.crs) if src.crs else None
-            # Check for Cloud Optimized GeoTIFF structure (overviews + tiling)
-            is_tiled = src.profile.get("tiled", False)
-            overviews = src.overviews(1) if src.count > 0 else []
-            is_cog = is_tiled and len(overviews) > 0
 
             return {
                 "filepath": filepath,
-                "width": src.width,
-                "height": src.height,
-                "band_count": src.count,
-                "dtypes": [str(d) for d in src.dtypes],
-                "crs": crs_str,
-                "transform": list(src.transform)[:6],
+                "width": int(src.width),
+                "height": int(src.height),
+                "band_count": int(src.count),
+                "dtypes": [
+                    str(dtype)
+                    for dtype in src.dtypes
+                ],
+                "crs": (
+                    src.crs.to_string()
+                    if src.crs
+                    else None
+                ),
+                "transform": list(
+                    src.transform[:6]
+                ),
                 "bounds": {
-                    "west": bounds.left,
-                    "south": bounds.bottom,
-                    "east": bounds.right,
-                    "north": bounds.top,
+                    "west": float(
+                        bounds.left
+                    ),
+                    "south": float(
+                        bounds.bottom
+                    ),
+                    "east": float(
+                        bounds.right
+                    ),
+                    "north": float(
+                        bounds.top
+                    ),
                 },
-                "nodata": src.nodata,
-                "is_tiled": is_tiled,
-                "is_cog": is_cog,
-                "overviews": overviews,
+                "nodata": (
+                    float(src.nodata)
+                    if src.nodata is not None
+                    else None
+                ),
+                "is_tiled": bool(
+                    src.profile.get(
+                        "tiled",
+                        False,
+                    )
+                ),
+                "is_cog": (
+                    bool(
+                        src.profile.get(
+                            "tiled",
+                            False,
+                        )
+                    )
+                    and any(
+                        src.overviews(
+                            band
+                        )
+                        for band in range(
+                            1,
+                            src.count + 1,
+                        )
+                    )
+                ),
+                "overviews": {
+                    str(band): src.overviews(
+                        band
+                    )
+                    for band in range(
+                        1,
+                        src.count + 1,
+                    )
+                },
+                "block_shapes": [
+                    list(shape)
+                    if shape
+                    else None
+                    for shape in src.block_shapes
+                ],
             }
 
     @staticmethod
-    def validate_raster(filepath: str) -> Tuple[bool, str]:
+    def validate_raster(
+        filepath: str,
+    ) -> tuple[bool, str]:
         import rasterio
-        if not os.path.exists(filepath):
-            return False, f"File does not exist: {filepath}"
+        from rasterio.windows import Window
+
+        if not os.path.isfile(filepath):
+            return (
+                False,
+                f"File does not exist: {filepath}",
+            )
+
         try:
-            with rasterio.open(filepath) as src:
-                if src.width <= 0 or src.height <= 0:
-                    return False, "Invalid raster dimensions"
+            with rasterio.open(
+                filepath
+            ) as src:
+
+                if src.width <= 0:
+                    return (
+                        False,
+                        "Raster width is invalid.",
+                    )
+
+                if src.height <= 0:
+                    return (
+                        False,
+                        "Raster height is invalid.",
+                    )
+
                 if src.count <= 0:
-                    return False, "Raster has no bands"
-                # Read 1x1 test window to verify readable data chunks
-                from rasterio.windows import Window
-                src.read(1, window=Window(0, 0, min(16, src.width), min(16, src.height)))
-            return True, "Raster is valid and readable"
-        except Exception as e:
-            return False, f"Corrupted or invalid raster: {str(e)}"
+                    return (
+                        False,
+                        "Raster contains no bands.",
+                    )
+
+                window_width = min(
+                    16,
+                    src.width,
+                )
+
+                window_height = min(
+                    16,
+                    src.height,
+                )
+
+                src.read(
+                    1,
+                    window=Window(
+                        0,
+                        0,
+                        window_width,
+                        window_height,
+                    ),
+                )
+
+                return (
+                    True,
+                    "Raster is valid and readable.",
+                )
+
+        except Exception as exc:
+            return (
+                False,
+                f"Raster validation failed: {exc}",
+            )
 
     @staticmethod
     def read_window(
@@ -76,12 +213,75 @@ class RasterEngine:
         height: int,
         bands: list[int] | None = None,
     ) -> np.ndarray:
+
         import rasterio
         from rasterio.windows import Window
-        with rasterio.open(filepath) as src:
-            w = Window(col_off, row_off, min(width, src.width - col_off), min(height, src.height - row_off))
-            indexes = bands if bands else list(range(1, src.count + 1))
-            return src.read(indexes, window=w)
+
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                "Window width and height must be positive."
+            )
+
+        with rasterio.open(
+            filepath
+        ) as src:
+
+            if col_off < 0 or row_off < 0:
+                raise ValueError(
+                    "Window offsets cannot be negative."
+                )
+
+            if col_off >= src.width:
+                raise ValueError(
+                    "Window starts outside raster width."
+                )
+
+            if row_off >= src.height:
+                raise ValueError(
+                    "Window starts outside raster height."
+                )
+
+            actual_width = min(
+                width,
+                src.width - col_off,
+            )
+
+            actual_height = min(
+                height,
+                src.height - row_off,
+            )
+
+            if bands is None:
+                indexes = list(
+                    range(
+                        1,
+                        src.count + 1,
+                    )
+                )
+            else:
+                indexes = bands
+
+                invalid = [
+                    band
+                    for band in indexes
+                    if band < 1
+                    or band > src.count
+                ]
+
+                if invalid:
+                    raise ValueError(
+                        f"Invalid raster band(s): {invalid}"
+                    )
+
+            return src.read(
+                indexes,
+                window=Window(
+                    col_off,
+                    row_off,
+                    actual_width,
+                    actual_height,
+                ),
+            )
 
     @staticmethod
     def clip_by_geometry(
@@ -90,124 +290,338 @@ class RasterEngine:
         geometry: dict[str, Any],
         crop: bool = True,
     ) -> dict[str, Any]:
-        """
-        Clips raster by a GeoJSON polygon/multipolygon geometry using rasterio.mask.
-        """
+
         import rasterio
         from rasterio.mask import mask
         from shapely.geometry import shape
 
-        os.makedirs(os.path.dirname(dst_filepath), exist_ok=True)
-        geom_obj = shape(geometry) if not hasattr(geometry, "__geo_interface__") else geometry
+        if not geometry:
+            raise ValueError(
+                "Geometry is required."
+            )
 
-        with rasterio.open(src_filepath) as src:
-            out_image, out_transform = mask(src, [geom_obj], crop=crop)
+        output_dir = os.path.dirname(
+            os.path.abspath(
+                dst_filepath
+            )
+        )
+
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
+
+        geom = shape(
+            geometry
+        )
+
+        if geom.is_empty:
+            raise ValueError(
+                "Input geometry is empty."
+            )
+
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+
+        with rasterio.open(
+            src_filepath
+        ) as src:
+
+            if src.crs is None:
+                raise ValueError(
+                    "Cannot clip a raster without CRS metadata."
+                )
+
+            out_image, out_transform = mask(
+                src,
+                [
+                    geom
+                ],
+                crop=crop,
+                filled=True,
+            )
+
             out_meta = src.meta.copy()
-            out_meta.update({
-                "driver": "GTiff",
-                "height": out_image.shape[1],
-                "width": out_image.shape[2],
-                "transform": out_transform,
-            })
 
-            with rasterio.open(dst_filepath, "w", **out_meta) as dst:
-                dst.write(out_image)
+            out_meta.update(
+                {
+                    "driver": "GTiff",
+                    "height": int(
+                        out_image.shape[1]
+                    ),
+                    "width": int(
+                        out_image.shape[2]
+                    ),
+                    "transform": out_transform,
+                }
+            )
 
-        return RasterEngine.inspect(dst_filepath)
+            with rasterio.open(
+                dst_filepath,
+                "w",
+                **out_meta,
+            ) as dst:
+
+                dst.write(
+                    out_image
+                )
+
+        return RasterEngine.inspect(
+            dst_filepath
+        )
 
     @staticmethod
     def compute_index(
         filepath: str,
         index_name: str,
         out_filepath: str | None = None,
+        sensor_name: str | None = None,
+        modality: str = "MULTISPECTRAL",
     ) -> dict[str, Any]:
-        """
-        Computes remote sensing spectral index (NDVI, NDWI, NDBI, SAVI, EVI, MNDWI, NBR).
-        Only proceeds if required bands exist in raster.
-        Computes accurate distribution statistics: min, max, mean, median, valid_pct.
-        """
+
         import rasterio
 
-        index_name = index_name.upper().strip()
-        with rasterio.open(filepath) as src:
+        index = (
+            index_name
+            .strip()
+            .upper()
+        )
+
+        supported = {
+            "NDVI",
+            "NDWI",
+            "MNDWI",
+            "NDBI",
+            "NBR",
+        }
+
+        if index not in supported:
+            raise ValueError(
+                f"Unsupported index '{index_name}'. "
+                f"Supported: {sorted(supported)}"
+            )
+
+        with rasterio.open(
+            filepath
+        ) as src:
+
+            data = src.read()
+
+            if sensor_name is None:
+                tags = src.tags()
+
+                sensor_name = (
+                    tags.get(
+                        "SENSOR"
+                    )
+                    or tags.get(
+                        "sensor"
+                    )
+                )
+
+            profile = get_sensor_profile(
+                sensor_name,
+                modality,
+            )
+
+            if not profile.bands:
+                raise ValueError(
+                    "A verified sensor profile is required for "
+                    f"{index} when the raster's band semantics are unknown."
+                )
+
             band_count = src.count
 
-            # Standard Sentinel-2 mapping: 1=Blue, 2=Green, 3=Red, 4=NIR (or 11=SWIR)
-            if band_count < 2 and index_name in ["NDVI", "NDWI", "NDBI", "SAVI", "EVI"]:
-                raise ValueError(f"Raster only has {band_count} bands; index {index_name} requires at least 2 bands.")
+            def band(
+                semantic: str,
+            ) -> np.ndarray:
 
-            if index_name in ["NDVI", "SAVI", "EVI"]:
-                # Requires Red and NIR
-                if band_count >= 4:
-                    red = src.read(3).astype(np.float32)
-                    nir = src.read(4).astype(np.float32)
-                    blue = src.read(1).astype(np.float32) if band_count >= 4 else None
-                else:
-                    red = src.read(1).astype(np.float32)
-                    nir = src.read(2).astype(np.float32)
-                    blue = red
+                index_zero = (
+                    profile.get_band_index(
+                        semantic,
+                        band_count,
+                    )
+                )
 
-                if index_name == "NDVI":
-                    denom = nir + red
-                    denom[denom == 0] = 1e-6
-                    result = (nir - red) / denom
-                elif index_name == "SAVI":
-                    L = 0.5
-                    denom = nir + red + L
-                    denom[denom == 0] = 1e-6
-                    result = ((nir - red) / denom) * (1.0 + L)
-                elif index_name == "EVI":
-                    denom = nir + 6.0 * red - 7.5 * blue + 1.0
-                    denom[denom == 0] = 1e-6
-                    result = 2.5 * ((nir - red) / denom)
+                if index_zero is None:
+                    raise ValueError(
+                        f"Sensor '{profile.sensor_id}' does not provide "
+                        f"a verified '{semantic}' band for this raster."
+                    )
 
-            elif index_name in ["NDWI", "MNDWI"]:
-                # Requires Green and NIR (or SWIR)
-                green = src.read(2 if band_count >= 2 else 1).astype(np.float32)
-                nir = src.read(4 if band_count >= 4 else (2 if band_count >= 2 else 1)).astype(np.float32)
-                denom = green + nir
-                denom[denom == 0] = 1e-6
-                result = (green - nir) / denom
+                return data[
+                    index_zero
+                ].astype(
+                    np.float32
+                )
 
-            elif index_name == "NDBI":
-                # Requires SWIR and NIR (fallback to Red vs NIR)
-                swir = src.read(band_count).astype(np.float32)
-                nir = src.read(4 if band_count >= 4 else 2).astype(np.float32)
-                denom = swir + nir
-                denom[denom == 0] = 1e-6
-                result = (swir - nir) / denom
+            if index == "NDVI":
+                result = compute_ndvi(
+                    band("red"),
+                    band("nir"),
+                )
+
+            elif index == "NDWI":
+                result = compute_ndwi(
+                    band("green"),
+                    band("nir"),
+                )
+
+            elif index == "MNDWI":
+                result = compute_mndwi(
+                    band("green"),
+                    band("swir"),
+                )
+
+            elif index == "NDBI":
+                result = compute_ndbi(
+                    band("swir"),
+                    band("nir"),
+                )
+
+            elif index == "NBR":
+                result = compute_nbr(
+                    band("nir"),
+                    band("swir2"),
+                )
+
             else:
-                raise ValueError(f"Unsupported index '{index_name}'")
+                raise RuntimeError(
+                    f"Unhandled index: {index}"
+                )
 
-            result = np.clip(result, -1.0, 1.0)
-            valid_mask = np.isfinite(result) & (result != 0.0)
+            valid_mask = np.isfinite(
+                result
+            )
 
-            stats = {
-                "index": index_name,
-                "min": float(np.min(result[valid_mask])) if np.any(valid_mask) else 0.0,
-                "max": float(np.max(result[valid_mask])) if np.any(valid_mask) else 0.0,
-                "mean": float(np.mean(result[valid_mask])) if np.any(valid_mask) else 0.0,
-                "median": float(np.median(result[valid_mask])) if np.any(valid_mask) else 0.0,
-                "std": float(np.std(result[valid_mask])) if np.any(valid_mask) else 0.0,
-                "valid_pixels": int(np.sum(valid_mask)),
-                "total_pixels": int(result.size),
-                "valid_pct": round(float(np.sum(valid_mask) / result.size * 100.0), 2),
+            nodata_mask = None
+
+            if src.nodata is not None:
+                nodata_mask = np.all(
+                    data == src.nodata,
+                    axis=0,
+                )
+
+                valid_mask &= ~nodata_mask
+
+            valid_values = result[
+                valid_mask
+            ]
+
+            statistics = {
+                "index": index,
+                "min": (
+                    float(
+                        np.min(
+                            valid_values
+                        )
+                    )
+                    if valid_values.size
+                    else None
+                ),
+                "max": (
+                    float(
+                        np.max(
+                            valid_values
+                        )
+                    )
+                    if valid_values.size
+                    else None
+                ),
+                "mean": (
+                    float(
+                        np.mean(
+                            valid_values
+                        )
+                    )
+                    if valid_values.size
+                    else None
+                ),
+                "median": (
+                    float(
+                        np.median(
+                            valid_values
+                        )
+                    )
+                    if valid_values.size
+                    else None
+                ),
+                "std": (
+                    float(
+                        np.std(
+                            valid_values
+                        )
+                    )
+                    if valid_values.size
+                    else None
+                ),
+                "valid_pixels": int(
+                    valid_values.size
+                ),
+                "total_pixels": int(
+                    result.size
+                ),
+                "valid_pct": round(
+                    (
+                        valid_values.size
+                        / result.size
+                        * 100.0
+                    )
+                    if result.size
+                    else 0.0,
+                    4,
+                ),
+                "sensor": profile.sensor_id,
+                "modality": profile.modality,
             }
 
             if out_filepath:
-                os.makedirs(os.path.dirname(out_filepath), exist_ok=True)
-                out_meta = src.meta.copy()
-                out_meta.update({
-                    "driver": "GTiff",
-                    "dtype": "float32",
-                    "count": 1,
-                    "nodata": -9999.0,
-                })
-                with rasterio.open(out_filepath, "w", **out_meta) as dst:
-                    dst.write(result.astype(np.float32), 1)
-                stats["output_file"] = out_filepath
+                output_dir = os.path.dirname(
+                    os.path.abspath(
+                        out_filepath
+                    )
+                )
 
-            return stats
+                os.makedirs(
+                    output_dir,
+                    exist_ok=True,
+                )
+
+                output = result.astype(
+                    np.float32
+                ).copy()
+
+                output[
+                    ~valid_mask
+                ] = np.nan
+
+                metadata = src.meta.copy()
+
+                metadata.update(
+                    {
+                        "driver": "GTiff",
+                        "dtype": "float32",
+                        "count": 1,
+                        "nodata": np.nan,
+                    }
+                )
+
+                with rasterio.open(
+                    out_filepath,
+                    "w",
+                    **metadata,
+                ) as dst:
+
+                    dst.write(
+                        output,
+                        1,
+                    )
+
+                statistics[
+                    "output_file"
+                ] = out_filepath
+
+            return statistics
 
     @staticmethod
     def render_tile_png(
@@ -217,98 +631,549 @@ class RasterEngine:
         y: int,
         layer: str = "rgb",
     ) -> bytes:
-        """
-        Renders a 256x256 Web Mercator PNG tile for the given raster and tile coordinates (z, x, y).
-        Supports layer types: 'rgb', 'false_color', 'ndvi', 'ndwi', 'ndbi'.
-        """
+
         import rasterio
+        from rasterio.enums import Resampling
+        from rasterio.windows import Window, from_bounds
         from rasterio.warp import transform_bounds
 
-        # Compute Web Mercator bounds for tile (z, x, y)
+        if z < 0:
+            raise ValueError(
+                "Zoom level cannot be negative."
+            )
+
         n = 2.0 ** z
-        lon_west = x / n * 360.0 - 180.0
-        lon_east = (x + 1) / n * 360.0 - 180.0
-        lat_north = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
-        lat_south = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
 
-        with rasterio.open(filepath) as src:
-            src_crs = src.crs.to_string() if src.crs else "EPSG:4326"
-            # Transform tile WGS84 bbox to raster native CRS
+        lon_west = (
+            x / n * 360.0
+            - 180.0
+        )
+
+        lon_east = (
+            (x + 1)
+            / n
+            * 360.0
+            - 180.0
+        )
+
+        lat_north = math.degrees(
+            math.atan(
+                math.sinh(
+                    math.pi
+                    * (
+                        1
+                        - 2 * y / n
+                    )
+                )
+            )
+        )
+
+        lat_south = math.degrees(
+            math.atan(
+                math.sinh(
+                    math.pi
+                    * (
+                        1
+                        - 2 * (y + 1) / n
+                    )
+                )
+            )
+        )
+
+        layer_name = (
+            layer
+            .strip()
+            .lower()
+        )
+
+        supported_layers = {
+            "rgb",
+            "ndvi",
+            "ndwi",
+            "mndwi",
+            "ndbi",
+        }
+
+        if layer_name not in supported_layers:
+            raise ValueError(
+                f"Unsupported tile layer '{layer}'. "
+                f"Supported: {sorted(supported_layers)}"
+            )
+
+        with rasterio.open(
+            filepath
+        ) as src:
+
+            if src.crs is None:
+                return _transparent_tile()
+
             try:
-                native_bounds = transform_bounds("EPSG:4326", src_crs, lon_west, lat_south, lon_east, lat_north)
+                native_bounds = transform_bounds(
+                    "EPSG:4326",
+                    src.crs,
+                    lon_west,
+                    lat_south,
+                    lon_east,
+                    lat_north,
+                )
             except Exception:
-                native_bounds = (lon_west, lat_south, lon_east, lat_north)
+                return _transparent_tile()
 
-            # Check overlap
-            r_left, r_bottom, r_right, r_top = src.bounds
-            t_left, t_bottom, t_right, t_top = native_bounds
+            left, bottom, right, top = (
+                native_bounds
+            )
 
-            if (t_right < r_left or t_left > r_right or t_top < r_bottom or t_bottom > r_top):
-                # Return transparent 256x256 tile
-                img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
-                buf = BytesIO()
-                img.save(buf, format="PNG")
-                return buf.getvalue()
+            if (
+                right < src.bounds.left
+                or left > src.bounds.right
+                or top < src.bounds.bottom
+                or bottom > src.bounds.top
+            ):
+                return _transparent_tile()
 
-            # Read window covering tile
-            from rasterio.windows import from_bounds
-            window = from_bounds(t_left, t_bottom, t_right, t_top, src.transform)
-            # Bound window to raster extent
-            window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+            window = from_bounds(
+                left,
+                bottom,
+                right,
+                top,
+                src.transform,
+            )
 
-            if window.width <= 0 or window.height <= 0:
-                img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
-                buf = BytesIO()
-                img.save(buf, format="PNG")
-                return buf.getvalue()
+            window = window.intersection(
+                Window(
+                    0,
+                    0,
+                    src.width,
+                    src.height,
+                )
+            )
 
-            data = src.read(window=window, out_shape=(src.count, 256, 256), resampling=rasterio.enums.Resampling.bilinear)
+            if (
+                window.width <= 0
+                or window.height <= 0
+            ):
+                return _transparent_tile()
 
-            # Format into RGBA image based on requested layer
-            if layer.lower() == "rgb":
-                if data.shape[0] >= 3:
-                    r, g, b = data[2].astype(np.float32), data[1].astype(np.float32), data[0].astype(np.float32)
-                elif data.shape[0] == 2:
-                    # SAR VV/VH pseudo-RGB
-                    r = data[0].astype(np.float32)
-                    g = data[1].astype(np.float32)
-                    b = (r + g) / 2.0
-                else:
-                    r = g = b = data[0].astype(np.float32)
+            data = src.read(
+                window=window,
+                out_shape=(
+                    src.count,
+                    256,
+                    256,
+                ),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
 
-                p_max = np.percentile(r[r > 0], 98) if np.any(r > 0) else 1.0
-                r_norm = np.clip((r / max(p_max, 1e-3)) * 255.0, 0, 255).astype(np.uint8)
-                g_norm = np.clip((g / max(p_max, 1e-3)) * 255.0, 0, 255).astype(np.uint8)
-                b_norm = np.clip((b / max(p_max, 1e-3)) * 255.0, 0, 255).astype(np.uint8)
-                alpha = np.where((r_norm > 0) | (g_norm > 0) | (b_norm > 0), 255, 0).astype(np.uint8)
-                rgba = np.dstack([r_norm, g_norm, b_norm, alpha])
-                img = Image.fromarray(rgba, mode="RGBA")
+            if layer_name == "rgb":
+                return _render_rgb_tile(
+                    data
+                )
 
-            elif layer.lower() in ["ndvi", "ndwi", "ndbi"]:
-                # Colorized spectral index
-                if data.shape[0] >= 4 and layer.lower() == "ndvi":
-                    nir = data[3].astype(np.float32)
-                    red = data[2].astype(np.float32)
-                    idx = (nir - red) / (nir + red + 1e-6)
-                elif data.shape[0] >= 2 and layer.lower() == "ndwi":
-                    green = data[1].astype(np.float32)
-                    nir = data[3 if data.shape[0] >= 4 else 0].astype(np.float32)
-                    idx = (green - nir) / (green + nir + 1e-6)
-                else:
-                    idx = np.zeros((256, 256), dtype=np.float32)
+            return _render_index_tile(
+                data,
+                layer_name,
+            )
 
-                # Colormap: NDVI (Brown -> Yellow -> Green)
-                idx_norm = np.clip((idx + 0.2) / 1.0, 0, 1)  # -0.2 to 0.8
-                r = (np.clip(1.0 - idx_norm, 0, 1) * 255).astype(np.uint8)
-                g = (np.clip(idx_norm, 0, 1) * 255).astype(np.uint8)
-                b = np.full((256, 256), 40, dtype=np.uint8)
-                alpha = np.where(idx != 0, 220, 0).astype(np.uint8)
-                rgba = np.dstack([r, g, b, alpha])
-                img = Image.fromarray(rgba, mode="RGBA")
 
-            else:
-                img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+def _transparent_tile() -> bytes:
+    image = Image.new(
+        "RGBA",
+        (
+            256,
+            256,
+        ),
+        (
+            0,
+            0,
+            0,
+            0,
+        ),
+    )
 
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
+    output = BytesIO()
+
+    image.save(
+        output,
+        format="PNG",
+    )
+
+    return output.getvalue()
+
+
+def _normalize_display(
+    array: np.ndarray,
+) -> np.ndarray:
+
+    if np.ma.isMaskedArray(
+        array
+    ):
+        values = array.compressed()
+    else:
+        values = array[
+            np.isfinite(array)
+        ]
+
+    if values.size == 0:
+        return np.zeros(
+            array.shape,
+            dtype=np.uint8,
+        )
+
+    low, high = np.percentile(
+        values,
+        (
+            2.0,
+            98.0,
+        ),
+    )
+
+    if high <= low:
+        return np.zeros(
+            array.shape,
+            dtype=np.uint8,
+        )
+
+    normalized = (
+        (
+            array
+            - low
+        )
+        / (
+            high
+            - low
+        )
+    )
+
+    normalized = np.clip(
+        normalized,
+        0.0,
+        1.0,
+    )
+
+    return (
+        normalized
+        * 255.0
+    ).astype(
+        np.uint8
+    )
+
+
+def _render_rgb_tile(
+    data,
+) -> bytes:
+
+    bands = data.shape[0]
+
+    if bands >= 3:
+        red = _normalize_display(
+            data[2]
+        )
+
+        green = _normalize_display(
+            data[1]
+        )
+
+        blue = _normalize_display(
+            data[0]
+        )
+
+    elif bands == 2:
+        red = _normalize_display(
+            data[0]
+        )
+
+        green = _normalize_display(
+            data[1]
+        )
+
+        blue = (
+            (
+                red.astype(
+                    np.uint16
+                )
+                + green.astype(
+                    np.uint16
+                )
+            )
+            // 2
+        ).astype(
+            np.uint8
+        )
+
+    elif bands == 1:
+        gray = _normalize_display(
+            data[0]
+        )
+
+        red = gray
+        green = gray
+        blue = gray
+
+    else:
+        return _transparent_tile()
+
+    if np.ma.isMaskedArray(
+        data
+    ):
+        mask = np.any(
+            np.ma.getmaskarray(
+                data
+            ),
+            axis=0,
+        )
+
+        alpha = np.where(
+            mask,
+            0,
+            255,
+        ).astype(
+            np.uint8
+        )
+    else:
+        alpha = np.full(
+            (
+                256,
+                256,
+            ),
+            255,
+            dtype=np.uint8,
+        )
+
+    rgba = np.dstack(
+        [
+            red,
+            green,
+            blue,
+            alpha,
+        ]
+    )
+
+    image = Image.fromarray(
+        rgba,
+        mode="RGBA",
+    )
+
+    output = BytesIO()
+
+    image.save(
+        output,
+        format="PNG",
+    )
+
+    return output.getvalue()
+
+
+def _render_index_tile(
+    data,
+    layer_name: str,
+) -> bytes:
+
+    if data.shape[0] < 2:
+        return _transparent_tile()
+
+    try:
+        # These tile layers are intended for visualization only.
+        # Exact band mapping must be supplied by a caller using a known
+        # sensor profile. The generic renderer therefore uses common
+        # multispectral layouts only when enough bands are available.
+        if layer_name == "ndvi":
+            if data.shape[0] < 4:
+                return _transparent_tile()
+
+            red = data[2].astype(
+                np.float32
+            )
+
+            nir = data[3].astype(
+                np.float32
+            )
+
+            index = np.divide(
+                nir - red,
+                nir + red,
+                out=np.full_like(
+                    nir,
+                    np.nan,
+                ),
+                where=np.abs(
+                    nir + red
+                )
+                > np.finfo(
+                    np.float32
+                ).eps,
+            )
+
+        elif layer_name == "ndwi":
+            if data.shape[0] < 4:
+                return _transparent_tile()
+
+            green = data[1].astype(
+                np.float32
+            )
+
+            nir = data[3].astype(
+                np.float32
+            )
+
+            index = np.divide(
+                green - nir,
+                green + nir,
+                out=np.full_like(
+                    green,
+                    np.nan,
+                ),
+                where=np.abs(
+                    green + nir
+                )
+                > np.finfo(
+                    np.float32
+                ).eps,
+            )
+
+        elif layer_name == "mndwi":
+            if data.shape[0] < 11:
+                return _transparent_tile()
+
+            green = data[1].astype(
+                np.float32
+            )
+
+            swir = data[10].astype(
+                np.float32
+            )
+
+            index = np.divide(
+                green - swir,
+                green + swir,
+                out=np.full_like(
+                    green,
+                    np.nan,
+                ),
+                where=np.abs(
+                    green + swir
+                )
+                > np.finfo(
+                    np.float32
+                ).eps,
+            )
+
+        elif layer_name == "ndbi":
+            if data.shape[0] < 4:
+                return _transparent_tile()
+
+            nir = data[3].astype(
+                np.float32
+            )
+
+            swir = data[
+                10
+                if data.shape[0] >= 11
+                else data.shape[0] - 1
+            ].astype(
+                np.float32
+            )
+
+            index = np.divide(
+                swir - nir,
+                swir + nir,
+                out=np.full_like(
+                    nir,
+                    np.nan,
+                ),
+                where=np.abs(
+                    swir + nir
+                )
+                > np.finfo(
+                    np.float32
+                ).eps,
+            )
+
+        else:
+            return _transparent_tile()
+
+    except Exception:
+        return _transparent_tile()
+
+    valid = index[
+        np.isfinite(index)
+    ]
+
+    if valid.size == 0:
+        return _transparent_tile()
+
+    # Visualization range only.
+    low, high = np.percentile(
+        valid,
+        (
+            2.0,
+            98.0,
+        ),
+    )
+
+    if high <= low:
+        return _transparent_tile()
+
+    normalized = np.clip(
+        (
+            index
+            - low
+        )
+        / (
+            high
+            - low
+        ),
+        0.0,
+        1.0,
+    )
+
+    red = (
+        (1.0 - normalized)
+        * 255
+    ).astype(
+        np.uint8
+    )
+
+    green = (
+        normalized
+        * 255
+    ).astype(
+        np.uint8
+    )
+
+    blue = np.full(
+        index.shape,
+        80,
+        dtype=np.uint8,
+    )
+
+    alpha = np.where(
+        np.isfinite(index),
+        220,
+        0,
+    ).astype(
+        np.uint8
+    )
+
+    rgba = np.dstack(
+        [
+            red,
+            green,
+            blue,
+            alpha,
+        ]
+    )
+
+    image = Image.fromarray(
+        rgba,
+        mode="RGBA",
+    )
+
+    output = BytesIO()
+
+    image.save(
+        output,
+        format="PNG",
+    )
+
+    return output.getvalue()

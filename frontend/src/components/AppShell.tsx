@@ -21,6 +21,7 @@ import {
   Search,
 } from "lucide-react";
 import { SystemHealthModal } from "./SystemHealthModal";
+import { CommandPalette } from "./ui/CommandPalette";
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -147,9 +148,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <main className="app-main">
         <header className="app-topbar">
           {/* Search bar with quick keyboard shortcut */}
-          <div className="search-box">
+          <div
+            className="search-box"
+            onClick={() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }))}
+            style={{ cursor: "pointer" }}
+            title="Press Cmd+K or Ctrl+K to search"
+          >
             <Search size={14} color="#78919b" />
-            <input placeholder="Search coordinates, AOI, or target (e.g. Aral Sea, 44.5° N)..." />
+            <input
+              readOnly
+              placeholder="Search coordinates, AOI, or target (e.g. Coimbatore, 11.0° N)..."
+              style={{ cursor: "pointer" }}
+            />
             <span
               style={{
                 fontSize: "10px",
@@ -201,6 +211,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         {children}
       </main>
 
+      <CommandPalette />
       <SystemHealthModal isOpen={showHealth} onClose={() => setShowHealth(false)} />
     </div>
   );

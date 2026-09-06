@@ -1,51 +1,374 @@
-"""Computer Vision & Remote Sensing deterministic feature detection engine."""
+"""
+Deterministic computer-vision and remote-sensing feature engine.
+
+This module provides evidence-producing algorithms.
+
+Important:
+- It does not claim that heuristic detections are ground truth.
+- Confidence is only returned when an algorithm provides a measurable
+  score.
+- Ground coordinates are returned only when valid geospatial metadata exists.
+- No synthetic coordinates are created.
+"""
 
 from __future__ import annotations
-import math
+
 from dataclasses import dataclass
 from typing import Any
+
 import numpy as np
-from PIL import Image
+
+from apps.geospatial.indices import (
+    compute_ndvi,
+    compute_ndwi,
+    compute_ndbi,
+)
+from apps.geospatial.math import (
+    calculate_pixel_area_m2,
+    polygonize_mask_to_geojson,
+)
+
 
 try:
     from scipy import ndimage
+
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
-
-from apps.geospatial.indices import compute_ndvi, compute_ndwi, compute_ndbi
-from apps.geospatial.math import calculate_pixel_area_m2, calculate_polygon_ground_area_m2
 
 
 @dataclass
 class DetectedFeature:
     label: str
-    confidence: float
+    confidence: float | None
     pixel_count: int
-    area_m2: float
-    area_km2: float
-    bbox: list[int]  # [x_min, y_min, x_max, y_max]
-    geojson_geometry: dict[str, Any]
+
+    area_m2: float | None
+    area_km2: float | None
+
+    bbox: list[int]
+
+    geojson_geometry: dict[str, Any] | None
+
+    properties: dict[str, Any] | None = None
 
 
-def otsu_threshold(arr: np.ndarray) -> float:
-    """Compute Otsu's optimal global binarization threshold on continuous spectral array."""
-    valid = arr[~np.isnan(arr)]
-    if len(valid) == 0:
+def otsu_threshold(
+    arr: np.ndarray,
+) -> float:
+    """
+    Compute Otsu threshold over finite values.
+
+    The histogram range is derived from the actual data rather than
+    assuming a fixed physical index range.
+    """
+
+    values = np.asarray(
+        arr,
+        dtype=np.float32,
+    )
+
+    valid = values[
+        np.isfinite(values)
+    ]
+
+    if valid.size == 0:
         return 0.0
-    hist, bin_edges = np.histogram(valid, bins=256, range=(-1.0, 1.0))
-    hist = hist.astype(float) / hist.sum()
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
 
-    weight1 = np.cumsum(hist)
-    weight2 = np.cumsum(hist[::-1])[::-1]
+    minimum = float(
+        np.min(valid)
+    )
 
-    mean1 = np.cumsum(hist * bin_centers) / np.maximum(weight1, 1e-8)
-    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / np.maximum(weight2[::-1], 1e-8))[::-1]
+    maximum = float(
+        np.max(valid)
+    )
 
-    variance = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
-    idx = int(np.argmax(variance))
-    return float(bin_centers[idx])
+    if minimum == maximum:
+        return minimum
+
+    histogram, edges = np.histogram(
+        valid,
+        bins=256,
+        range=(minimum, maximum),
+    )
+
+    histogram = histogram.astype(
+        np.float64
+    )
+
+    probability = (
+        histogram
+        / max(
+            histogram.sum(),
+            1.0,
+        )
+    )
+
+    centers = (
+        edges[:-1]
+        + edges[1:]
+    ) / 2.0
+
+    cumulative_weight = np.cumsum(
+        probability
+    )
+
+    cumulative_mean = np.cumsum(
+        probability
+        * centers
+    )
+
+    total_mean = cumulative_mean[-1]
+
+    denominator = (
+        cumulative_weight
+        * (
+            1.0
+            - cumulative_weight
+        )
+    )
+
+    between_variance = np.divide(
+        (
+            total_mean
+            * cumulative_weight
+            - cumulative_mean
+        )
+        ** 2,
+        denominator,
+        out=np.zeros_like(
+            denominator
+        ),
+        where=denominator > 0,
+    )
+
+    return float(
+        centers[
+            int(
+                np.argmax(
+                    between_variance
+                )
+            )
+        ]
+    )
+
+
+def _validate_image_array(
+    raster: np.ndarray,
+) -> np.ndarray:
+    arr = np.asarray(
+        raster
+    )
+
+    if arr.ndim not in {
+        2,
+        3,
+    }:
+        raise ValueError(
+            "Raster must be 2D or 3D."
+        )
+
+    return arr.astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _to_hwc(
+    raster: np.ndarray,
+) -> np.ndarray:
+    arr = _validate_image_array(
+        raster
+    )
+
+    if arr.ndim == 2:
+        return arr[:, :, None]
+
+    if arr.shape[0] <= 16 and arr.shape[1] > 16:
+        return np.transpose(
+            arr,
+            (1, 2, 0),
+        )
+
+    if arr.shape[2] <= 16:
+        return arr
+
+    raise ValueError(
+        "Unable to safely infer raster layout."
+    )
+
+
+def _calculate_component_area(
+    pixel_count: int,
+    pixel_area_m2: float | None,
+) -> tuple[float | None, float | None]:
+
+    if pixel_area_m2 is None:
+        return None, None
+
+    area_m2 = (
+        pixel_count
+        * pixel_area_m2
+    )
+
+    return (
+        float(area_m2),
+        float(
+            area_m2 / 1_000_000.0
+        ),
+    )
+
+
+def _component_features(
+    mask: np.ndarray,
+    label: str,
+    bounds_wgs84: dict[str, float] | None,
+    affine_list: list[float] | None,
+    crs_str: str | None,
+    min_pixels: int = 15,
+    max_pixels: int = 500_000,
+) -> list[DetectedFeature]:
+
+    if not HAS_SCIPY:
+        raise RuntimeError(
+            "scipy is required for connected-component detection."
+        )
+
+    if mask.ndim != 2:
+        raise ValueError(
+            "Mask must be 2D."
+        )
+
+    try:
+        pixel_area = calculate_pixel_area_m2(
+            affine_list,
+            crs_str,
+            bounds_wgs84,
+        )
+    except ValueError:
+        pixel_area = None
+
+    labeled, count = ndimage.label(
+        mask.astype(bool)
+    )
+
+    objects = ndimage.find_objects(
+        labeled
+    )
+
+    results: list[DetectedFeature] = []
+
+    for component_id, component_slice in enumerate(
+        objects,
+        start=1,
+    ):
+
+        if component_slice is None:
+            continue
+
+        ys, xs = np.where(
+            labeled[
+                component_slice
+            ]
+            == component_id
+        )
+
+        pixel_count = int(
+            len(xs)
+        )
+
+        if (
+            pixel_count < min_pixels
+            or pixel_count > max_pixels
+        ):
+            continue
+
+        y0 = component_slice[0].start
+        x0 = component_slice[1].start
+
+        x_min = int(
+            xs.min() + x0
+        )
+        x_max = int(
+            xs.max() + x0
+        )
+
+        y_min = int(
+            ys.min() + y0
+        )
+        y_max = int(
+            ys.max() + y0
+        )
+
+        area_m2, area_km2 = (
+            _calculate_component_area(
+                pixel_count,
+                pixel_area,
+            )
+        )
+
+        geometry = None
+
+        # Only generate geographic geometry when the source has valid
+        # geospatial metadata.
+        if affine_list and crs_str:
+            try:
+                component_mask = (
+                    labeled
+                    == component_id
+                )
+
+                geojson_features = polygonize_mask_to_geojson(
+                    component_mask,
+                    affine_list,
+                    crs_str,
+                    bounds_wgs84,
+                    class_label=label,
+                    confidence=None,
+                    min_area_pixels=min_pixels,
+                )
+
+                if geojson_features:
+                    geometry = geojson_features[0][
+                        "geometry"
+                    ]
+
+            except Exception:
+                geometry = None
+
+        results.append(
+            DetectedFeature(
+                label=label,
+                confidence=None,
+                pixel_count=pixel_count,
+                area_m2=area_m2,
+                area_km2=area_km2,
+                bbox=[
+                    x_min,
+                    y_min,
+                    x_max,
+                    y_max,
+                ],
+                geojson_geometry=geometry,
+                properties={
+                    "detection_type": "heuristic",
+                    "georeferenced": bool(
+                        geometry
+                    ),
+                },
+            )
+        )
+
+    results.sort(
+        key=lambda feature: (
+            feature.area_m2
+            if feature.area_m2 is not None
+            else feature.pixel_count
+        ),
+        reverse=True,
+    )
+
+    return results
 
 
 def segment_water(
@@ -54,28 +377,55 @@ def segment_water(
     affine_list: list[float] | None = None,
     crs_str: str | None = None,
 ) -> list[DetectedFeature]:
-    """Segment water bodies using NDWI and adaptive thresholding."""
-    h, w = rgb_or_multiband.shape[:2]
-    pixel_area_m2 = calculate_pixel_area_m2(affine_list, crs_str, bounds_wgs84)
+    """
+    Water screening using NDWI when verified green/NIR bands are available.
 
-    # Compute NDWI if multispectral, else blue/red ratio
-    if rgb_or_multiband.shape[-1] >= 4:
-        green = rgb_or_multiband[:, :, 1]
-        nir = rgb_or_multiband[:, :, 3]
-        ndwi = compute_ndwi(green, nir)
-    elif rgb_or_multiband.shape[-1] >= 3:
-        green = rgb_or_multiband[:, :, 1].astype(float)
-        red = rgb_or_multiband[:, :, 0].astype(float)
-        blue = rgb_or_multiband[:, :, 2].astype(float)
-        ndwi = (blue - red) / np.maximum(blue + red, 1.0)
-    else:
-        ndwi = (rgb_or_multiband[:, :] < 50).astype(float)
+    For RGB-only imagery, a spectral NDWI claim is not made.
+    """
 
-    threshold = max(0.05, otsu_threshold(ndwi))
-    binary_mask = (ndwi > threshold).astype(np.uint8)
+    hwc = _to_hwc(
+        rgb_or_multiband
+    )
 
-    return _extract_features_from_binary_mask(
-        binary_mask, "water_body", bounds_wgs84, pixel_area_m2, h, w, min_pixels=20
+    bands = hwc.shape[2]
+
+    if bands < 4:
+        raise ValueError(
+            "Water segmentation requires verified multispectral "
+            "Green and NIR bands. RGB-only imagery is insufficient "
+            "for this NDWI-based detector."
+        )
+
+    green = hwc[:, :, 1]
+    nir = hwc[:, :, 3]
+
+    ndwi = compute_ndwi(
+        green,
+        nir,
+    )
+
+    valid = ndwi[
+        np.isfinite(ndwi)
+    ]
+
+    if valid.size == 0:
+        return []
+
+    threshold = otsu_threshold(
+        valid
+    )
+
+    mask = (
+        ndwi > threshold
+    )
+
+    return _component_features(
+        mask,
+        "water_body_candidate",
+        bounds_wgs84,
+        affine_list,
+        crs_str,
+        min_pixels=20,
     )
 
 
@@ -85,25 +435,52 @@ def segment_vegetation(
     affine_list: list[float] | None = None,
     crs_str: str | None = None,
 ) -> list[DetectedFeature]:
-    """Segment dense and moderate vegetation canopies using NDVI."""
-    h, w = rgb_or_multiband.shape[:2]
-    pixel_area_m2 = calculate_pixel_area_m2(affine_list, crs_str, bounds_wgs84)
+    """
+    Vegetation screening using NDVI.
 
-    if rgb_or_multiband.shape[-1] >= 4:
-        red = rgb_or_multiband[:, :, 2]
-        nir = rgb_or_multiband[:, :, 3]
-        ndvi = compute_ndvi(red, nir)
-    elif rgb_or_multiband.shape[-1] >= 3:
-        green = rgb_or_multiband[:, :, 1].astype(float)
-        red = rgb_or_multiband[:, :, 0].astype(float)
-        ndvi = (green - red) / np.maximum(green + red, 1.0)
-    else:
-        ndvi = np.zeros((h, w), dtype=float)
+    Requires verified Red and NIR bands.
+    """
 
-    binary_mask = (ndvi > 0.35).astype(np.uint8)
+    hwc = _to_hwc(
+        rgb_or_multiband
+    )
 
-    return _extract_features_from_binary_mask(
-        binary_mask, "dense_vegetation", bounds_wgs84, pixel_area_m2, h, w, min_pixels=30
+    if hwc.shape[2] < 4:
+        raise ValueError(
+            "Vegetation segmentation requires verified Red and NIR "
+            "bands. RGB-only imagery is insufficient for NDVI."
+        )
+
+    red = hwc[:, :, 2]
+    nir = hwc[:, :, 3]
+
+    ndvi = compute_ndvi(
+        red,
+        nir,
+    )
+
+    valid = ndvi[
+        np.isfinite(ndvi)
+    ]
+
+    if valid.size == 0:
+        return []
+
+    threshold = otsu_threshold(
+        valid
+    )
+
+    mask = (
+        ndvi > threshold
+    )
+
+    return _component_features(
+        mask,
+        "vegetation_candidate",
+        bounds_wgs84,
+        affine_list,
+        crs_str,
+        min_pixels=30,
     )
 
 
@@ -115,121 +492,121 @@ def detect_and_count_structures(
     min_pixels: int = 15,
     max_pixels: int = 4000,
 ) -> tuple[int, list[DetectedFeature]]:
-    """Detect and count building/infrastructure candidates using morphological high-frequency gradients."""
-    h, w = rgb_or_multiband.shape[:2]
-    pixel_area_m2 = calculate_pixel_area_m2(affine_list, crs_str, bounds_wgs84)
+    """
+    Detect high-gradient image structures.
 
-    # Convert to grayscale
-    if len(rgb_or_multiband.shape) >= 3:
-        gray = np.mean(rgb_or_multiband[:, :, :3], axis=2).astype(float)
-    else:
-        gray = rgb_or_multiband.astype(float)
+    IMPORTANT:
+    This is a candidate detector, not a building classifier.
+    Results must be described as image-structure candidates unless
+    validated by a trained object-detection model.
+    """
 
-    # High frequency Sobel gradient for sharp building boundaries
-    gx = ndimage.sobel(gray, axis=1)
-    gy = ndimage.sobel(gray, axis=0)
-    grad = np.hypot(gx, gy)
+    if not HAS_SCIPY:
+        raise RuntimeError(
+            "scipy is required for structure detection."
+        )
 
-    grad_threshold = np.percentile(grad, 85)
-    binary_structures = (grad > grad_threshold) & (gray > 90)
+    hwc = _to_hwc(
+        rgb_or_multiband
+    )
 
-    # Morphological closing
-    structure_elem = ndimage.generate_binary_structure(2, 1)
-    closed = ndimage.binary_closing(binary_structures, structure=structure_elem, iterations=1)
+    gray = np.mean(
+        hwc[:, :, : min(3, hwc.shape[2])],
+        axis=2,
+    )
 
-    features = _extract_features_from_binary_mask(
-        closed.astype(np.uint8),
+    gray = np.nan_to_num(
+        gray,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    gradient_x = ndimage.sobel(
+        gray,
+        axis=1,
+    )
+
+    gradient_y = ndimage.sobel(
+        gray,
+        axis=0,
+    )
+
+    gradient = np.hypot(
+        gradient_x,
+        gradient_y,
+    )
+
+    finite_gradient = gradient[
+        np.isfinite(gradient)
+    ]
+
+    if finite_gradient.size == 0:
+        return 0, []
+
+    threshold = np.percentile(
+        finite_gradient,
+        90.0,
+    )
+
+    candidates = (
+        gradient >= threshold
+    )
+
+    candidates = ndimage.binary_closing(
+        candidates,
+        structure=ndimage.generate_binary_structure(
+            2,
+            1,
+        ),
+        iterations=1,
+    )
+
+    features = _component_features(
+        candidates,
         "structure_candidate",
         bounds_wgs84,
-        pixel_area_m2,
-        h,
-        w,
+        affine_list,
+        crs_str,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
+
     return len(features), features
-
-
-def _extract_features_from_binary_mask(
-    mask: np.ndarray,
-    label: str,
-    bounds_wgs84: dict[str, float] | None,
-    pixel_area_m2: float,
-    height: int,
-    width: int,
-    min_pixels: int = 15,
-    max_pixels: int = 500000,
-) -> list[DetectedFeature]:
-    """Label connected components and construct standard WGS84 GeoJSON polygon features."""
-    if not HAS_SCIPY:
-        return []
-
-    labeled, num_features = ndimage.label(mask > 0)
-    results = []
-
-    for i in range(1, min(num_features + 1, 150)):
-        ys, xs = np.where(labeled == i)
-        cnt = len(xs)
-        if cnt < min_pixels or cnt > max_pixels:
-            continue
-
-        x_min, x_max = int(xs.min()), int(xs.max())
-        y_min, y_max = int(ys.min()), int(ys.max())
-
-        area_m2 = float(cnt * pixel_area_m2)
-        area_km2 = float(area_m2 / 1_000_000.0)
-
-        # Coordinate transformation
-        if bounds_wgs84:
-            w_wgs = bounds_wgs84["west"] + (x_min / width) * (bounds_wgs84["east"] - bounds_wgs84["west"])
-            e_wgs = bounds_wgs84["west"] + (x_max / width) * (bounds_wgs84["east"] - bounds_wgs84["west"])
-            n_wgs = bounds_wgs84["north"] - (y_min / height) * (bounds_wgs84["north"] - bounds_wgs84["south"])
-            s_wgs = bounds_wgs84["north"] - (y_max / height) * (bounds_wgs84["north"] - bounds_wgs84["south"])
-            coordinates = [[[w_wgs, s_wgs], [e_wgs, s_wgs], [e_wgs, n_wgs], [w_wgs, n_wgs], [w_wgs, s_wgs]]]
-        else:
-            coordinates = [[[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max], [x_min, y_min]]]
-
-        results.append(
-            DetectedFeature(
-                label=label,
-                confidence=round(min(0.95, 0.75 + (cnt / (cnt + 50.0)) * 0.2), 3),
-                pixel_count=cnt,
-                area_m2=round(area_m2, 2),
-                area_km2=round(area_km2, 6),
-                bbox=[x_min, y_min, x_max, y_max],
-                geojson_geometry={
-                    "type": "Polygon",
-                    "coordinates": coordinates,
-                },
-            )
-        )
-
-    # Sort largest features first
-    results.sort(key=lambda f: f.area_m2, reverse=True)
-    return results
 
 
 @dataclass
 class LandCoverMetrics:
-    aoi_total_area_km2: float
-    valid_cloud_free_area_km2: float
-    built_up_area_km2: float
-    built_up_pct: float
-    vegetation_area_km2: float
-    vegetation_pct: float
-    dense_vegetation_km2: float
-    dense_vegetation_pct: float
-    sparse_vegetation_km2: float
-    sparse_vegetation_pct: float
-    open_water_area_km2: float
-    open_water_pct: float
-    salt_pan_area_km2: float
-    salt_pan_pct: float
-    bare_soil_area_km2: float
-    bare_soil_pct: float
-    mean_ndvi: float
-    mean_ndwi: float
+    aoi_total_area_km2: float | None
+    valid_cloud_free_area_km2: float | None
+
+    built_up_area_km2: float | None
+    built_up_pct: float | None
+
+    vegetation_area_km2: float | None
+    vegetation_pct: float | None
+
+    dense_vegetation_km2: float | None
+    dense_vegetation_pct: float | None
+
+    sparse_vegetation_km2: float | None
+    sparse_vegetation_pct: float | None
+
+    open_water_area_km2: float | None
+    open_water_pct: float | None
+
+    salt_pan_area_km2: float | None
+    salt_pan_pct: float | None
+
+    bare_soil_area_km2: float | None
+    bare_soil_pct: float | None
+
+    mean_ndvi: float | None
+    mean_ndwi: float | None
+
     pixel_counts: dict[str, int]
+
+    warnings: list[str]
 
 
 def classify_land_cover(
@@ -239,129 +616,362 @@ def classify_land_cover(
     crs_str: str | None = None,
 ) -> LandCoverMetrics:
     """
-    Deterministically classifies multispectral or optical raster into mutually exclusive
-    semantic land-cover classes per SIH 26167:
-    - Open Surface Water (NDWI)
-    - Salt Pan (Coastal evaporative basins, distinct from deep water)
-    - Dense Vegetation & Canopy (High NDVI)
-    - Sparse Vegetation / Agro-Scrub
-    - Built-Up / Impervious Structures
-    - Bare Soil / Arid Sediment
+    Conservative land-cover screening.
+
+    This is not a trained land-cover classifier.
+
+    The function refuses to produce physical area values when spatial
+    metadata is unavailable.
     """
-    h, w = rgb_or_multiband.shape[:2]
-    total_pixels = h * w
-    pixel_area_m2 = calculate_pixel_area_m2(affine_list, crs_str, bounds_wgs84)
-    total_area_km2 = round((total_pixels * pixel_area_m2) / 1_000_000.0, 3)
 
-    # Spectral band extraction
-    if rgb_or_multiband.ndim == 3 and rgb_or_multiband.shape[-1] >= 4:
-        blue = rgb_or_multiband[:, :, 0].astype(float)
-        green = rgb_or_multiband[:, :, 1].astype(float)
-        red = rgb_or_multiband[:, :, 2].astype(float)
-        nir = rgb_or_multiband[:, :, 3].astype(float)
-        ndvi = (nir - red) / np.maximum(nir + red, 1e-6)
-        ndwi = (green - nir) / np.maximum(green + nir, 1e-6)
-    elif rgb_or_multiband.ndim == 3 and rgb_or_multiband.shape[-1] >= 3:
-        red = rgb_or_multiband[:, :, 0].astype(float)
-        green = rgb_or_multiband[:, :, 1].astype(float)
-        blue = rgb_or_multiband[:, :, 2].astype(float)
-        nir = green * 1.15
-        ndvi = (green - red) / np.maximum(green + red, 1.0)
-        ndwi = (blue - red) / np.maximum(blue + red, 1.0)
-    else:
-        gray = rgb_or_multiband.astype(float) if rgb_or_multiband.ndim == 2 else rgb_or_multiband[:, :, 0].astype(float)
-        red = green = blue = nir = gray
-        ndvi = np.zeros((h, w), dtype=float)
-        ndwi = np.zeros((h, w), dtype=float)
-
-    whiteness = (blue + green + red) / 3.0
-
-    # 1. Open Surface Water (Deep inland / marine water: high absorption in NIR/red, dark optical luminance)
-    water_mask = (ndwi > 0.10) & (nir < 95.0) & (whiteness < 140.0)
-
-    # 2. Salt Pan (Coastal high-reflectance evaporative flats: bright crust, shallow brine)
-    # Distinctive spectral signature: high visible brightness, low NDVI, elevated coastal moisture
-    is_coastal = False
-    if bounds_wgs84:
-        # Check proximity to coastline (e.g. Gulf of Mannar / Coromandel Coast)
-        lon_c = (bounds_wgs84.get("west", 0.0) + bounds_wgs84.get("east", 0.0)) / 2.0
-        lat_c = (bounds_wgs84.get("south", 0.0) + bounds_wgs84.get("north", 0.0)) / 2.0
-        if (78.0 <= lon_c <= 78.4 and 8.6 <= lat_c <= 9.2) or (80.1 <= lon_c <= 80.4 and 12.8 <= lat_c <= 13.3):
-            is_coastal = True
-
-    salt_pan_mask = (whiteness >= 140.0) & (ndvi < 0.20) & (~water_mask)
-    if is_coastal:
-        salt_pan_mask = salt_pan_mask | ((whiteness >= 135.0) & (ndvi < 0.20) & (~water_mask))
-
-    # 3. Dense Vegetation (High canopy cover, NDVI > 0.40)
-    dense_veg_mask = (ndvi > 0.40) & (~water_mask) & (~salt_pan_mask)
-
-    # 4. Sparse Vegetation / Agriculture (0.20 <= NDVI <= 0.40)
-    sparse_veg_mask = (ndvi >= 0.20) & (ndvi <= 0.40) & (~water_mask) & (~salt_pan_mask)
-
-    # 5. Built-up / Urban Structural Footprint
-    # High edge variance + moderate reflectance or low NDVI with grey tone
-    built_up_mask = (
-        (ndvi < 0.20)
-        & (whiteness > 85.0)
-        & (whiteness < 180.0)
-        & (~water_mask)
-        & (~salt_pan_mask)
-        & (~dense_veg_mask)
-        & (~sparse_veg_mask)
+    hwc = _to_hwc(
+        rgb_or_multiband
     )
 
-    # 6. Bare Soil / Sediment
-    soil_mask = (~water_mask) & (~salt_pan_mask) & (~dense_veg_mask) & (~sparse_veg_mask) & (~built_up_mask)
+    height, width, bands = hwc.shape
 
-    # Pixel counts
-    cnt_water = int(np.count_nonzero(water_mask))
-    cnt_salt = int(np.count_nonzero(salt_pan_mask))
-    cnt_dense = int(np.count_nonzero(dense_veg_mask))
-    cnt_sparse = int(np.count_nonzero(sparse_veg_mask))
-    cnt_built = int(np.count_nonzero(built_up_mask))
-    cnt_soil = int(np.count_nonzero(soil_mask))
+    total_pixels = (
+        height
+        * width
+    )
 
-    def to_km2(cnt: int) -> float:
-        return round((cnt * pixel_area_m2) / 1_000_000.0, 3)
+    warnings: list[str] = []
 
-    area_water = to_km2(cnt_water)
-    area_salt = to_km2(cnt_salt)
-    area_dense = to_km2(cnt_dense)
-    area_sparse = to_km2(cnt_sparse)
-    area_veg = round(area_dense + area_sparse, 3)
-    area_built = to_km2(cnt_built)
-    area_soil = to_km2(cnt_soil)
+    try:
+        pixel_area = calculate_pixel_area_m2(
+            affine_list,
+            crs_str,
+            bounds_wgs84,
+        )
+    except ValueError:
+        pixel_area = None
+        warnings.append(
+            "Ground area unavailable because valid CRS/geotransform "
+            "metadata was not provided."
+        )
 
-    valid_area = round(area_water + area_salt + area_veg + area_built + area_soil, 3)
-    valid_area_safe = max(valid_area, 0.001)
+    total_area_km2 = (
+        total_pixels
+        * pixel_area
+        / 1_000_000.0
+        if pixel_area is not None
+        else None
+    )
+
+    ndvi = None
+    ndwi = None
+
+    if bands >= 4:
+        red = hwc[:, :, 2]
+        nir = hwc[:, :, 3]
+        green = hwc[:, :, 1]
+
+        ndvi = compute_ndvi(
+            red,
+            nir,
+        )
+
+        ndwi = compute_ndwi(
+            green,
+            nir,
+        )
+    else:
+        warnings.append(
+            "Verified multispectral Red/NIR bands are unavailable; "
+            "NDVI-based vegetation analysis is not produced."
+        )
+
+    if ndvi is not None:
+        vegetation_mask = (
+            np.isfinite(ndvi)
+            & (ndvi > 0.3)
+        )
+
+        dense_mask = (
+            np.isfinite(ndvi)
+            & (ndvi > 0.5)
+        )
+
+        sparse_mask = (
+            np.isfinite(ndvi)
+            & (ndvi > 0.1)
+            & (ndvi <= 0.3)
+        )
+    else:
+        vegetation_mask = np.zeros(
+            (height, width),
+            dtype=bool,
+        )
+
+        dense_mask = vegetation_mask.copy()
+        sparse_mask = vegetation_mask.copy()
+
+    if ndwi is not None:
+        water_mask = (
+            np.isfinite(ndwi)
+            & (ndwi > 0.2)
+        )
+    else:
+        water_mask = np.zeros(
+            (height, width),
+            dtype=bool,
+        )
+
+    # These classes are intentionally labeled as heuristic candidates.
+    #
+    # They are not treated as certified land-cover classes.
+    non_vegetated = (
+        ~water_mask
+        & ~vegetation_mask
+    )
+
+    built_mask = np.zeros(
+        (height, width),
+        dtype=bool,
+    )
+
+    bare_mask = non_vegetated.copy()
+
+    if bands >= 3:
+        visible = np.mean(
+            hwc[:, :, :3],
+            axis=2,
+        )
+
+        visible_normalized = (
+            _normalize_visible(
+                visible
+            )
+        )
+
+        built_mask = (
+            non_vegetated
+            & (visible_normalized > 0.25)
+            & (visible_normalized < 0.80)
+        )
+
+        bare_mask = (
+            non_vegetated
+            & ~built_mask
+        )
+
+    counts = {
+        "open_water": int(
+            np.count_nonzero(
+                water_mask
+            )
+        ),
+        "dense_vegetation": int(
+            np.count_nonzero(
+                dense_mask
+            )
+        ),
+        "sparse_vegetation": int(
+            np.count_nonzero(
+                sparse_mask
+            )
+        ),
+        "vegetation": int(
+            np.count_nonzero(
+                vegetation_mask
+            )
+        ),
+        "built_up_candidate": int(
+            np.count_nonzero(
+                built_mask
+            )
+        ),
+        "bare_soil_candidate": int(
+            np.count_nonzero(
+                bare_mask
+            )
+        ),
+    }
+
+    def area_km2(
+        count: int,
+    ) -> float | None:
+        if pixel_area is None:
+            return None
+
+        return round(
+            count
+            * pixel_area
+            / 1_000_000.0,
+            6,
+        )
+
+    def percentage(
+        count: int,
+    ) -> float | None:
+        if total_pixels == 0:
+            return None
+
+        return round(
+            count
+            / total_pixels
+            * 100.0,
+            4,
+        )
+
+    mean_ndvi = (
+        float(
+            np.nanmean(
+                ndvi
+            )
+        )
+        if ndvi is not None
+        and np.isfinite(ndvi).any()
+        else None
+    )
+
+    mean_ndwi = (
+        float(
+            np.nanmean(
+                ndwi
+            )
+        )
+        if ndwi is not None
+        and np.isfinite(ndwi).any()
+        else None
+    )
+
+    vegetation_count = counts[
+        "vegetation"
+    ]
+
+    dense_count = counts[
+        "dense_vegetation"
+    ]
+
+    sparse_count = counts[
+        "sparse_vegetation"
+    ]
+
+    water_count = counts[
+        "open_water"
+    ]
+
+    built_count = counts[
+        "built_up_candidate"
+    ]
+
+    bare_count = counts[
+        "bare_soil_candidate"
+    ]
 
     return LandCoverMetrics(
-        aoi_total_area_km2=total_area_km2,
-        valid_cloud_free_area_km2=valid_area,
-        built_up_area_km2=area_built,
-        built_up_pct=round((area_built / valid_area_safe) * 100.0, 1),
-        vegetation_area_km2=area_veg,
-        vegetation_pct=round((area_veg / valid_area_safe) * 100.0, 1),
-        dense_vegetation_km2=area_dense,
-        dense_vegetation_pct=round((area_dense / valid_area_safe) * 100.0, 1),
-        sparse_vegetation_km2=area_sparse,
-        sparse_vegetation_pct=round((area_sparse / valid_area_safe) * 100.0, 1),
-        open_water_area_km2=area_water,
-        open_water_pct=round((area_water / valid_area_safe) * 100.0, 1),
-        salt_pan_area_km2=area_salt,
-        salt_pan_pct=round((area_salt / valid_area_safe) * 100.0, 1),
-        bare_soil_area_km2=area_soil,
-        bare_soil_pct=round((area_soil / valid_area_safe) * 100.0, 1),
-        mean_ndvi=round(float(np.mean(ndvi)), 3),
-        mean_ndwi=round(float(np.mean(ndwi)), 3),
-        pixel_counts={
-            "open_water": cnt_water,
-            "salt_pan": cnt_salt,
-            "dense_vegetation": cnt_dense,
-            "sparse_vegetation": cnt_sparse,
-            "built_up": cnt_built,
-            "bare_soil": cnt_soil,
-        },
+        aoi_total_area_km2=(
+            round(
+                total_area_km2,
+                6,
+            )
+            if total_area_km2 is not None
+            else None
+        ),
+        valid_cloud_free_area_km2=(
+            round(
+                total_area_km2,
+                6,
+            )
+            if total_area_km2 is not None
+            else None
+        ),
+        built_up_area_km2=area_km2(
+            built_count
+        ),
+        built_up_pct=percentage(
+            built_count
+        ),
+        vegetation_area_km2=area_km2(
+            vegetation_count
+        ),
+        vegetation_pct=percentage(
+            vegetation_count
+        ),
+        dense_vegetation_km2=area_km2(
+            dense_count
+        ),
+        dense_vegetation_pct=percentage(
+            dense_count
+        ),
+        sparse_vegetation_km2=area_km2(
+            sparse_count
+        ),
+        sparse_vegetation_pct=percentage(
+            sparse_count
+        ),
+        open_water_area_km2=area_km2(
+            water_count
+        ),
+        open_water_pct=percentage(
+            water_count
+        ),
+        salt_pan_area_km2=None,
+        salt_pan_pct=None,
+        bare_soil_area_km2=area_km2(
+            bare_count
+        ),
+        bare_soil_pct=percentage(
+            bare_count
+        ),
+        mean_ndvi=(
+            round(
+                mean_ndvi,
+                5,
+            )
+            if mean_ndvi is not None
+            else None
+        ),
+        mean_ndwi=(
+            round(
+                mean_ndwi,
+                5,
+            )
+            if mean_ndwi is not None
+            else None
+        ),
+        pixel_counts=counts,
+        warnings=warnings,
     )
 
+
+def _normalize_visible(
+    values: np.ndarray,
+) -> np.ndarray:
+    finite = values[
+        np.isfinite(values)
+    ]
+
+    if finite.size == 0:
+        return np.zeros_like(
+            values,
+            dtype=np.float32,
+        )
+
+    low, high = np.percentile(
+        finite,
+        (
+            2.0,
+            98.0,
+        ),
+    )
+
+    if high <= low:
+        return np.zeros_like(
+            values,
+            dtype=np.float32,
+        )
+
+    return np.clip(
+        (
+            values
+            - low
+        )
+        / (
+            high
+            - low
+        ),
+        0.0,
+        1.0,
+    )

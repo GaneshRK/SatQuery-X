@@ -1,434 +1,2083 @@
-"""Evidence Engine for SatQuery AI.
-Computes deterministic GIS metrics, structures evidence across 4 epistemological certainty tiers,
-tracks multi-tier AOI telemetry, generates claims-backed evidence objects,
-and calculates calibrated multi-factor confidence per SIH 26167.
+"""
+SatQuery-X Evidence Engine
+==========================
+
+Transforms outputs from actual models/tools into a structured evidence
+representation consumed by the reasoning and response layers.
+
+This module is deliberately NON-GENERATIVE.
+
+It never:
+- invents measurements
+- invents coordinates
+- invents dates
+- invents sensors
+- invents CRS
+- invents cloud percentages
+- invents geographic areas
+- invents confidence
+- creates synthetic observations
+
+It only organizes evidence already returned by upstream components.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import logging
-from typing import Any, Dict, List, Optional
-import numpy as np
+from dataclasses import asdict, dataclass, field
+import math
+from typing import Any, Mapping
 
-logger = logging.getLogger(__name__)
+
+ENGINE_VERSION = "3.0"
+
+VALID_EVIDENCE_KINDS = {
+    "observation",
+    "measurement",
+    "provenance",
+    "validation",
+    "limitation",
+    "interpretation",
+    "input",
+}
+
+SUCCESS_STATUSES = {
+    "ok",
+    "success",
+    "completed",
+    "done",
+}
+
+FAILURE_STATUSES = {
+    "failed",
+    "error",
+    "unavailable",
+}
+
+KNOWN_MEASUREMENT_KEYS = {
+    "mean_ndvi",
+    "mean_ndwi",
+    "mean_ndbi",
+    "mean_nbr",
+    "min_ndvi",
+    "max_ndvi",
+    "min_ndwi",
+    "max_ndwi",
+    "min_ndbi",
+    "max_ndbi",
+    "min_nbr",
+    "max_nbr",
+
+    "detected_change_km2",
+    "detected_change_ha",
+    "detected_change_pct",
+
+    "built_up_area_km2",
+    "built_up_pct",
+
+    "vegetation_area_km2",
+    "vegetation_pct",
+
+    "dense_vegetation_km2",
+    "sparse_vegetation_km2",
+
+    "water_body_area_km2",
+    "open_water_area_km2",
+    "open_water_pct",
+
+    "water_features_count",
+    "structures_detected_count",
+
+    "salt_pan_area_km2",
+    "salt_pan_pct",
+
+    "bare_soil_area_km2",
+    "bare_soil_pct",
+
+    "aoi_total_area_km2",
+    "analysis_aoi_area_km2",
+    "analysis_aoi_bbox_km2",
+
+    "actual_raster_footprint_km2",
+    "valid_cloud_free_area_km2",
+    "valid_analytical_area_km2",
+    "usable_analytical_area_pct",
+
+    "scene_cloud_cover_pct",
+    "aoi_cloud_cover_pct",
+    "shadow_cover_pct",
+    "haze_pct",
+    "nodata_pct",
+
+    "area_km2",
+    "area_ha",
+
+    "pixel_count",
+    "valid_pixel_count",
+    "changed_pixel_count",
+    "total_pixel_count",
+
+    "overlap_area_km2",
+    "overlap_area_pct",
+
+    "mean_temperature",
+    "min_temperature",
+    "max_temperature",
+}
+
+
+# ============================================================================
+# Generic helpers
+# ============================================================================
+
+
+def _remove_none(value: Any) -> Any:
+    """
+    Remove None values recursively.
+
+    This does not create replacement values.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _remove_none(item)
+            for key, item in value.items()
+            if item is not None
+        }
+
+    if isinstance(value, list):
+        return [
+            _remove_none(item)
+            for item in value
+            if item is not None
+        ]
+
+    if isinstance(value, tuple):
+        return [
+            _remove_none(item)
+            for item in value
+            if item is not None
+        ]
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+
+    return value
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    try:
+        result = float(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if not math.isfinite(result):
+        return None
+
+    return result
+
+
+def _first_present(
+    *values: Any,
+) -> Any:
+    for value in values:
+        if value is not None:
+            if isinstance(
+                value,
+                str,
+            ):
+                if value.strip():
+                    return value
+            else:
+                return value
+
+    return None
+
+
+def _is_mapping(
+    value: Any,
+) -> bool:
+    return isinstance(
+        value,
+        Mapping,
+    )
+
+
+def _feature_count(
+    value: Any,
+) -> int | None:
+    if isinstance(
+        value,
+        list,
+    ):
+        return len(value)
+
+    if isinstance(
+        value,
+        Mapping,
+    ):
+        features = value.get(
+            "features"
+        )
+
+        if isinstance(
+            features,
+            list,
+        ):
+            return len(features)
+
+    return None
+
+
+# ============================================================================
+# Evidence structures
+# ============================================================================
 
 
 @dataclass
-class EvidenceClaim:
-    claim: str
-    value: Any
-    unit: str
-    evidence: Dict[str, Any] = field(default_factory=dict)
+class EvidenceItem:
+    """
+    One auditable evidence item.
+    """
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "claim": self.claim,
-            "value": self.value,
-            "unit": self.unit,
-            "evidence": self.evidence,
-        }
+    id: str
+
+    kind: str
+
+    source: str | None = None
+
+    description: str | None = None
+
+    value: Any = None
+
+    unit: str | None = None
+
+    confidence: float | None = None
+
+    spatial_reference: dict[str, Any] | None = None
+
+    temporal_reference: dict[str, Any] | None = None
+
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    def to_dict(
+        self,
+    ) -> dict[str, Any]:
+        return _remove_none(
+            asdict(self)
+        )
 
 
 @dataclass
 class StructuredEvidenceReport:
-    # Tier 1: Primary Satellite Observation Facts (Ground Truth / Sensors)
-    satellite_facts: List[Dict[str, Any]] = field(default_factory=list)
+    """
+    Structured evidence consumed by GeoReason and response composition.
+    """
 
-    # Tier 2: Deterministic GIS Measurements (Geometric math, projections, pixel counting)
-    gis_measurements: Dict[str, Any] = field(default_factory=dict)
+    observations: list[dict[str, Any]] = field(
+        default_factory=list
+    )
 
-    # Tier 3: Specialist AI Model Predictions (Deep learning inferences, segmentation masks)
-    model_predictions: List[Dict[str, Any]] = field(default_factory=list)
+    measurements: dict[str, Any] = field(
+        default_factory=dict
+    )
 
-    # Tier 4: Vision-Language Reasoning & Interpretation (Synthesized explanation)
-    ai_interpretation: str = ""
+    gis_measurements: dict[str, Any] = field(
+        default_factory=dict
+    )
 
-    # Mathematical Calibrated Confidence
-    calibrated_confidence_pct: float = 85.0
-    confidence_factors: Dict[str, float] = field(default_factory=dict)
+    aoi_telemetry: dict[str, Any] = field(
+        default_factory=dict
+    )
 
-    # Multi-Tier AOI Telemetry
-    aoi_telemetry: Dict[str, Any] = field(default_factory=dict)
+    data_quality: dict[str, Any] = field(
+        default_factory=dict
+    )
 
-    # Multi-Parameter Data Quality Telemetry
-    data_quality: Dict[str, Any] = field(default_factory=dict)
+    satellite_facts: list[dict[str, Any]] = field(
+        default_factory=list
+    )
 
-    # Claims-Backed Evidence Objects
-    claims: List[EvidenceClaim] = field(default_factory=list)
+    provenance: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+
+    confidence: float | None = None
+
+    calibrated_confidence: float | None = None
+
+    calibrated_confidence_pct: float | None = None
+
+    confidence_factors: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    limitations: list[str] = field(
+        default_factory=list
+    )
+
+    validation: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    evidence_items: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+
+    evidence_graph: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    interpretations: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+
+    status: str = "partial"
+
+    message: str | None = None
+
+    query_text: str | None = None
+
+    engine_version: str = ENGINE_VERSION
+
+    def to_dict(
+        self,
+    ) -> dict[str, Any]:
+        return _remove_none(
+            asdict(self)
+        )
+
+    def has_measurements(
+        self,
+    ) -> bool:
+        return bool(
+            self.measurements
+            or self.gis_measurements
+        )
+
+    def has_observations(
+        self,
+    ) -> bool:
+        return bool(
+            self.observations
+        )
+
+    def has_provenance(
+        self,
+    ) -> bool:
+        return bool(
+            self.provenance
+            or self.satellite_facts
+        )
+
+    def has_confidence(
+        self,
+    ) -> bool:
+        return (
+            self.confidence is not None
+            or self.calibrated_confidence is not None
+            or self.calibrated_confidence_pct is not None
+        )
+
+    def has_core_evidence(
+        self,
+    ) -> bool:
+        return (
+            self.has_observations()
+            or self.has_measurements()
+        )
+
+
+# ============================================================================
+# Evidence Engine
+# ============================================================================
 
 
 class EvidenceEngine:
-    """Manages metric extraction, epistemological tiering, and confidence calibration."""
+    """
+    Converts actual execution outputs into structured evidence.
 
-    @staticmethod
-    def calculate_calibrated_confidence(
-        model_confidence: float = 0.88,
-        cloud_cover_pct: float = 0.0,
-        usable_data_pct: float = 100.0,
-        registration_score: float = 1.0,
-        spatial_resolution_m: float = 10.0,
-    ) -> Dict[str, Any]:
-        """Calculates independent Data Quality and Result Confidence:
-        Data Quality = usable_data_fraction * (1 - cloud_fraction) * (1 - shadow_fraction) * registration_score
-        Result Confidence = 0.35 * Model + 0.30 * Data + 0.20 * Coverage + 0.15 * Geometry
-        Returns independent confidence percentages and component factors.
-        """
-        model_conf = max(0.20, min(1.0, float(model_confidence)))
-        cloud_fraction = max(0.0, min(1.0, float(cloud_cover_pct) / 100.0))
-        cloud_factor = max(0.10, 1.0 - cloud_fraction)
-        shadow_fraction = min(0.15, cloud_fraction * 0.35)
-        shadow_factor = max(0.10, 1.0 - shadow_fraction)
-        usable_factor = max(0.10, min(1.0, float(usable_data_pct) / 100.0))
-        reg_factor = max(0.50, min(1.0, float(registration_score)))
+    No scientific calculation occurs here.
+    """
 
-        # Resolution penalty if ground sample distance is coarse (> 30m)
-        res_factor = 1.0
-        if spatial_resolution_m > 30.0:
-            res_factor = 0.90
-        elif spatial_resolution_m > 100.0:
-            res_factor = 0.75
+    VERSION = ENGINE_VERSION
 
-        # 1. Rigorous Data Quality
-        data_quality_score = usable_factor * cloud_factor * shadow_factor * reg_factor
-        data_quality_pct = round(data_quality_score * 100.0, 1)
-
-        # 2. Geometry Quality
-        geometry_quality_score = reg_factor * res_factor
-        geometry_quality_pct = round(geometry_quality_score * 100.0, 1)
-
-        # 3. Evidence Coverage
-        evidence_coverage_pct = round(usable_factor * 100.0, 1)
-
-        # 4. Independent Result Confidence
-        result_conf_score = (
-            0.35 * model_conf
-            + 0.30 * data_quality_score
-            + 0.20 * usable_factor
-            + 0.15 * geometry_quality_score
-        )
-        result_conf_score = max(0.15, min(0.98, result_conf_score))
-        result_conf_pct = round(result_conf_score * 100.0, 1)
-        model_conf_pct = round(model_conf * 100.0, 1)
-
-        return {
-            "calibrated_confidence_pct": result_conf_pct,
-            "calibrated_score": round(result_conf_score, 4),
-            "model_confidence_pct": model_conf_pct,
-            "result_confidence_pct": result_conf_pct,
-            "data_quality_pct": data_quality_pct,
-            "geometry_quality_pct": geometry_quality_pct,
-            "evidence_coverage_pct": evidence_coverage_pct,
-            "factors": {
-                "model_confidence": round(model_conf, 3),
-                "data_quality": round(data_quality_score, 3),
-                "cloud_factor": round(cloud_factor, 3),
-                "shadow_factor": round(shadow_factor, 3),
-                "usable_data_factor": round(usable_factor, 3),
-                "coregistration_score": round(reg_factor, 3),
-                "resolution_factor": round(res_factor, 3),
-            },
-        }
+    # =========================================================================
+    # Public API
+    # =========================================================================
 
     @classmethod
-    def extract_dynamic_metrics(
+    def build_report(
         cls,
-        query_obj: Any,
-        step_outputs: Optional[Dict[str, Any]] = None,
-        image_assets: Optional[List[Any]] = None,
-        image_pair: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """Dynamically calculates and aggregates real GIS metrics without static fallbacks.
-        Extracts metrics directly from EvidenceRegions, step execution outputs, and raster headers.
-        """
-        metrics: Dict[str, Any] = {}
-
-        # 1. Extract from EvidenceRegions associated with this query
-        try:
-            from apps.evidence.models import EvidenceRegion
-            ev_regions = list(EvidenceRegion.objects.filter(query=query_obj))
-            if ev_regions:
-                total_change_m2 = sum(r.area_m2 or 0.0 for r in ev_regions)
-                total_change_km2 = sum(r.area_km2 or 0.0 for r in ev_regions)
-                feature_count = len(ev_regions)
-
-                if total_change_km2 > 0:
-                    metrics["detected_change_km2"] = round(total_change_km2, 4)
-                    metrics["detected_change_ha"] = round(total_change_km2 * 100.0, 2)
-                    metrics["detected_feature_count"] = feature_count
-
-                # Class-specific grouping
-                class_areas: Dict[str, float] = {}
-                for r in ev_regions:
-                    cname = (r.class_name or "change").lower()
-                    class_areas[cname] = class_areas.get(cname, 0.0) + (r.area_km2 or 0.0)
-
-                for cname, ckm2 in class_areas.items():
-                    if "salt" in cname:
-                        metrics["salt_pan_area_km2"] = round(ckm2, 4)
-                    elif "water" in cname:
-                        metrics["water_body_area_km2"] = round(ckm2, 4)
-                    elif "veg" in cname or "forest" in cname:
-                        metrics["vegetation_area_km2"] = round(ckm2, 4)
-                    elif "urban" in cname or "built" in cname or "structure" in cname:
-                        metrics["built_up_area_km2"] = round(ckm2, 4)
-                    elif "soil" in cname:
-                        metrics["bare_soil_area_km2"] = round(ckm2, 4)
-        except Exception as e:
-            logger.warning("Failed extracting metrics from EvidenceRegions: %s", e)
-
-        # 2. Extract from tool execution step outputs
-        if step_outputs:
-            for s_name, s_val in step_outputs.items():
-                if not isinstance(s_val, dict):
-                    continue
-                if "total_water_km2" in s_val:
-                    metrics["water_body_area_km2"] = round(float(s_val["total_water_km2"]), 4)
-                if "salt_pan_area_km2" in s_val:
-                    metrics["salt_pan_area_km2"] = round(float(s_val["salt_pan_area_km2"]), 4)
-                if "water_features_count" in s_val:
-                    metrics["water_features_count"] = int(s_val["water_features_count"])
-                if "total_veg_km2" in s_val:
-                    metrics["vegetation_area_km2"] = round(float(s_val["total_veg_km2"]), 4)
-                if "mean_ndvi" in s_val:
-                    metrics["mean_ndvi"] = round(float(s_val["mean_ndvi"]), 4)
-                if "vegetation_coverage_pct" in s_val:
-                    metrics["vegetation_coverage_pct"] = round(float(s_val["vegetation_coverage_pct"]), 2)
-                if "total_structure_km2" in s_val:
-                    metrics["built_up_area_km2"] = round(float(s_val["total_structure_km2"]), 4)
-                if "candidate_count" in s_val:
-                    metrics["structures_detected_count"] = int(s_val["candidate_count"])
-                if "area_km2" in s_val:
-                    metrics["detected_change_km2"] = round(float(s_val["area_km2"]), 4)
-                if "area_ha" in s_val:
-                    metrics["detected_change_ha"] = round(float(s_val["area_ha"]), 2)
-
-        # 3. Extract total AOI scene area from primary imagery geometry
-        primary_asset = None
-        if image_pair and getattr(image_pair, "image_a", None):
-            primary_asset = image_pair.image_a
-        elif image_assets and len(image_assets) > 0:
-            primary_asset = image_assets[0]
-        elif getattr(query_obj, "image", None):
-            primary_asset = query_obj.image
-
-        if primary_asset and primary_asset.bounds_wgs84:
-            b = primary_asset.bounds_wgs84
-            if isinstance(b, dict) and all(k in b for k in ("west", "south", "east", "north")):
-                import math
-                lat_mid = (b["south"] + b["north"]) / 2.0
-                deg_lat_km = 111.132
-                deg_lon_km = 111.320 * math.cos(math.radians(lat_mid))
-                width_km = abs(b["east"] - b["west"]) * deg_lon_km
-                height_km = abs(b["north"] - b["south"]) * deg_lat_km
-                total_scene_km2 = round(width_km * height_km, 2)
-                metrics["aoi_total_area_km2"] = total_scene_km2
-                metrics["actual_raster_footprint_km2"] = total_scene_km2
-
-                # If detected change exists, compute percentage
-                if "detected_change_km2" in metrics and total_scene_km2 > 0:
-                    chg = metrics["detected_change_km2"]
-                    metrics["detected_change_pct"] = round((chg / total_scene_km2) * 100.0, 2)
-
-        # 4. Calibrated confidence
-        cloud_cover = float(getattr(primary_asset, "cloud_cover_pct", 0.0) or 0.0) if primary_asset else 0.0
-        resolution = float(getattr(primary_asset, "resolution_m", 10.0) or 10.0) if primary_asset else 10.0
-        model_conf = float(getattr(query_obj, "confidence", 0.94) or 0.94)
-
-        calib = cls.calculate_calibrated_confidence(
-            model_confidence=model_conf,
-            cloud_cover_pct=cloud_cover,
-            spatial_resolution_m=resolution,
-        )
-        metrics["model_confidence_pct"] = calib["model_confidence_pct"]
-        metrics["result_confidence_pct"] = calib["result_confidence_pct"]
-        metrics["data_quality_pct"] = calib["data_quality_pct"]
-        metrics["geometry_quality_pct"] = calib["geometry_quality_pct"]
-        metrics["evidence_coverage_pct"] = calib["evidence_coverage_pct"]
-        metrics["confidence_factors"] = calib["factors"]
-
-        # 5. Epistemological Evidence Chain
-        chg_val = metrics.get("detected_change_km2") or metrics.get("vegetation_decreased_km2") or 18.4
-        metrics["evidence_chain"] = {
-            "pixel_count": int(chg_val * 10000),
-            "pixel_ground_area_m2": 100.0,
-            "total_area_m2": int(chg_val * 1000000),
-            "total_area_km2": round(float(chg_val), 2),
-            "source_crs": "EPSG:4326 (WGS-84 Geographic 2D)",
-            "analysis_crs": "EPSG:6933 (World Cylindrical Equal Area)",
-            "measurement_method": "Geodesic Cylindrical Equal-Area Metric Pixel Integration",
-            "resolution_m": resolution,
-        }
-
-        return metrics
-
-    @classmethod
-    def assemble_report(
-        cls,
-        query_obj: Any,
-        intent: Any,
-        image_assets: Optional[List[Any]] = None,
-        image_pair: Optional[Any] = None,
-        step_outputs: Optional[Dict[str, Any]] = None,
+        execution_results: Mapping[str, Any] | None = None,
+        input_context: Mapping[str, Any] | None = None,
+        query_text: str | None = None,
+        execution_trace: list[Mapping[str, Any]] | None = None,
     ) -> StructuredEvidenceReport:
-        """Assembles the 4-tier structured report, multi-tier AOI telemetry, and claims-backed evidence."""
-        report = StructuredEvidenceReport()
 
-        # Tier 1: Satellite facts
-        assets_to_inspect = []
-        if image_pair:
-            if image_pair.image_a:
-                assets_to_inspect.append(("Baseline Observation (T1)", image_pair.image_a))
-            if image_pair.image_b:
-                assets_to_inspect.append(("Comparison Observation (T2)", image_pair.image_b))
-        elif image_assets:
-            for i, a in enumerate(image_assets):
-                assets_to_inspect.append((f"Observation {i + 1}", a))
-        elif getattr(query_obj, "image", None):
-            assets_to_inspect.append(("Observation", query_obj.image))
-
-        primary_asset = None
-        for label, asset in assets_to_inspect:
-            if not primary_asset:
-                primary_asset = asset
-            prov = getattr(asset, "provenance", {}) or {}
-            fact = {
-                "observation_role": label,
-                "sensor": getattr(asset, "sensor", "SENTINEL-2"),
-                "modality": getattr(asset, "modality", "OPTICAL"),
-                "acquisition_date": getattr(asset, "acquisition_date", "Unknown"),
-                "cloud_cover_pct": float(getattr(asset, "cloud_cover_pct", 0.0) or 0.0),
-                "resolution_m": float(getattr(asset, "resolution_m", 10.0) or 10.0),
-                "crs": getattr(asset, "crs", "EPSG:4326"),
-                "bounds": getattr(asset, "bounds_wgs84", None),
-                "stac_item_id": prov.get("stac_item_id"),
-                "provider": prov.get("source", "Copernicus Data Space Ecosystem"),
-            }
-            report.satellite_facts.append(fact)
-
-        # Tier 2: GIS measurements
-        report.gis_measurements = cls.extract_dynamic_metrics(
-            query_obj=query_obj,
-            step_outputs=step_outputs,
-            image_assets=image_assets,
-            image_pair=image_pair,
+        report = StructuredEvidenceReport(
+            query_text=(
+                str(query_text).strip()
+                if query_text is not None
+                and str(query_text).strip()
+                else None
+            )
         )
 
-        # Multi-Tier AOI Telemetry
-        loc_data = getattr(intent, "location", {}) or {}
-        req_name = loc_data.get("name", "Target AOI")
-        admin_reg = loc_data.get("canonical_name", req_name)
-        bbox_km2 = report.gis_measurements.get("aoi_total_area_km2", 100.0)
-        raster_km2 = bbox_km2
-        cloud_pct = report.satellite_facts[0].get("cloud_cover_pct", 0.0) if report.satellite_facts else 0.0
-        valid_km2 = round(raster_km2 * (1.0 - (cloud_pct / 100.0)), 2)
+        results = dict(
+            execution_results or {}
+        )
 
-        report.aoi_telemetry = {
-            "user_requested_location": req_name,
-            "administrative_region": admin_reg,
-            "analysis_aoi_bbox_km2": bbox_km2,
-            "actual_raster_footprint_km2": raster_km2,
-            "valid_cloud_free_area_km2": valid_km2,
-        }
-        report.gis_measurements["aoi_telemetry"] = report.aoi_telemetry
+        context = dict(
+            input_context or {}
+        )
 
-        # Multi-Parameter Data Quality Telemetry
-        report.data_quality = {
-            "scene_cloud_cover_pct": cloud_pct,
-            "aoi_cloud_cover_pct": cloud_pct,
-            "shadow_cover_pct": round(cloud_pct * 0.35, 1),
-            "haze_pct": 2.1 if getattr(primary_asset, "modality", "") == "OPTICAL" else 0.0,
-            "nodata_pct": 0.0,
-            "usable_analytical_area_pct": max(0.0, round(100.0 - cloud_pct - (cloud_pct * 0.35), 1)),
-        }
-        report.gis_measurements["data_quality"] = report.data_quality
+        # --------------------------------------------------------------
+        # Consume actual execution results.
+        # --------------------------------------------------------------
 
-        # Tier 3: Model predictions
-        if step_outputs:
-            for s_k, s_v in step_outputs.items():
-                if isinstance(s_v, dict) and ("answer" in s_v or "confidence" in s_v):
-                    report.model_predictions.append({
-                        "step": s_k,
-                        "answer": s_v.get("answer"),
-                        "confidence": s_v.get("confidence"),
-                    })
+        for source, raw_output in results.items():
+            cls._consume_result(
+                report=report,
+                source=str(source),
+                raw_output=raw_output,
+                context=context,
+            )
 
-        # Tier 4: Claims-Backed Evidence Objects
-        source_imgs = [f["sensor"] for f in report.satellite_facts] or ["SENTINEL-2"]
-        if "detected_change_km2" in report.gis_measurements:
-            val = report.gis_measurements["detected_change_km2"]
-            report.claims.append(EvidenceClaim(
-                claim="bi_temporal_surface_change",
-                value=val,
-                unit="km2",
-                evidence={
-                    "mask_ref": "change_detection_mask",
-                    "pixel_count": int(val * 10000),
-                    "source_images": source_imgs,
-                    "model": "ChangeFormer",
-                    "calculation_method": "projected_equal_area_cylindrical_wgs84",
-                },
-            ))
-        if "built_up_area_km2" in report.gis_measurements:
-            val = report.gis_measurements["built_up_area_km2"]
-            report.claims.append(EvidenceClaim(
-                claim="built_up_infrastructure_footprint",
-                value=val,
-                unit="km2",
-                evidence={
-                    "mask_ref": "structure_candidate_mask",
-                    "pixel_count": int(val * 10000),
-                    "source_images": source_imgs,
-                    "model": "MorphologicalStructureClassifier",
-                    "calculation_method": "projected_equal_area_cylindrical_wgs84",
-                },
-            ))
-        if "vegetation_area_km2" in report.gis_measurements:
-            val = report.gis_measurements["vegetation_area_km2"]
-            report.claims.append(EvidenceClaim(
-                claim="vegetation_canopy_extent",
-                value=val,
-                unit="km2",
-                evidence={
-                    "mask_ref": "ndvi_canopy_mask",
-                    "pixel_count": int(val * 10000),
-                    "source_images": source_imgs,
-                    "model": "NDVI_Segmentation",
-                    "calculation_method": "projected_equal_area_cylindrical_wgs84",
-                },
-            ))
-        if "water_body_area_km2" in report.gis_measurements:
-            val = report.gis_measurements["water_body_area_km2"]
-            report.claims.append(EvidenceClaim(
-                claim="open_surface_water_extent",
-                value=val,
-                unit="km2",
-                evidence={
-                    "mask_ref": "ndwi_water_mask",
-                    "pixel_count": int(val * 10000),
-                    "source_images": source_imgs,
-                    "model": "NDWI_Segmentation",
-                    "calculation_method": "projected_equal_area_cylindrical_wgs84",
-                },
-            ))
-        if "salt_pan_area_km2" in report.gis_measurements:
-            val = report.gis_measurements["salt_pan_area_km2"]
-            report.claims.append(EvidenceClaim(
-                claim="salt_pan_evaporation_basin_extent",
-                value=val,
-                unit="km2",
-                evidence={
-                    "mask_ref": "coastal_salt_pan_mask",
-                    "pixel_count": int(val * 10000),
-                    "source_images": source_imgs,
-                    "model": "Multispectral_Saline_Classifier",
-                    "calculation_method": "projected_equal_area_cylindrical_wgs84",
-                },
-            ))
+        # --------------------------------------------------------------
+        # Preserve actual context.
+        # --------------------------------------------------------------
 
-        # Confidence
-        report.calibrated_confidence_pct = report.gis_measurements.get("model_confidence_pct", 88.0)
-        report.confidence_factors = report.gis_measurements.get("confidence_factors", {})
-        report.ai_interpretation = getattr(query_obj, "answer", "")
+        cls._collect_context(
+            report=report,
+            context=context,
+        )
+
+        # --------------------------------------------------------------
+        # Preserve concise execution trace.
+        # --------------------------------------------------------------
+
+        if execution_trace:
+            report.evidence_graph[
+                "execution_trace"
+            ] = [
+                cls._sanitize_trace_item(
+                    item
+                )
+                for item in execution_trace
+                if isinstance(
+                    item,
+                    Mapping,
+                )
+            ]
+
+        # --------------------------------------------------------------
+        # Validate.
+        # --------------------------------------------------------------
+
+        report.validation = cls.validate_report(
+            report
+        )
+
+        # --------------------------------------------------------------
+        # Status.
+        # --------------------------------------------------------------
+
+        report.status = cls._determine_status(
+            report
+        )
+
+        if not report.has_core_evidence():
+            report.message = (
+                "No directly usable observation or quantitative "
+                "measurement was returned by the executed analysis."
+            )
 
         return report
+
+    @classmethod
+    def generate_report(
+        cls,
+        execution_results: Mapping[str, Any] | None = None,
+        input_context: Mapping[str, Any] | None = None,
+        query_text: str | None = None,
+        execution_trace: list[Mapping[str, Any]] | None = None,
+    ) -> StructuredEvidenceReport:
+        return cls.build_report(
+            execution_results=execution_results,
+            input_context=input_context,
+            query_text=query_text,
+            execution_trace=execution_trace,
+        )
+
+    @classmethod
+    def create_report(
+        cls,
+        execution_results: Mapping[str, Any] | None = None,
+        input_context: Mapping[str, Any] | None = None,
+        query_text: str | None = None,
+        execution_trace: list[Mapping[str, Any]] | None = None,
+    ) -> StructuredEvidenceReport:
+        return cls.build_report(
+            execution_results=execution_results,
+            input_context=input_context,
+            query_text=query_text,
+            execution_trace=execution_trace,
+        )
+
+    @classmethod
+    def collect(
+        cls,
+        execution_results: Mapping[str, Any] | None = None,
+        input_context: Mapping[str, Any] | None = None,
+        query_text: str | None = None,
+        execution_trace: list[Mapping[str, Any]] | None = None,
+    ) -> StructuredEvidenceReport:
+        return cls.build_report(
+            execution_results=execution_results,
+            input_context=input_context,
+            query_text=query_text,
+            execution_trace=execution_trace,
+        )
+
+    @classmethod
+    def build_evidence_graph(
+        cls,
+        execution_results: Mapping[str, Any] | None = None,
+        input_context: Mapping[str, Any] | None = None,
+        execution_trace: list[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        report = cls.build_report(
+            execution_results=execution_results,
+            input_context=input_context,
+            execution_trace=execution_trace,
+        )
+
+        return report.evidence_graph
+
+    # =========================================================================
+    # Validation
+    # =========================================================================
+
+    @classmethod
+    def validate_report(
+        cls,
+        report: StructuredEvidenceReport,
+    ) -> dict[str, Any]:
+
+        issues: list[str] = []
+
+        warnings: list[str] = []
+
+        # --------------------------------------------------------------
+        # Evidence items.
+        # --------------------------------------------------------------
+
+        for index, item in enumerate(
+            report.evidence_items
+        ):
+            if not isinstance(
+                item,
+                Mapping,
+            ):
+                issues.append(
+                    f"Evidence item {index} is not a mapping."
+                )
+                continue
+
+            kind = item.get(
+                "kind"
+            )
+
+            if kind not in VALID_EVIDENCE_KINDS:
+                issues.append(
+                    f"Evidence item {index} has unsupported kind "
+                    f"'{kind}'."
+                )
+
+            if not item.get(
+                "source"
+            ):
+                warnings.append(
+                    f"Evidence item {index} has no source."
+                )
+
+        # --------------------------------------------------------------
+        # Observations.
+        # --------------------------------------------------------------
+
+        for index, observation in enumerate(
+            report.observations
+        ):
+            if not isinstance(
+                observation,
+                Mapping,
+            ):
+                issues.append(
+                    f"Observation {index} is not a mapping."
+                )
+                continue
+
+            description = _first_present(
+                observation.get(
+                    "observation"
+                ),
+                observation.get(
+                    "description"
+                ),
+                observation.get(
+                    "finding"
+                ),
+                observation.get(
+                    "answer"
+                ),
+                observation.get(
+                    "caption"
+                ),
+            )
+
+            if description is None:
+                warnings.append(
+                    f"Observation {index} has no textual description."
+                )
+
+        # --------------------------------------------------------------
+        # Measurements.
+        # --------------------------------------------------------------
+
+        for key, value in report.measurements.items():
+            if value is None:
+                issues.append(
+                    f"Measurement '{key}' has a null value."
+                )
+                continue
+
+            numeric = _as_float(
+                value
+            )
+
+            if numeric is not None:
+                if not math.isfinite(
+                    numeric
+                ):
+                    issues.append(
+                        f"Measurement '{key}' is not finite."
+                    )
+
+        for key, value in report.gis_measurements.items():
+            if value is None:
+                issues.append(
+                    f"GIS measurement '{key}' has a null value."
+                )
+
+        # --------------------------------------------------------------
+        # Confidence.
+        # --------------------------------------------------------------
+
+        for field_name in (
+            "confidence",
+            "calibrated_confidence",
+        ):
+            value = getattr(
+                report,
+                field_name,
+            )
+
+            if value is None:
+                continue
+
+            numeric = _as_float(
+                value
+            )
+
+            if numeric is None:
+                issues.append(
+                    f"{field_name} is not numeric."
+                )
+            elif not 0.0 <= numeric <= 1.0:
+                issues.append(
+                    f"{field_name} is outside the expected 0-1 range."
+                )
+
+        if report.calibrated_confidence_pct is not None:
+            numeric = _as_float(
+                report.calibrated_confidence_pct
+            )
+
+            if numeric is None:
+                issues.append(
+                    "calibrated_confidence_pct is not numeric."
+                )
+            elif not 0.0 <= numeric <= 100.0:
+                issues.append(
+                    "calibrated_confidence_pct is outside the "
+                    "expected 0-100 range."
+                )
+
+        # --------------------------------------------------------------
+        # Duplicate evidence.
+        # --------------------------------------------------------------
+
+        duplicate_count = cls._count_duplicate_items(
+            report.evidence_items
+        )
+
+        if duplicate_count:
+            warnings.append(
+                f"{duplicate_count} duplicate evidence item(s) "
+                "were detected."
+            )
+
+        return {
+            "valid": not issues,
+            "issues": issues,
+            "warnings": warnings,
+            "evidence_count": len(
+                report.evidence_items
+            ),
+            "observation_count": len(
+                report.observations
+            ),
+            "measurement_count": len(
+                report.measurements
+            ),
+            "gis_measurement_count": len(
+                report.gis_measurements
+            ),
+            "provenance_count": (
+                len(report.provenance)
+                + len(report.satellite_facts)
+            ),
+            "interpretation_count": len(
+                report.interpretations
+            ),
+            "limitation_count": len(
+                report.limitations
+            ),
+        }
+
+    @classmethod
+    def validate(
+        cls,
+        report: StructuredEvidenceReport,
+    ) -> dict[str, Any]:
+        return cls.validate_report(
+            report
+        )
+
+    # =========================================================================
+    # Result ingestion
+    # =========================================================================
+
+    @classmethod
+    def _consume_result(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        raw_output: Any,
+        context: Mapping[str, Any],
+    ) -> None:
+
+        if raw_output is None:
+            return
+
+        raw_output = cls._normalize_output(
+            raw_output
+        )
+
+        if isinstance(
+            raw_output,
+            str,
+        ):
+            text = raw_output.strip()
+
+            if text:
+                cls._add_observation(
+                    report=report,
+                    source=source,
+                    description=text,
+                )
+
+            return
+
+        if isinstance(
+            raw_output,
+            Mapping,
+        ):
+            cls._collect_mapping_result(
+                report=report,
+                source=source,
+                result=dict(raw_output),
+                context=context,
+            )
+            return
+
+        if isinstance(
+            raw_output,
+            list,
+        ):
+            for index, item in enumerate(
+                raw_output
+            ):
+                cls._consume_result(
+                    report=report,
+                    source=f"{source}[{index}]",
+                    raw_output=item,
+                    context=context,
+                )
+
+            return
+
+        text = str(
+            raw_output
+        ).strip()
+
+        if text:
+            cls._add_observation(
+                report=report,
+                source=source,
+                description=text,
+            )
+
+    @classmethod
+    def _normalize_output(
+        cls,
+        value: Any,
+    ) -> Any:
+
+        if hasattr(
+            value,
+            "to_dict",
+        ):
+            try:
+                converted = value.to_dict()
+
+                if converted is not value:
+                    return converted
+
+            except Exception:
+                pass
+
+        if hasattr(
+            value,
+            "__dict__",
+        ):
+            try:
+                return dict(
+                    value.__dict__
+                )
+            except Exception:
+                pass
+
+        return value
+
+    # =========================================================================
+    # Mapping ingestion
+    # =========================================================================
+
+    @classmethod
+    def _collect_mapping_result(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: dict[str, Any],
+        context: Mapping[str, Any],
+    ) -> None:
+
+        clean_result = _remove_none(
+            result
+        )
+
+        status = str(
+            result.get(
+                "status",
+                "",
+            )
+        ).lower()
+
+        # --------------------------------------------------------------
+        # Failure information.
+        # --------------------------------------------------------------
+
+        if status in FAILURE_STATUSES:
+            error = _first_present(
+                result.get("error"),
+                result.get("message"),
+            )
+
+            if error:
+                cls._add_limitation(
+                    report,
+                    source,
+                    str(error),
+                )
+
+        # --------------------------------------------------------------
+        # Observations.
+        # --------------------------------------------------------------
+
+        observation_fields = (
+            "observation",
+            "observations",
+            "finding",
+            "findings",
+            "answer",
+            "caption",
+            "description",
+            "summary",
+            "interpretation",
+        )
+
+        for key in observation_fields:
+            if key not in result:
+                continue
+
+            value = result.get(
+                key
+            )
+
+            if value is None:
+                continue
+
+            if key == "interpretation":
+                cls._collect_interpretations(
+                    report,
+                    source,
+                    value,
+                )
+                continue
+
+            if isinstance(
+                value,
+                list,
+            ):
+                for item in value:
+                    if isinstance(
+                        item,
+                        Mapping,
+                    ):
+                        text = _first_present(
+                            item.get("observation"),
+                            item.get("description"),
+                            item.get("finding"),
+                            item.get("text"),
+                            item.get("label"),
+                        )
+
+                        if text:
+                            cls._add_observation(
+                                report=report,
+                                source=source,
+                                description=str(text),
+                                spatial_reference=(
+                                    item.get(
+                                        "spatial_reference"
+                                    )
+                                ),
+                                temporal_reference=(
+                                    item.get(
+                                        "temporal_reference"
+                                    )
+                                ),
+                                metadata=item,
+                            )
+
+                    elif item is not None:
+                        cls._add_observation(
+                            report=report,
+                            source=source,
+                            description=str(item),
+                        )
+
+            elif isinstance(
+                value,
+                str,
+            ):
+                if value.strip():
+                    cls._add_observation(
+                        report=report,
+                        source=source,
+                        description=value,
+                    )
+
+        # --------------------------------------------------------------
+        # Explicit measurements.
+        # --------------------------------------------------------------
+
+        cls._collect_measurements(
+            report,
+            source,
+            result,
+        )
+
+        # --------------------------------------------------------------
+        # Spatial outputs.
+        # --------------------------------------------------------------
+
+        cls._collect_spatial_outputs(
+            report,
+            source,
+            result,
+        )
+
+        # --------------------------------------------------------------
+        # Provenance.
+        # --------------------------------------------------------------
+
+        cls._collect_provenance(
+            report,
+            source,
+            result,
+        )
+
+        # --------------------------------------------------------------
+        # Data quality.
+        # --------------------------------------------------------------
+
+        cls._collect_quality(
+            report,
+            source,
+            result,
+        )
+
+        # --------------------------------------------------------------
+        # Confidence.
+        # --------------------------------------------------------------
+
+        cls._collect_confidence(
+            report,
+            source,
+            result,
+        )
+
+        # --------------------------------------------------------------
+        # Limitations.
+        # --------------------------------------------------------------
+
+        cls._collect_limitations(
+            report,
+            source,
+            result,
+        )
+
+        # --------------------------------------------------------------
+        # Validation.
+        # --------------------------------------------------------------
+
+        validation = result.get(
+            "validation"
+        )
+
+        if isinstance(
+            validation,
+            Mapping,
+        ):
+            report.validation.setdefault(
+                "upstream",
+                [],
+            ).append(
+                {
+                    "source": source,
+                    **_remove_none(
+                        dict(validation)
+                    ),
+                }
+            )
+
+        # --------------------------------------------------------------
+        # Generic evidence.
+        # --------------------------------------------------------------
+
+        evidence = result.get(
+            "evidence"
+        )
+
+        if isinstance(
+            evidence,
+            list,
+        ):
+            for item in evidence:
+                if isinstance(
+                    item,
+                    Mapping,
+                ):
+                    cls._add_evidence_item(
+                        report=report,
+                        kind=str(
+                            item.get(
+                                "kind",
+                                "observation",
+                            )
+                        ),
+                        source=str(
+                            item.get(
+                                "source",
+                                source,
+                            )
+                        ),
+                        description=item.get(
+                            "description"
+                        ),
+                        value=item.get(
+                            "value"
+                        ),
+                        unit=item.get(
+                            "unit"
+                        ),
+                        confidence=_as_float(
+                            item.get(
+                                "confidence"
+                            )
+                        ),
+                        spatial_reference=(
+                            item.get(
+                                "spatial_reference"
+                            )
+                        ),
+                        temporal_reference=(
+                            item.get(
+                                "temporal_reference"
+                            )
+                        ),
+                        metadata=item.get(
+                            "metadata",
+                            {},
+                        ),
+                    )
+
+        # --------------------------------------------------------------
+        # Graph source node.
+        # --------------------------------------------------------------
+
+        report.evidence_graph.setdefault(
+            "sources",
+            [],
+        ).append(
+            {
+                "source": source,
+                "status": status or None,
+                "keys": sorted(
+                    str(key)
+                    for key in clean_result.keys()
+                ),
+            }
+        )
+
+    # =========================================================================
+    # Measurements
+    # =========================================================================
+
+    @classmethod
+    def _collect_measurements(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+
+        measurement_mapping = result.get(
+            "measurements"
+        )
+
+        if isinstance(
+            measurement_mapping,
+            Mapping,
+        ):
+            for key, value in measurement_mapping.items():
+                if value is None:
+                    continue
+
+                report.measurements[
+                    str(key)
+                ] = value
+
+                cls._add_evidence_item(
+                    report=report,
+                    kind="measurement",
+                    source=source,
+                    description=(
+                        f"Measurement returned by {source}: "
+                        f"{key}"
+                    ),
+                    value=value,
+                    metadata={
+                        "measurement_key": str(key),
+                    },
+                )
+
+        gis_mapping = result.get(
+            "gis_measurements"
+        )
+
+        if isinstance(
+            gis_mapping,
+            Mapping,
+        ):
+            for key, value in gis_mapping.items():
+                if value is None:
+                    continue
+
+                report.gis_measurements[
+                    str(key)
+                ] = value
+
+                cls._add_evidence_item(
+                    report=report,
+                    kind="measurement",
+                    source=source,
+                    description=(
+                        f"GIS measurement returned by {source}: "
+                        f"{key}"
+                    ),
+                    value=value,
+                    metadata={
+                        "measurement_key": str(key),
+                        "category": "gis",
+                    },
+                )
+
+        for key in KNOWN_MEASUREMENT_KEYS:
+            if key not in result:
+                continue
+
+            value = result.get(
+                key
+            )
+
+            if value is None:
+                continue
+
+            report.measurements[
+                key
+            ] = value
+
+            cls._add_evidence_item(
+                report=report,
+                kind="measurement",
+                source=source,
+                description=(
+                    f"Explicit measurement returned by {source}: "
+                    f"{key}"
+                ),
+                value=value,
+                metadata={
+                    "measurement_key": key,
+                },
+            )
+
+    # =========================================================================
+    # Spatial outputs
+    # =========================================================================
+
+    @classmethod
+    def _collect_spatial_outputs(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+
+        spatial_keys = (
+            "geometry",
+            "geometries",
+            "features",
+            "geojson",
+            "vector",
+            "mask",
+            "change_mask",
+            "overlay",
+            "boxes",
+            "bbox",
+            "bounds",
+        )
+
+        for key in spatial_keys:
+            if key not in result:
+                continue
+
+            value = result.get(
+                key
+            )
+
+            if value is None:
+                continue
+
+            record = {
+                "source": source,
+                "type": key,
+                "available": True,
+            }
+
+            count = _feature_count(
+                value
+            )
+
+            if count is not None:
+                record[
+                    "feature_count"
+                ] = count
+
+            report.evidence_graph.setdefault(
+                "spatial_outputs",
+                [],
+            ).append(
+                record
+            )
+
+    # =========================================================================
+    # Provenance
+    # =========================================================================
+
+    @classmethod
+    def _collect_provenance(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+
+        provenance = result.get(
+            "provenance"
+        )
+
+        if isinstance(
+            provenance,
+            Mapping,
+        ):
+            item = {
+                "source": source,
+                **dict(provenance),
+            }
+
+            report.provenance.append(
+                _remove_none(item)
+            )
+
+        elif isinstance(
+            provenance,
+            list,
+        ):
+            for item in provenance:
+                if isinstance(
+                    item,
+                    Mapping,
+                ):
+                    record = {
+                        "source": source,
+                        **dict(item),
+                    }
+
+                    report.provenance.append(
+                        _remove_none(record)
+                    )
+
+        # --------------------------------------------------------------
+        # Satellite facts.
+        # --------------------------------------------------------------
+
+        satellite_fields = (
+            "sensor",
+            "satellite",
+            "platform",
+            "mission",
+            "acquisition_date",
+            "observation_date",
+            "scene_id",
+            "product_id",
+            "processing_level",
+            "crs",
+            "resolution_m",
+        )
+
+        facts = {}
+
+        for key in satellite_fields:
+            value = result.get(
+                key
+            )
+
+            if value is not None:
+                facts[key] = value
+
+        if facts:
+            facts["source"] = source
+
+            report.satellite_facts.append(
+                _remove_none(
+                    facts
+                )
+            )
+
+    # =========================================================================
+    # Quality
+    # =========================================================================
+
+    @classmethod
+    def _collect_quality(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+
+        quality = result.get(
+            "quality"
+        )
+
+        if isinstance(
+            quality,
+            Mapping,
+        ):
+            report.data_quality.update(
+                {
+                    str(key): value
+                    for key, value in quality.items()
+                    if value is not None
+                }
+            )
+
+        quality_keys = (
+            "cloud_cover_pct",
+            "scene_cloud_cover_pct",
+            "aoi_cloud_cover_pct",
+            "shadow_cover_pct",
+            "haze_pct",
+            "nodata_pct",
+            "usable_analytical_area_pct",
+            "usable_clear_data_pct",
+            "resolution_m",
+            "crs",
+            "is_georeferenced",
+            "band_count",
+            "dtype",
+        )
+
+        for key in quality_keys:
+            if key not in result:
+                continue
+
+            value = result.get(
+                key
+            )
+
+            if value is not None:
+                report.data_quality[
+                    key
+                ] = value
+
+    # =========================================================================
+    # Confidence
+    # =========================================================================
+
+    @classmethod
+    def _collect_confidence(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+
+        confidence = _as_float(
+            result.get(
+                "confidence"
+            )
+        )
+
+        if confidence is not None:
+            if report.confidence is None:
+                report.confidence = confidence
+
+        calibrated = _as_float(
+            result.get(
+                "calibrated_confidence"
+            )
+        )
+
+        if calibrated is not None:
+            report.calibrated_confidence = (
+                calibrated
+            )
+
+        calibrated_pct = _as_float(
+            result.get(
+                "calibrated_confidence_pct"
+            )
+        )
+
+        if calibrated_pct is not None:
+            report.calibrated_confidence_pct = (
+                calibrated_pct
+            )
+
+        factors = result.get(
+            "confidence_factors"
+        )
+
+        if isinstance(
+            factors,
+            Mapping,
+        ):
+            report.confidence_factors.update(
+                {
+                    str(key): value
+                    for key, value in factors.items()
+                    if value is not None
+                }
+            )
+
+    # =========================================================================
+    # Limitations
+    # =========================================================================
+
+    @classmethod
+    def _collect_limitations(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+
+        limitations = result.get(
+            "limitations"
+        )
+
+        if isinstance(
+            limitations,
+            str,
+        ):
+            cls._add_limitation(
+                report,
+                source,
+                limitations,
+            )
+
+        elif isinstance(
+            limitations,
+            list,
+        ):
+            for limitation in limitations:
+                if limitation:
+                    cls._add_limitation(
+                        report,
+                        source,
+                        str(limitation),
+                    )
+
+        for key in (
+            "warning",
+            "warnings",
+            "uncertainty",
+            "uncertainties",
+        ):
+            value = result.get(
+                key
+            )
+
+            if isinstance(
+                value,
+                str,
+            ):
+                cls._add_limitation(
+                    report,
+                    source,
+                    value,
+                )
+
+            elif isinstance(
+                value,
+                list,
+            ):
+                for item in value:
+                    if item:
+                        cls._add_limitation(
+                            report,
+                            source,
+                            str(item),
+                        )
+
+    @classmethod
+    def _add_limitation(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        text: str,
+    ) -> None:
+
+        clean = str(
+            text
+        ).strip()
+
+        if not clean:
+            return
+
+        if clean not in report.limitations:
+            report.limitations.append(
+                clean
+            )
+
+        cls._add_evidence_item(
+            report=report,
+            kind="limitation",
+            source=source,
+            description=clean,
+        )
+
+    # =========================================================================
+    # Observations
+    # =========================================================================
+
+    @classmethod
+    def _add_observation(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        description: str,
+        spatial_reference: Mapping[str, Any] | None = None,
+        temporal_reference: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+
+        text = str(
+            description
+        ).strip()
+
+        if not text:
+            return
+
+        observation = {
+            "source": source,
+            "observation": text,
+        }
+
+        if spatial_reference:
+            observation[
+                "spatial_reference"
+            ] = dict(
+                spatial_reference
+            )
+
+        if temporal_reference:
+            observation[
+                "temporal_reference"
+            ] = dict(
+                temporal_reference
+            )
+
+        if metadata:
+            observation[
+                "metadata"
+            ] = dict(
+                metadata
+            )
+
+        observation = _remove_none(
+            observation
+        )
+
+        if observation in report.observations:
+            return
+
+        report.observations.append(
+            observation
+        )
+
+        cls._add_evidence_item(
+            report=report,
+            kind="observation",
+            source=source,
+            description=text,
+            spatial_reference=(
+                dict(spatial_reference)
+                if spatial_reference
+                else None
+            ),
+            temporal_reference=(
+                dict(temporal_reference)
+                if temporal_reference
+                else None
+            ),
+            metadata=(
+                dict(metadata)
+                if metadata
+                else {}
+            ),
+        )
+
+    # =========================================================================
+    # Interpretations
+    # =========================================================================
+
+    @classmethod
+    def _collect_interpretations(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        value: Any,
+    ) -> None:
+
+        if isinstance(
+            value,
+            str,
+        ):
+            cls._add_interpretation(
+                report,
+                source,
+                value,
+            )
+
+            return
+
+        if isinstance(
+            value,
+            list,
+        ):
+            for item in value:
+                if isinstance(
+                    item,
+                    Mapping,
+                ):
+                    text = _first_present(
+                        item.get("text"),
+                        item.get("interpretation"),
+                        item.get("description"),
+                    )
+
+                    if text:
+                        cls._add_interpretation(
+                            report,
+                            source,
+                            str(text),
+                            item,
+                        )
+
+                elif item:
+                    cls._add_interpretation(
+                        report,
+                        source,
+                        str(item),
+                    )
+
+    @classmethod
+    def _add_interpretation(
+        cls,
+        report: StructuredEvidenceReport,
+        source: str,
+        text: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+
+        clean = str(
+            text
+        ).strip()
+
+        if not clean:
+            return
+
+        item = {
+            "source": source,
+            "text": clean,
+        }
+
+        if metadata:
+            item[
+                "metadata"
+            ] = dict(
+                metadata
+            )
+
+        item = _remove_none(
+            item
+        )
+
+        if item in report.interpretations:
+            return
+
+        report.interpretations.append(
+            item
+        )
+
+        cls._add_evidence_item(
+            report=report,
+            kind="interpretation",
+            source=source,
+            description=clean,
+            metadata=(
+                dict(metadata)
+                if metadata
+                else {}
+            ),
+        )
+
+    # =========================================================================
+    # Evidence item
+    # =========================================================================
+
+    @classmethod
+    def _add_evidence_item(
+        cls,
+        report: StructuredEvidenceReport,
+        kind: str,
+        source: str | None = None,
+        description: str | None = None,
+        value: Any = None,
+        unit: str | None = None,
+        confidence: float | None = None,
+        spatial_reference: Mapping[str, Any] | None = None,
+        temporal_reference: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+
+        if kind not in VALID_EVIDENCE_KINDS:
+            kind = "observation"
+
+        item_id = (
+            f"evidence_"
+            f"{len(report.evidence_items) + 1}"
+        )
+
+        item = EvidenceItem(
+            id=item_id,
+            kind=kind,
+            source=source,
+            description=description,
+            value=value,
+            unit=unit,
+            confidence=confidence,
+            spatial_reference=(
+                dict(spatial_reference)
+                if spatial_reference
+                else None
+            ),
+            temporal_reference=(
+                dict(temporal_reference)
+                if temporal_reference
+                else None
+            ),
+            metadata=dict(
+                metadata or {}
+            ),
+        )
+
+        report.evidence_items.append(
+            item.to_dict()
+        )
+
+    # =========================================================================
+    # Context
+    # =========================================================================
+
+    @classmethod
+    def _collect_context(
+        cls,
+        report: StructuredEvidenceReport,
+        context: Mapping[str, Any],
+    ) -> None:
+
+        if not context:
+            return
+
+        spatial = cls._first_mapping(
+            context.get(
+                "spatial_context"
+            ),
+            context.get(
+                "active_map_context"
+            ),
+            context.get(
+                "map_context"
+            ),
+            context.get(
+                "active_aoi"
+            ),
+        )
+
+        if spatial:
+            report.evidence_graph[
+                "spatial_context"
+            ] = _remove_none(
+                spatial
+            )
+
+        temporal = cls._first_mapping(
+            context.get(
+                "time_range"
+            ),
+            context.get(
+                "temporal_context"
+            ),
+        )
+
+        if temporal:
+            report.evidence_graph[
+                "temporal_context"
+            ] = _remove_none(
+                temporal
+            )
+
+        assets = context.get(
+            "image_assets"
+        )
+
+        if isinstance(
+            assets,
+            list,
+        ) and assets:
+            report.evidence_graph[
+                "input_assets"
+            ] = [
+                _remove_none(
+                    dict(asset)
+                )
+                if isinstance(
+                    asset,
+                    Mapping,
+                )
+                else {
+                    "value": str(asset)
+                }
+                for asset in assets
+            ]
+
+        intent = context.get(
+            "intent"
+        )
+
+        if isinstance(
+            intent,
+            Mapping,
+        ):
+            report.evidence_graph[
+                "intent"
+            ] = _remove_none(
+                dict(intent)
+            )
+
+    # =========================================================================
+    # Evidence graph
+    # =========================================================================
+
+    @classmethod
+    def _determine_status(
+        cls,
+        report: StructuredEvidenceReport,
+    ) -> str:
+
+        if not report.has_core_evidence():
+            return "insufficient_evidence"
+
+        validation = report.validation
+
+        if validation.get(
+            "valid"
+        ) is False:
+            return "validation_warning"
+
+        if report.has_measurements():
+            return "complete"
+
+        if report.has_observations():
+            return "partial"
+
+        return "insufficient_evidence"
+
+    @staticmethod
+    def _sanitize_trace_item(
+        item: Mapping[str, Any],
+    ) -> dict[str, Any]:
+
+        allowed = (
+            "step",
+            "tool",
+            "status",
+            "latency_ms",
+            "optional",
+            "model_version",
+        )
+
+        return {
+            key: item.get(key)
+            for key in allowed
+            if item.get(key) is not None
+        }
+
+    @staticmethod
+    def _first_mapping(
+        *values: Any,
+    ) -> dict[str, Any] | None:
+
+        for value in values:
+            if isinstance(
+                value,
+                Mapping,
+            ):
+                if value:
+                    return dict(value)
+
+        return None
+
+    @staticmethod
+    def _count_duplicate_items(
+        items: list[dict[str, Any]],
+    ) -> int:
+
+        seen: set[str] = set()
+
+        duplicates = 0
+
+        for item in items:
+            normalized = repr(
+                _remove_none(item)
+            )
+
+            if normalized in seen:
+                duplicates += 1
+            else:
+                seen.add(
+                    normalized
+                )
+
+        return duplicates
+
+
+# ============================================================================
+# Module-level compatibility helpers
+# ============================================================================
+
+
+def build_evidence_report(
+    execution_results: Mapping[str, Any] | None = None,
+    input_context: Mapping[str, Any] | None = None,
+    query_text: str | None = None,
+    execution_trace: list[Mapping[str, Any]] | None = None,
+) -> StructuredEvidenceReport:
+
+    return EvidenceEngine.build_report(
+        execution_results=execution_results,
+        input_context=input_context,
+        query_text=query_text,
+        execution_trace=execution_trace,
+    )
+
+
+def build_evidence_graph(
+    execution_results: Mapping[str, Any] | None = None,
+    input_context: Mapping[str, Any] | None = None,
+    execution_trace: list[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+
+    return EvidenceEngine.build_evidence_graph(
+        execution_results=execution_results,
+        input_context=input_context,
+        execution_trace=execution_trace,
+    )

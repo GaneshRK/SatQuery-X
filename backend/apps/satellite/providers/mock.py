@@ -1,10 +1,38 @@
+"""
+Explicit mock satellite provider for tests only.
+
+WARNING:
+    These candidates are synthetic test fixtures.
+
+This provider must NEVER be used as an automatic production fallback.
+"""
+
 from __future__ import annotations
+
+from datetime import datetime, timedelta
 from typing import Any
-from .base import SatelliteCandidateDTO, SatelliteProvider
+
+from .base import (
+    SatelliteCandidateDTO,
+    SatelliteProvider,
+)
 
 
-class MockSatelliteProvider(SatelliteProvider):
-    name = "Test Fixture Mock Provider (Unit Tests Only)"
+class MockSatelliteProvider(
+    SatelliteProvider
+):
+    """
+    Deterministic test fixture provider.
+
+    This class exists so unit/integration tests can run without an external
+    Copernicus account or network connection.
+
+    It is intentionally marked synthetic.
+    """
+
+    name = (
+        "Test Fixture Mock Provider (Tests Only)"
+    )
 
     def search_scenes(
         self,
@@ -12,61 +40,190 @@ class MockSatelliteProvider(SatelliteProvider):
         date_start: str,
         date_end: str,
         sensor: str = "SENTINEL-2",
-        max_cloud_cover: float = 20.0,
+        max_cloud_cover: float | None = None,
         limit: int = 10,
     ) -> list[SatelliteCandidateDTO]:
-        date_str = date_end.replace("-", "")
-        start_str = date_start.replace("-", "")
+        if not isinstance(
+            aoi_geometry,
+            dict,
+        ):
+            raise ValueError(
+                "Mock provider requires a GeoJSON AOI."
+            )
 
-        is_s2 = "2" in sensor
-        if is_s2:
-            candidates = [
-                SatelliteCandidateDTO(
-                    stac_item_id=f"S2A_MSIL2A_{date_str}T051651_N0500_R062_T43REQ",
-                    collection="sentinel-2-l2a",
-                    sensor="SENTINEL-2",
-                    acquisition_date=date_end,
-                    cloud_cover_pct=2.4,
-                    footprint_geom=aoi_geometry or {"type": "Polygon", "coordinates": [[[93.0, 26.5], [93.25, 26.5], [93.25, 26.75], [93.0, 26.75], [93.0, 26.5]]]},
-                    thumbnail_url="https://browser.dataspace.copernicus.eu/sample_thumb_s2.jpg",
-                    provider="TEST_MOCK_ONLY",
-                    is_synthetic=True,
-                ),
-                SatelliteCandidateDTO(
-                    stac_item_id=f"S2B_MSIL2A_{start_str}T052649_N0500_R062_T43REQ",
-                    collection="sentinel-2-l2a",
-                    sensor="SENTINEL-2",
-                    acquisition_date=date_start,
-                    cloud_cover_pct=5.8,
-                    footprint_geom=aoi_geometry or {"type": "Polygon", "coordinates": [[[93.0, 26.5], [93.25, 26.5], [93.25, 26.75], [93.0, 26.75], [93.0, 26.5]]]},
-                    thumbnail_url="https://browser.dataspace.copernicus.eu/sample_thumb_s2b.jpg",
-                    provider="TEST_MOCK_ONLY",
-                    is_synthetic=True,
-                ),
-            ]
+        if not aoi_geometry.get(
+            "coordinates"
+        ):
+            raise ValueError(
+                "Mock provider requires AOI coordinates."
+            )
+
+        start = datetime.strptime(
+            date_start,
+            "%Y-%m-%d",
+        )
+
+        end = datetime.strptime(
+            date_end,
+            "%Y-%m-%d",
+        )
+
+        if start > end:
+            raise ValueError(
+                "date_start cannot be later than date_end."
+            )
+
+        limit = max(
+            1,
+            min(
+                int(limit),
+                100,
+            ),
+        )
+
+        normalized_sensor = (
+            str(sensor)
+            .strip()
+            .upper()
+        )
+
+        if "SENTINEL-1" in normalized_sensor:
+            collection = "sentinel-1-grd"
+            scene_prefix = "S1A"
         else:
+            collection = "sentinel-2-l2a"
+            scene_prefix = "S2A"
+
+        first_date = end
+        second_date = max(
+            start,
+            end - timedelta(
+                days=1
+            ),
+        )
+
+        candidates = [
+            SatelliteCandidateDTO(
+                stac_item_id=(
+                    f"TEST-{scene_prefix}-"
+                    f"{first_date:%Y%m%d}-001"
+                ),
+                collection=collection,
+                sensor=(
+                    "SENTINEL-1"
+                    if "SENTINEL-1"
+                    in normalized_sensor
+                    else "SENTINEL-2"
+                ),
+                acquisition_date=(
+                    first_date.strftime(
+                        "%Y-%m-%d"
+                    )
+                ),
+                cloud_cover_pct=(
+                    0.0
+                    if "SENTINEL-1"
+                    in normalized_sensor
+                    else 5.0
+                ),
+                footprint_geom=aoi_geometry,
+                thumbnail_url=None,
+                assets_summary={},
+                provider="TEST_MOCK_ONLY",
+                is_synthetic=True,
+                metadata={
+                    "fixture": True,
+                    "purpose": (
+                        "automated tests only"
+                    ),
+                },
+            ),
+            SatelliteCandidateDTO(
+                stac_item_id=(
+                    f"TEST-{scene_prefix}-"
+                    f"{second_date:%Y%m%d}-002"
+                ),
+                collection=collection,
+                sensor=(
+                    "SENTINEL-1"
+                    if "SENTINEL-1"
+                    in normalized_sensor
+                    else "SENTINEL-2"
+                ),
+                acquisition_date=(
+                    second_date.strftime(
+                        "%Y-%m-%d"
+                    )
+                ),
+                cloud_cover_pct=(
+                    0.0
+                    if "SENTINEL-1"
+                    in normalized_sensor
+                    else 8.0
+                ),
+                footprint_geom=aoi_geometry,
+                thumbnail_url=None,
+                assets_summary={},
+                provider="TEST_MOCK_ONLY",
+                is_synthetic=True,
+                metadata={
+                    "fixture": True,
+                    "purpose": (
+                        "automated tests only"
+                    ),
+                },
+            ),
+        ]
+
+        if max_cloud_cover is not None:
             candidates = [
-                SatelliteCandidateDTO(
-                    stac_item_id=f"S1A_IW_GRDH_1SDV_{date_str}T124500_049876_05FE12",
-                    collection="sentinel-1-grd",
-                    sensor="SENTINEL-1",
-                    acquisition_date=date_end,
-                    cloud_cover_pct=0.0,
-                    footprint_geom=aoi_geometry or {"type": "Polygon", "coordinates": [[[93.0, 26.5], [93.25, 26.5], [93.25, 26.75], [93.0, 26.75], [93.0, 26.5]]]},
-                    thumbnail_url="https://browser.dataspace.copernicus.eu/sample_thumb_s1.jpg",
-                    provider="TEST_MOCK_ONLY",
-                    is_synthetic=True,
+                candidate
+                for candidate in candidates
+                if (
+                    candidate.cloud_cover_pct
+                    is not None
+                    and candidate.cloud_cover_pct
+                    <= float(
+                        max_cloud_cover
+                    )
                 )
             ]
 
-        return [c for c in candidates if c.cloud_cover_pct <= max_cloud_cover][:limit]
+        return candidates[:limit]
 
-    def get_scene_metadata(self, stac_item_id: str) -> dict[str, Any]:
+    def get_scene_metadata(
+        self,
+        stac_item_id: str,
+    ) -> dict[str, Any]:
         return {
-            "stac_item_id": stac_item_id,
-            "provider": "mock_cdse",
-            "sensor": "SENTINEL-2" if "S2" in stac_item_id else "SENTINEL-1",
-            "resolution_m": 10.0,
-            "crs": "EPSG:4326",
-            "status": "SIMULATED_READY",
+            "stac_item_id": str(
+                stac_item_id
+            ),
+            "provider": (
+                "TEST_MOCK_ONLY"
+            ),
+            "synthetic": True,
+            "status": (
+                "TEST_FIXTURE"
+            ),
+            "warning": (
+                "This metadata is synthetic "
+                "test data and must not be "
+                "used as scientific evidence."
+            ),
         }
+
+    def health_check(
+        self,
+    ) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": "test_only",
+            "healthy": True,
+            "synthetic": True,
+        }
+
+
+__all__ = [
+    "MockSatelliteProvider",
+]

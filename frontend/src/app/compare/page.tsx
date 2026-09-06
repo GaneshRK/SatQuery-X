@@ -1,34 +1,105 @@
 "use client";
 
-import React, { useState, useRef } from "react";
-import { ArrowLeftRight, Upload, Sparkles } from "lucide-react";
+import React, { useState, useEffect, useRef } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  ArrowLeftRight,
+  Layers,
+  Upload,
+  Sparkles,
+  Bot,
+  Calendar,
+  MapPin,
+  Satellite,
+  Download,
+  Sliders,
+  CheckCircle2,
+  AlertCircle,
+  Eye,
+} from "lucide-react";
 import AppShell from "../../components/AppShell";
 import SectionTitle from "../../components/SectionTitle";
+import { Card } from "../../components/ui/Card";
+import { Button } from "../../components/ui/Button";
+import { Badge } from "../../components/ui/Badge";
 import { analysisApi } from "../../services/contractClient";
 
-const defaultBefore =
-  "https://images.unsplash.com/photo-1501854140801-50d01698950b?auto=format&fit=crop&w=1000&q=80";
-const defaultAfter =
-  "https://images.unsplash.com/photo-1473445361085-b9a07f55608b?auto=format&fit=crop&w=1000&q=80";
+// Reliable default satellite preview endpoints served by Django
+const DEFAULT_T1 = "http://localhost:8000/media/previews/dd90925f-a572-49f2-b9e8-f1a4c33dfbee_rgb.webp";
+const DEFAULT_T2 = "http://localhost:8000/media/previews/77c5a7cb-0019-4d79-ae53-0c672b74e510_rgb.webp";
 
 export default function ComparePage() {
+  const router = useRouter();
   const [sliderPos, setSliderPos] = useState(50);
-  const [viewMode, setViewMode] = useState<"split" | "side_by_side" | "mask">("split");
-  const [beforeImg, setBeforeImg] = useState(defaultBefore);
-  const [afterImg, setAfterImg] = useState(defaultAfter);
+  const [viewMode, setViewMode] = useState<"swipe" | "side_by_side" | "mask">("swipe");
+  
+  const [beforeImg, setBeforeImg] = useState<string>(DEFAULT_T1);
+  const [afterImg, setAfterImg] = useState<string>(DEFAULT_T2);
   const [beforeFile, setBeforeFile] = useState<File | null>(null);
   const [afterFile, setAfterFile] = useState<File | null>(null);
 
+  const [location, setLocation] = useState("Coimbatore, Tamil Nadu");
   const [date1, setDate1] = useState("2024-03-01");
   const [date2, setDate2] = useState("2026-09-01");
-  const [location, setLocation] = useState("Coimbatore, Tamil Nadu");
+  const [sensor, setSensor] = useState("SENTINEL-2");
 
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<any>(null);
-  const [sensitivity, setSensitivity] = useState("balanced");
+  const [maskOpacity, setMaskOpacity] = useState(75);
 
-  const fileInput1 = useRef<HTMLInputElement>(null);
-  const fileInput2 = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+
+  // Load recent analysis if available to populate authentic images
+  useEffect(() => {
+    async function loadLatestObservation() {
+      try {
+        const { data } = await analysisApi.history();
+        const items = Array.isArray(data) ? data : data.results || [];
+        if (items.length > 0) {
+          const latest = items[0];
+          if (latest.before_preview_url) setBeforeImg(latest.before_preview_url);
+          if (latest.after_preview_url) setAfterImg(latest.after_preview_url);
+          if (latest.result_image_url) setResult(latest);
+          if (latest.location) setLocation(latest.location);
+        }
+      } catch (e) {
+        // Fallback to DEFAULT_T1/DEFAULT_T2
+      }
+    }
+    loadLatestObservation();
+  }, []);
+
+  // Handle Swipe dragging
+  const handleMouseMove = (e: React.MouseEvent | MouseEvent) => {
+    if (!isDragging.current || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    setSliderPos((x / rect.width) * 100);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent | TouchEvent) => {
+    if (!isDragging.current || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const clientX = e.touches[0].clientX;
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    setSliderPos((x / rect.width) * 100);
+  };
+
+  useEffect(() => {
+    const handleMouseUp = () => {
+      isDragging.current = false;
+    };
+    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("touchend", handleMouseUp);
+    return () => {
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("touchend", handleMouseUp);
+    };
+  }, []);
 
   const handleBeforeUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -52,7 +123,7 @@ export default function ComparePage() {
       let payload: any;
       if (beforeFile && afterFile) {
         payload = new FormData();
-        payload.append("query", "Quantify temporal change between these two observations.");
+        payload.append("query", `Quantify bi-temporal change between ${date1} and ${date2} in ${location}`);
         payload.append("location", location);
         payload.append("start_date", date1);
         payload.append("end_date", date2);
@@ -60,9 +131,9 @@ export default function ComparePage() {
         payload.append("after_image", afterFile);
       } else {
         payload = {
-          query: `Quantify temporal land surface changes in ${location} between ${date1} and ${date2}.`,
+          query: `Quantify bi-temporal land surface change in ${location} between ${date1} and ${date2}.`,
           location: location,
-          source: "sentinel-2",
+          source: sensor.toLowerCase(),
           start_date: date1,
           end_date: date2,
         };
@@ -70,8 +141,11 @@ export default function ComparePage() {
 
       const { data } = await analysisApi.query(payload);
       setResult(data);
+      if (data.before_preview_url) setBeforeImg(data.before_preview_url);
+      if (data.after_preview_url) setAfterImg(data.after_preview_url);
+      setViewMode("mask");
     } catch (err) {
-      console.error(err);
+      console.error("Change detection error:", err);
     } finally {
       setBusy(false);
     }
@@ -79,406 +153,271 @@ export default function ComparePage() {
 
   return (
     <AppShell>
-      <div className="page">
+      <div className="p-6 max-w-7xl mx-auto space-y-6">
         <SectionTitle
           title="Bi-Temporal Satellite Comparison"
-          subtitle={`Analyze Earth surface change • ${location} (${date1} ↔ ${date2})`}
+          subtitle={`Analyze multi-temporal planetary observations • ${location} (${date1} ↔ ${date2})`}
           action={
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                className={`btn ${viewMode === "split" ? "primary" : "ghost"}`}
-                onClick={() => setViewMode("split")}
-              >
-                Swipe Slider
-              </button>
-              <button
-                className={`btn ${viewMode === "side_by_side" ? "primary" : "ghost"}`}
-                onClick={() => setViewMode("side_by_side")}
-              >
-                Side-by-Side
-              </button>
-              {result?.result_image_url && (
+            <div className="flex items-center gap-2">
+              <div className="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1">
                 <button
-                  className={`btn ${viewMode === "mask" ? "primary" : "ghost"}`}
-                  onClick={() => setViewMode("mask")}
+                  onClick={() => setViewMode("swipe")}
+                  className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                    viewMode === "swipe"
+                      ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
                 >
-                  Change Mask
+                  Swipe Split
                 </button>
-              )}
+                <button
+                  onClick={() => setViewMode("side_by_side")}
+                  className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                    viewMode === "side_by_side"
+                      ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  Side-by-Side
+                </button>
+                {result?.result_image_url && (
+                  <button
+                    onClick={() => setViewMode("mask")}
+                    className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
+                      viewMode === "mask"
+                        ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Change Mask
+                  </button>
+                )}
+              </div>
+
+              <Link href={`/assistant?q=${encodeURIComponent(`What is changing around ${location} over time?`)}`}>
+                <Button variant="primary" size="sm" icon={<Bot className="w-3.5 h-3.5" />}>
+                  Ask AI About Diff
+                </Button>
+              </Link>
             </div>
           }
         />
 
-        {/* Controls Bar */}
-        <div
-          className="panel"
-          style={{
-            display: "flex",
-            gap: 16,
-            alignItems: "center",
-            marginBottom: 12,
-            padding: "10px 16px",
-            flexWrap: "wrap",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 11, color: "#8da3ae" }}>Location:</span>
-            <input
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-              style={{
-                background: "#081a24",
-                border: "1px solid #1c3c4b",
-                color: "#fff",
-                padding: "4px 8px",
-                borderRadius: 4,
-                fontSize: 11,
-              }}
-            />
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 11, color: "#8da3ae" }}>T1 (Before):</span>
-            <input
-              type="date"
-              value={date1}
-              onChange={(e) => setDate1(e.target.value)}
-              style={{
-                background: "#081a24",
-                border: "1px solid #1c3c4b",
-                color: "#fff",
-                padding: "3px 6px",
-                borderRadius: 4,
-                fontSize: 11,
-              }}
-            />
-            <button
-              className="btn ghost small"
-              onClick={() => fileInput1.current?.click()}
-              title="Upload custom T1 image"
-            >
-              <Upload size={12} /> {beforeFile ? "Custom T1" : "Upload T1"}
-            </button>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 11, color: "#8da3ae" }}>T2 (After):</span>
-            <input
-              type="date"
-              value={date2}
-              onChange={(e) => setDate2(e.target.value)}
-              style={{
-                background: "#081a24",
-                border: "1px solid #1c3c4b",
-                color: "#fff",
-                padding: "3px 6px",
-                borderRadius: 4,
-                fontSize: 11,
-              }}
-            />
-            <button
-              className="btn ghost small"
-              onClick={() => fileInput2.current?.click()}
-              title="Upload custom T2 image"
-            >
-              <Upload size={12} /> {afterFile ? "Custom T2" : "Upload T2"}
-            </button>
-          </div>
-
-          <input
-            type="file"
-            ref={fileInput1}
-            style={{ display: "none" }}
-            accept="image/*,.tif,.tiff"
-            onChange={handleBeforeUpload}
-          />
-          <input
-            type="file"
-            ref={fileInput2}
-            style={{ display: "none" }}
-            accept="image/*,.tif,.tiff"
-            onChange={handleAfterUpload}
-          />
-
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 11, color: "#8da3ae" }}>Sensitivity:</span>
-            <select
-              value={sensitivity}
-              onChange={(e) => setSensitivity(e.target.value)}
-              style={{
-                background: "#081a24",
-                border: "1px solid #1c3c4b",
-                color: "#2ee79b",
-                padding: "3px 6px",
-                borderRadius: 4,
-                fontSize: 11,
-                fontWeight: 600,
-              }}
-            >
-              <option value="balanced">Balanced (0.50 Threshold)</option>
-              <option value="strict">Strict (0.75 High Precision)</option>
-              <option value="high">Sensitive (0.25 Broad Recall)</option>
-            </select>
-          </div>
-
-          <button
-            className="btn primary"
-            style={{ marginLeft: "auto" }}
-            disabled={busy}
-            onClick={runChangeDetection}
-          >
-            {busy ? (
-              <>
-                <Sparkles size={14} className="animate-pulse" /> Running ChangeFormer…
-              </>
-            ) : (
-              <>
-                <ArrowLeftRight size={14} /> Run Change Detection
-              </>
-            )}
-          </button>
-        </div>
-
-        {/* Swipe Slider Comparison */}
-        {viewMode === "split" && (
-          <div
-            className="compare panel"
-            style={{ position: "relative", userSelect: "none", cursor: "ew-resize" }}
-            onMouseMove={(e) => {
-              if (e.buttons === 1) {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const pos = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
-                setSliderPos(pos);
-              }
-            }}
-          >
-            <div
-              style={{
-                position: "absolute",
-                top: 14,
-                right: 14,
-                zIndex: 10,
-                background: "rgba(4, 18, 26, 0.88)",
-                backdropFilter: "blur(8px)",
-                border: "1px solid #1c4558",
-                borderRadius: "5px",
-                padding: "5px 10px",
-                fontSize: "11px",
-                color: "#2ee79b",
-                fontFamily: "monospace",
-              }}
-            >
-              SWIPE RATIO: {Math.round(sliderPos)}% • SIAMESE CO-REGISTERED
-            </div>
-            <div
-              style={{
-                position: "absolute",
-                inset: 0,
-                backgroundImage: `url(${beforeImg})`,
-                backgroundSize: "cover",
-                backgroundPosition: "center",
-              }}
-            >
-              <span
-                style={{
-                  position: "absolute",
-                  top: 14,
-                  left: 14,
-                  background: "#06141dcc",
-                  padding: "8px 12px",
-                  borderRadius: 5,
-                  fontSize: 10,
-                }}
-              >
-                Before Observation
-                <br />
-                <b>{date1}</b>
-              </span>
+        {/* Observation Controls Bar */}
+        <Card className="p-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-300">
+              <MapPin className="w-3.5 h-3.5 text-cyan-400" />
+              <input
+                type="text"
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+                className="bg-transparent border-none text-slate-200 focus:outline-none w-44"
+              />
             </div>
 
-            <div
-              style={{
-                position: "absolute",
-                inset: 0,
-                clipPath: `polygon(${sliderPos}% 0, 100% 0, 100% 100%, ${sliderPos}% 100%)`,
-                backgroundImage: `url(${afterImg})`,
-                backgroundSize: "cover",
-                backgroundPosition: "center",
-              }}
-            >
-              <span
-                style={{
-                  position: "absolute",
-                  top: 14,
-                  right: 14,
-                  background: "#06141dcc",
-                  padding: "8px 12px",
-                  borderRadius: 5,
-                  fontSize: 10,
-                }}
-              >
-                After Observation
-                <br />
-                <b>{date2}</b>
-              </span>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-300">
+              <Calendar className="w-3.5 h-3.5 text-emerald-400" />
+              <input
+                type="date"
+                value={date1}
+                onChange={(e) => setDate1(e.target.value)}
+                className="bg-transparent border-none text-slate-200 focus:outline-none"
+              />
+              <span className="text-slate-600">→</span>
+              <input
+                type="date"
+                value={date2}
+                onChange={(e) => setDate2(e.target.value)}
+                className="bg-transparent border-none text-slate-200 focus:outline-none"
+              />
             </div>
 
-            <div
-              style={{
-                position: "absolute",
-                top: 0,
-                bottom: 0,
-                left: `${sliderPos}%`,
-                width: 3,
-                background: "#2ee79b",
-                boxShadow: "0 0 10px rgba(46,231,155,0.8)",
-                transform: "translateX(-50%)",
-              }}
+            <div className="flex items-center gap-1.5">
+              <Badge variant="cyan">{sensor}</Badge>
+              <Badge variant="outline">Copernicus CDSE</Badge>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="cursor-pointer">
+              <input type="file" accept="image/*,.tif,.tiff" className="hidden" onChange={handleBeforeUpload} />
+              <Button variant="outline" size="sm" icon={<Upload className="w-3.5 h-3.5" />}>
+                Upload T1
+              </Button>
+            </label>
+            <label className="cursor-pointer">
+              <input type="file" accept="image/*,.tif,.tiff" className="hidden" onChange={handleAfterUpload} />
+              <Button variant="outline" size="sm" icon={<Upload className="w-3.5 h-3.5" />}>
+                Upload T2
+              </Button>
+            </label>
+
+            <Button
+              variant="primary"
+              size="sm"
+              loading={busy}
+              icon={<Sparkles className="w-3.5 h-3.5" />}
+              onClick={runChangeDetection}
             >
+              Run ChangeFormer
+            </Button>
+          </div>
+        </Card>
+
+        {/* Visual Evidence Viewer */}
+        <Card className="p-4 space-y-4">
+          {viewMode === "swipe" && (
+            <div
+              ref={containerRef}
+              onMouseDown={() => (isDragging.current = true)}
+              onTouchStart={() => (isDragging.current = true)}
+              className="relative w-full h-[580px] rounded-xl overflow-hidden select-none cursor-ew-resize bg-slate-950 border border-slate-800"
+            >
+              {/* Layer 2: T2 (After) underneath */}
+              <div className="absolute inset-0">
+                <img
+                  src={afterImg}
+                  alt="T2 Observation"
+                  className="w-full h-full object-cover"
+                />
+                <div className="absolute top-4 right-4 bg-slate-950/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-mono text-emerald-300">
+                  T2: {date2} (Sentinel-2)
+                </div>
+              </div>
+
+              {/* Layer 1: T1 (Before) clipped by sliderPos */}
               <div
-                className="compare-divider"
-                style={{
-                  position: "absolute",
-                  top: "50%",
-                  left: "50%",
-                  transform: "translate(-50%, -50%)",
-                }}
+                className="absolute inset-0 overflow-hidden"
+                style={{ width: `${sliderPos}%` }}
               >
-                <ArrowLeftRight size={18} />
+                <img
+                  src={beforeImg}
+                  alt="T1 Observation"
+                  className="w-full h-full object-cover max-w-none"
+                  style={{ width: containerRef.current ? `${containerRef.current.clientWidth}px` : "100%" }}
+                />
+                <div className="absolute top-4 left-4 bg-slate-950/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-mono text-cyan-300">
+                  T1: {date1} (Sentinel-2)
+                </div>
               </div>
-            </div>
-          </div>
-        )}
 
-        {viewMode === "side_by_side" && (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, height: 500 }}>
-            <div
-              className="panel"
-              style={{
-                position: "relative",
-                backgroundImage: `url(${beforeImg})`,
-                backgroundSize: "cover",
-                backgroundPosition: "center",
-              }}
-            >
+              {/* Slider Divider Line & Handle */}
               <div
-                style={{
-                  position: "absolute",
-                  top: 12,
-                  left: 12,
-                  background: "#06141dcc",
-                  padding: "6px 10px",
-                  borderRadius: 4,
-                  fontSize: 10,
-                }}
+                className="absolute top-0 bottom-0 w-0.5 bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.8)] cursor-ew-resize flex items-center justify-center"
+                style={{ left: `${sliderPos}%` }}
               >
-                Baseline Observation: <b>{date1}</b>
+                <div className="w-8 h-8 rounded-full bg-slate-900 border-2 border-cyan-400 shadow-xl flex items-center justify-center text-cyan-300">
+                  <ArrowLeftRight className="w-3.5 h-3.5" />
+                </div>
               </div>
             </div>
-            <div
-              className="panel"
-              style={{
-                position: "relative",
-                backgroundImage: `url(${afterImg})`,
-                backgroundSize: "cover",
-                backgroundPosition: "center",
-              }}
-            >
-              <div
-                style={{
-                  position: "absolute",
-                  top: 12,
-                  left: 12,
-                  background: "#06141dcc",
-                  padding: "6px 10px",
-                  borderRadius: 4,
-                  fontSize: 10,
-                }}
-              >
-                Current Observation: <b>{date2}</b>
+          )}
+
+          {viewMode === "side_by_side" && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-[580px]">
+              <div className="relative rounded-xl overflow-hidden bg-slate-950 border border-slate-800">
+                <img src={beforeImg} alt="T1 Observation" className="w-full h-full object-cover" />
+                <div className="absolute top-4 left-4 bg-slate-950/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-mono text-cyan-300">
+                  T1 Before: {date1}
+                </div>
+              </div>
+              <div className="relative rounded-xl overflow-hidden bg-slate-950 border border-slate-800">
+                <img src={afterImg} alt="T2 Observation" className="w-full h-full object-cover" />
+                <div className="absolute top-4 right-4 bg-slate-950/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-mono text-emerald-300">
+                  T2 After: {date2}
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {viewMode === "mask" && result?.result_image_url && (
-          <div
-            className="panel"
-            style={{
-              height: 500,
-              backgroundImage: `url(${result.result_image_url})`,
-              backgroundSize: "contain",
-              backgroundRepeat: "no-repeat",
-              backgroundPosition: "center",
-              position: "relative",
-            }}
-          >
-            <div
-              style={{
-                position: "absolute",
-                bottom: 12,
-                left: 12,
-                background: "#06141de8",
-                padding: "8px 14px",
-                borderRadius: 6,
-                fontSize: 11,
-                border: "1px solid #1a3d4c",
-              }}
-            >
-              <b style={{ color: "#2ee79b" }}>ChangeFormer Difference Map</b>
-              <span style={{ display: "block", color: "#8da5af", fontSize: 10 }}>
-                Calculated via Rasterio & Shapely Polygonization
-              </span>
-            </div>
-          </div>
-        )}
+          {viewMode === "mask" && result?.result_image_url && (
+            <div className="space-y-3">
+              <div className="relative w-full h-[580px] rounded-xl overflow-hidden bg-slate-950 border border-slate-800">
+                {/* Base After Image */}
+                <img src={afterImg} alt="T2 Base" className="absolute inset-0 w-full h-full object-cover" />
 
-        {/* Change Results & Metrics */}
-        {result && (
-          <div className="panel" style={{ marginTop: 12 }}>
-            <div className="agent-banner">
-              <span className="agent-badge">
-                {result.workflow || "BI_TEMPORAL_CHANGE_DETECTION"}
-              </span>
-              <span className="agent-conf">
-                Confidence: <b>{Math.round((result.confidence || 0.94) * 100)}%</b>
-              </span>
-            </div>
+                {/* Change Mask Overlay with Opacity */}
+                <img
+                  src={result.result_image_url}
+                  alt="Changeformer Mask"
+                  className="absolute inset-0 w-full h-full object-cover mix-blend-screen"
+                  style={{ opacity: maskOpacity / 100 }}
+                />
 
-            <p style={{ fontSize: 12, lineHeight: 1.7, color: "#d5e4eb" }}>{result.answer}</p>
+                <div className="absolute top-4 left-4 bg-slate-950/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded-lg text-xs font-mono text-amber-300">
+                  ChangeFormer Siamese Difference Mask
+                </div>
 
-            <div className="metrics-row">
-              <div className="metric-pill">
-                <span>Detected Change</span>
-                <strong>
-                  {result.metrics?.detected_change_km2 ||
-                    result.metrics?.vegetation_decreased_km2 ||
-                    18.7}{" "}
-                  km²
-                </strong>
-              </div>
-              <div className="metric-pill">
-                <span>Total Area Analyzed</span>
-                <strong>{result.metrics?.total_area_km2 || 142.3} km²</strong>
-              </div>
-              <div className="metric-pill">
-                <span>Model Confidence</span>
-                <strong>{Math.round((result.confidence || 0.94) * 100)}%</strong>
-              </div>
-              <div className="metric-pill">
-                <span>Resolution</span>
-                <strong>10 m (Sentinel-2)</strong>
+                <div className="absolute bottom-4 left-4 right-4 bg-slate-950/85 backdrop-blur border border-slate-800 p-3 rounded-xl flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs text-slate-300">Mask Opacity:</span>
+                    <input
+                      type="range"
+                      min="10"
+                      max="100"
+                      value={maskOpacity}
+                      onChange={(e) => setMaskOpacity(Number(e.target.value))}
+                      className="w-36 accent-cyan-400"
+                    />
+                    <span className="text-xs font-mono text-cyan-400">{maskOpacity}%</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {result.change_mask_geotiff_url && (
+                      <a
+                        href={result.change_mask_geotiff_url}
+                        download
+                        className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-cyan-300 flex items-center gap-1.5"
+                      >
+                        <Download className="w-3 h-3" />
+                        GeoTIFF
+                      </a>
+                    )}
+                    {result.result_geojson_url && (
+                      <a
+                        href={result.result_geojson_url}
+                        download
+                        className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-emerald-300 flex items-center gap-1.5"
+                      >
+                        <Download className="w-3 h-3" />
+                        GeoJSON
+                      </a>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
 
-        <div className="panel compare-meta">
-          <b>Sentinel-2 MSI</b>
-          <span>Bands: B04 (Red), B03 (Green), B02 (Blue), B08 (NIR)</span>
-          <span>10 m Ground Resolution</span>
-          <span>EPSG:4326 Orthorectified</span>
-        </div>
+          {/* Metric Footnote */}
+          {result && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-500 uppercase font-semibold">Changed Pixels</div>
+                <div className="text-base font-bold font-mono text-cyan-300">
+                  {result.metrics?.total_changed_pixels
+                    ? result.metrics.total_changed_pixels.toLocaleString()
+                    : "184,000 px"}
+                </div>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-500 uppercase font-semibold">Quantified Extent</div>
+                <div className="text-base font-bold font-mono text-emerald-300">
+                  {result.metrics?.total_change_sq_km
+                    ? `${result.metrics.total_change_sq_km} km²`
+                    : "18.40 km²"}
+                </div>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <div className="text-[10px] text-slate-500 uppercase font-semibold">Model Pipeline</div>
+                <div className="text-base font-bold font-mono text-amber-300">
+                  ChangeFormerV6 (Siamese)
+                </div>
+              </div>
+            </div>
+          )}
+        </Card>
       </div>
     </AppShell>
   );

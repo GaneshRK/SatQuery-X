@@ -1,64 +1,392 @@
-"""Bridge views implementing the exact SatQuery-AI-frontend-starter REST contract per BACKEND_CONTRACT.md."""
+"""
+Frontend REST contract bridge for SatQuery-X.
+
+This module keeps compatibility with the existing React frontend contract
+while routing requests through the real Django/DRF SatQuery-X subsystems.
+
+Design rules:
+- Authentication is required for user-owned analysis data.
+- No default/demo users are created automatically.
+- No synthetic imagery is generated.
+- No fabricated CRS, coordinates, dates, cloud cover, resolution,
+  measurements, confidence, or analysis results are returned.
+- Uploaded imagery is ingested through the normal imagery pipeline.
+- Queries are executed through the canonical query task/orchestration path.
+- User/session/project ownership is enforced.
+- Password/email verification endpoints never falsely claim that an action
+  happened when no delivery/verification service is configured.
+"""
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import os
 import uuid
 from typing import Any
 
-from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
-from django.shortcuts import get_object_or_404
+from django.db import transaction
+from django.core.files.base import ContentFile
 from rest_framework import permissions, status, views
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.accounts.models import Project
-from apps.agent.agent import Agent
+from apps.imagery.models import ImageAsset, ImagePair
+from apps.imagery.tasks import ingest_image_task
 from apps.queries.models import Query
+from apps.queries.tasks import run_query_task
 from apps.sessions.models import Session
 
 User = get_user_model()
 
 
-def get_or_create_default_user():
-    user, _ = User.objects.get_or_create(
-        username="analyst_default",
-        defaults={
-            "email": "analyst@satquery.ai",
-            "first_name": "SatQuery",
-            "last_name": "Analyst",
-            "role": "ANALYST",
-        },
-    )
-    if not user.has_usable_password():
-        user.set_password("password123")
-        user.save()
-    return user
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+
+def _user_payload(user: User) -> dict[str, Any]:
+    """Return the public frontend representation of a user."""
+
+    return {
+        "id": user.id,
+        "full_name": user.get_full_name() or user.username,
+        "email": user.email,
+    }
+
+
+def _normalise_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _parse_json(value: Any) -> Any:
+    """
+    Parse JSON supplied either as an already-decoded object or a string.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, (dict, list, tuple, int, float, bool)):
+        return value
+
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    return None
+
+
+def _parse_bbox(value: Any) -> list[float] | None:
+    """
+    Validate a GeoJSON-style numeric bbox represented as:
+        [west, south, east, north]
+    """
+
+    value = _parse_json(value)
+
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+
+    try:
+        bbox = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+
+    if not all(
+        -180.0 <= bbox[index] <= 180.0
+        for index in (0, 2)
+    ):
+        return None
+
+    if not all(
+        -90.0 <= bbox[index] <= 90.0
+        for index in (1, 3)
+    ):
+        return None
+
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        return None
+
+    return bbox
+
+
+def _decode_base64_file(
+    value: Any,
+    filename: str,
+) -> ContentFile | None:
+    """
+    Convert a data URL/base64 payload into a Django ContentFile.
+
+    This function performs no scientific interpretation of the bytes.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    encoded = value.strip()
+
+    if "," in encoded:
+        header, encoded = encoded.split(",", 1)
+
+        # Reject obvious non-image data URLs when a MIME type is supplied.
+        if header.lower().startswith("data:"):
+            mime = header[5:].split(";", 1)[0].lower()
+            if mime and not mime.startswith("image/"):
+                return None
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError, binascii.Error):
+        return None
+
+    if not raw:
+        return None
+
+    return ContentFile(raw, name=filename)
+
+
+def _file_format(filename: str) -> str:
+    """
+    Determine a storage/display format from the filename extension only.
+
+    This is not a georeferencing claim.
+    """
+
+    extension = os.path.splitext(filename or "")[1].lower()
+
+    mapping = {
+        ".tif": "GEOTIFF",
+        ".tiff": "GEOTIFF",
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".webp": "WEBP",
+        ".bmp": "BMP",
+    }
+
+    return mapping.get(extension, "UNKNOWN")
+
+
+def _request_sensor(request) -> str:
+    value = _normalise_text(request.data.get("source"))
+    return value.upper() if value else "UNKNOWN"
+
+
+def _request_date(value: Any):
+    """
+    Preserve an acquisition date only when it is explicitly supplied and
+    parseable by Django's DateField.
+    """
+
+    from datetime import date
+
+    text = _normalise_text(value)
+
+    if not text:
+        return None
+
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _asset_summary(asset: ImageAsset) -> dict[str, Any]:
+    """
+    Return actual stored imagery metadata.
+
+    Missing scientific metadata remains None.
+    """
+
+    return {
+        "id": str(asset.id),
+        "filename": (
+            getattr(asset, "original_filename", None)
+            or getattr(asset.file, "name", None)
+            or ""
+        ),
+        "sensor": getattr(asset, "sensor", None),
+        "modality": getattr(asset, "modality", None),
+        "processing_status": getattr(
+            asset,
+            "processing_status",
+            None,
+        ),
+        "acquisition_date": (
+            asset.acquisition_date.isoformat()
+            if getattr(asset, "acquisition_date", None)
+            else None
+        ),
+        "is_georeferenced": getattr(
+            asset,
+            "is_georeferenced",
+            None,
+        ),
+        "crs": getattr(asset, "crs", None),
+        "resolution_m": getattr(asset, "resolution_m", None),
+        "cloud_cover_pct": getattr(
+            asset,
+            "cloud_cover_pct",
+            None,
+        ),
+        "bounds_wgs84": getattr(
+            asset,
+            "bounds_wgs84",
+            None,
+        ),
+    }
+
+
+def _pair_summary(pair: ImagePair | None) -> dict[str, Any] | None:
+    if pair is None:
+        return None
+
+    return {
+        "id": str(pair.id),
+        "pair_type": getattr(pair, "pair_type", None),
+        "compatibility_status": getattr(
+            pair,
+            "compatibility_status",
+            None,
+        ),
+        "coregistration_status": getattr(
+            pair,
+            "coregistration_status",
+            None,
+        ),
+        "image_a_id": str(pair.image_a_id),
+        "image_b_id": str(pair.image_b_id),
+    }
+
+
+def _query_response(
+    query: Query,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Return a compatibility response without manufacturing analysis output.
+    """
+
+    payload: dict[str, Any] = {
+        "analysis_id": str(query.id),
+        "query_id": str(query.id),
+        "status": query.status,
+        "query": query.text,
+        "answer": query.answer,
+        "confidence": query.confidence,
+        "clarification_required": getattr(
+            query,
+            "clarification_required",
+            False,
+        ),
+        "clarification": getattr(
+            query,
+            "clarification",
+            None,
+        ),
+        "plan": query.plan,
+        "evidence_graph": query.evidence_graph,
+        "evidence_bundle": getattr(
+            query,
+            "evidence_bundle",
+            {},
+        ),
+        "answer_trace": getattr(
+            query,
+            "answer_trace",
+            [],
+        ),
+    }
+
+    if task_id:
+        payload["task_id"] = task_id
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
 
 
 class ContractRegisterView(views.APIView):
+    """
+    POST /api/auth/register/
+
+    Creates a real Django user and returns JWT credentials.
+    """
+
     permission_classes = [permissions.AllowAny]
 
-    def post(self, request):
-        email = request.data.get("email", "").strip().lower()
+    def post(self, request, *args, **kwargs):
+        email = _normalise_text(
+            request.data.get("email")
+        ).lower()
         password = request.data.get("password", "")
-        full_name = request.data.get("full_name", "").strip()
+        full_name = _normalise_text(
+            request.data.get("full_name")
+        )
 
         if not email or not password:
             return Response(
-                {"error": "Email and password are required."},
+                {
+                    "error": "Email and password are required.",
+                    "detail": "Email and password are required.",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        username = email.split("@")[0] if email else f"user_{uuid.uuid4().hex[:8]}"
-        if User.objects.filter(username=username).exists():
-            username = f"{username}_{uuid.uuid4().hex[:4]}"
+        if len(password) < 8:
+            return Response(
+                {
+                    "error": "Password must contain at least 8 characters.",
+                    "detail": "Password must contain at least 8 characters.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        names = full_name.split(" ", 1)
-        first_name = names[0] if names else ""
-        last_name = names[1] if len(names) > 1 else ""
+        if User.objects.filter(
+            email__iexact=email
+        ).exists():
+            return Response(
+                {
+                    "error": "An account with this email already exists.",
+                    "detail": "An account with this email already exists.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        username_base = (
+            email.split("@", 1)[0]
+            or f"user_{uuid.uuid4().hex[:8]}"
+        )
+
+        username = username_base
+
+        while User.objects.filter(
+            username=username
+        ).exists():
+            username = (
+                f"{username_base}_{uuid.uuid4().hex[:6]}"
+            )
+
+        name_parts = full_name.split(" ", 1)
+
+        first_name = name_parts[0] if name_parts else ""
+        last_name = (
+            name_parts[1]
+            if len(name_parts) > 1
+            else ""
+        )
 
         user = User.objects.create_user(
             username=username,
@@ -70,534 +398,882 @@ class ContractRegisterView(views.APIView):
         )
 
         refresh = RefreshToken.for_user(user)
+
         return Response(
             {
                 "access": str(refresh.access_token),
                 "refresh": str(refresh),
-                "user": {
-                    "id": user.id,
-                    "full_name": full_name or user.username,
-                    "email": user.email,
-                },
+                "user": _user_payload(user),
             },
             status=status.HTTP_201_CREATED,
         )
 
 
 class ContractLoginView(views.APIView):
+    """
+    POST /api/auth/login/
+
+    Authenticates against the actual Django user database.
+    """
+
     permission_classes = [permissions.AllowAny]
 
-    def post(self, request):
-        email = request.data.get("email", "").strip().lower()
+    def post(self, request, *args, **kwargs):
+        email = _normalise_text(
+            request.data.get("email")
+        ).lower()
+        username = _normalise_text(
+            request.data.get("username")
+        )
         password = request.data.get("password", "")
 
         user = None
+
         if email:
-            u_cand = User.objects.filter(email__iexact=email).first()
-            if u_cand and u_cand.check_password(password):
-                user = u_cand
+            candidate = (
+                User.objects
+                .filter(email__iexact=email)
+                .first()
+            )
 
-        if not user:
-            # Fallback to authenticating with username
-            user = authenticate(username=request.data.get("username", email), password=password)
+            if candidate and candidate.check_password(password):
+                user = candidate
 
-        if not user:
-            # Check demo user
-            if email in ("ganesh@example.com", "demo@satquery.ai") and password:
-                user, _ = User.objects.get_or_create(
-                    username="demo_analyst",
-                    defaults={"email": email, "first_name": "Demo", "last_name": "Analyst"},
-                )
-                user.set_password(password)
-                user.save()
-            else:
-                return Response(
-                    {"error": "Invalid email or password.", "detail": "Invalid email or password."},
-                    status=status.HTTP_401_UNAUTHORIZED,
-                )
+        if user is None:
+            user = authenticate(
+                request=request,
+                username=username or email,
+                password=password,
+            )
+
+        if user is None:
+            return Response(
+                {
+                    "error": "Invalid email or password.",
+                    "detail": "Invalid email or password.",
+                },
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not user.is_active:
+            return Response(
+                {
+                    "error": "This account is inactive.",
+                    "detail": "This account is inactive.",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         refresh = RefreshToken.for_user(user)
-        return Response({
-            "access": str(refresh.access_token),
-            "refresh": str(refresh),
-            "user": {
-                "id": user.id,
-                "full_name": user.get_full_name() or user.username,
-                "email": user.email,
+
+        return Response(
+            {
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+                "user": _user_payload(user),
             },
-        })
+            status=status.HTTP_200_OK,
+        )
 
 
 class ContractMeView(views.APIView):
+    """
+    GET /api/auth/me/
+    """
+
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request):
-        user = request.user
-        return Response({
-            "id": user.id,
-            "full_name": user.get_full_name() or user.username,
-            "email": user.email,
-        })
+    def get(self, request, *args, **kwargs):
+        return Response(
+            _user_payload(request.user),
+            status=status.HTTP_200_OK,
+        )
 
 
 class ContractForgotPasswordView(views.APIView):
+    """
+    Password reset compatibility endpoint.
+
+    A real email/SMS delivery provider must be configured before this
+    endpoint can honestly claim that a reset message was sent.
+    """
+
     permission_classes = [permissions.AllowAny]
 
-    def post(self, request):
-        email = request.data.get("email", "")
-        return Response({"message": f"Password reset instructions sent to {email}."})
+    def post(self, request, *args, **kwargs):
+        email = _normalise_text(
+            request.data.get("email")
+        ).lower()
+
+        if not email:
+            return Response(
+                {
+                    "error": "Email is required.",
+                    "detail": "Email is required.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Do not reveal whether an account exists.
+        # No external reset-delivery service is assumed here.
+        return Response(
+            {
+                "message": (
+                    "Password reset delivery is not configured. "
+                    "No reset message was sent."
+                ),
+                "configured": False,
+            },
+            status=status.HTTP_501_NOT_IMPLEMENTED,
+        )
 
 
 class ContractVerifyEmailView(views.APIView):
-    permission_classes = [permissions.AllowAny]
+    """
+    Email verification compatibility endpoint.
 
-    def post(self, request):
-        return Response({"message": "Email verified successfully."})
+    Verification must be implemented through a real verification-token
+    workflow before an account can be marked verified.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        return Response(
+            {
+                "message": (
+                    "Email verification is not configured. "
+                    "The account was not marked as verified."
+                ),
+                "verified": False,
+                "configured": False,
+            },
+            status=status.HTTP_501_NOT_IMPLEMENTED,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
 
 
 class ContractAnalysisQueryView(views.APIView):
     """
     POST /api/analysis/query/
-    Accepts natural language query, optional location, sensor, dates, bbox,
-    and optional uploaded imagery (single image, before/after bi-temporal pair, or optical+SAR pair).
-    Supports multipart/form-data and base64 payloads.
-    Runs SatQuery AI Agent & returns structured answer, metrics, result images, and agent execution trace.
+
+    Compatibility bridge for the existing frontend analysis contract.
+
+    Supported inputs include:
+
+    - query
+    - location
+    - source
+    - start_date
+    - end_date
+    - bbox
+    - image / file
+    - before_image / image_before
+    - after_image / image_after
+    - optical_image
+    - sar_image
+    - image_base64
+    - before_image_base64
+    - after_image_base64
+
+    The bridge creates real ImageAsset records and sends the query through
+    the canonical SatQuery-X query task.
+
+    It never assigns georeferencing or scientific metadata merely because
+    the frontend supplied a location or date range.
     """
-    permission_classes = [permissions.AllowAny]
 
-    def post(self, request):
-        import base64
-        import os
-        from django.core.files.base import ContentFile
-        from apps.imagery.models import ImageAsset, ImagePair
+    permission_classes = [permissions.IsAuthenticated]
 
-        query_text = request.data.get("query", "").strip()
+    def _get_or_create_session(
+        self,
+        request,
+    ) -> Session:
+        """
+        Reuse an explicitly supplied authenticated session when possible;
+        otherwise create a normal workspace session.
+        """
+
+        requested_id = _normalise_text(
+            request.data.get("session_id")
+        )
+
+        if requested_id:
+            session = (
+                Session.objects
+                .filter(
+                    id=requested_id,
+                    user=request.user,
+                )
+                .first()
+            )
+
+            if session is None:
+                raise ValueError(
+                    "The requested session does not exist "
+                    "or does not belong to the authenticated user."
+                )
+
+            return session
+
+        session = (
+            Session.objects
+            .filter(
+                user=request.user,
+                status="active",
+            )
+            .order_by("-updated_at")
+            .first()
+        )
+
+        if session is not None:
+            return session
+
+        return Session.objects.create(
+            user=request.user,
+            name="SatQuery-X Analysis Workspace",
+        )
+
+    def _create_asset(
+        self,
+        *,
+        session: Session,
+        file_obj,
+        modality: str = "UNKNOWN",
+        sensor: str = "UNKNOWN",
+        acquisition_date=None,
+    ) -> ImageAsset:
+        """
+        Create an asset without claiming that it is georeferenced or
+        scientifically calibrated.
+        """
+
+        filename = (
+            getattr(file_obj, "name", None)
+            or "uploaded_image"
+        )
+
+        return ImageAsset.objects.create(
+            session=session,
+            file=file_obj,
+            original_filename=filename,
+            file_format=_file_format(filename),
+            sensor=sensor or "UNKNOWN",
+            modality=modality or "UNKNOWN",
+            acquisition_date=acquisition_date,
+            processing_status="PENDING",
+            is_georeferenced=False,
+        )
+
+    def _ingest_asset(self, asset: ImageAsset) -> None:
+        """
+        Queue normal imagery ingestion.
+
+        The ingestion worker is responsible for discovering real metadata.
+        """
+
+        ingest_image_task.delay(str(asset.id))
+
+    def _update_session_context(
+        self,
+        session: Session,
+        *,
+        location: str | None,
+        bbox: list[float] | None,
+        source: str,
+        start_date: Any,
+        end_date: Any,
+        assets: list[ImageAsset],
+    ) -> None:
+        context = dict(
+            getattr(
+                session,
+                "conversation_context",
+                {},
+            )
+            or {}
+        )
+
+        if bbox:
+            context["current_viewport"] = {
+                "west": bbox[0],
+                "south": bbox[1],
+                "east": bbox[2],
+                "north": bbox[3],
+            }
+
+        if location:
+            # Location text is context, not fabricated geospatial geometry.
+            context["active_location"] = location
+
+        if start_date or end_date:
+            context["time_range"] = {
+                "start": start_date,
+                "end": end_date,
+            }
+
+        if source:
+            context["requested_sensor"] = source.upper()
+
+        context["input_asset_ids"] = [
+            str(asset.id)
+            for asset in assets
+        ]
+
+        context["has_images"] = bool(assets)
+        context["image_count"] = len(assets)
+
+        session.conversation_context = context
+
+        session.save(
+            update_fields=["conversation_context"]
+        )
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        query_text = _normalise_text(
+            request.data.get("query")
+        )
+
         if not query_text:
             return Response(
-                {"error": "Query text cannot be empty.", "detail": "Query text cannot be empty."},
+                {
+                    "error": "Query text cannot be empty.",
+                    "detail": "Query text cannot be empty.",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        raw_location = request.data.get("location")
-        location = raw_location.strip() if (raw_location and isinstance(raw_location, str) and raw_location.strip()) else None
+        try:
+            session = self._get_or_create_session(request)
+        except ValueError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
-        source = request.data.get("source", "sentinel-2")
-        start_date = request.data.get("start_date", "2024-01-01")
-        end_date = request.data.get("end_date", "2026-09-01")
-        bbox = request.data.get("bbox")
-        if isinstance(bbox, str):
-            try:
-                bbox = json.loads(bbox)
-            except Exception:
-                bbox = None
+        location = _normalise_text(
+            request.data.get("location")
+        ) or None
 
-        user = request.user if (request.user and request.user.is_authenticated) else get_or_create_default_user()
+        source = _request_sensor(request)
 
-        # Get or create active session
-        session, _ = Session.objects.get_or_create(
-            user=user,
-            status="active",
-            name="Frontend Starter Analysis",
-            defaults={"conversation_history": [], "conversation_context": {}},
+        start_date_raw = _normalise_text(
+            request.data.get("start_date")
+        )
+        end_date_raw = _normalise_text(
+            request.data.get("end_date")
         )
 
-        def _save_file_asset(file_obj, modality="OPTICAL", sensor="UNKNOWN", acq_date=None, default_name="image.png"):
-            filename = getattr(file_obj, "name", default_name)
-            ext = os.path.splitext(filename)[1].upper().replace(".", "")
-            fmt = "GEOTIFF" if ext in ("TIF", "TIFF") else ("PNG" if ext == "PNG" else "JPEG")
-            asset = ImageAsset.objects.create(
-                session=session,
-                file=file_obj,
-                original_filename=filename,
-                file_format=fmt,
-                sensor=sensor,
-                modality=modality,
-                acquisition_date=acq_date,
-                processing_status="VALIDATED",
-                is_georeferenced=False,
+        bbox = _parse_bbox(
+            request.data.get("bbox")
+        )
+
+        before_file = (
+            request.FILES.get("before_image")
+            or request.FILES.get("image_before")
+        )
+
+        after_file = (
+            request.FILES.get("after_image")
+            or request.FILES.get("image_after")
+        )
+
+        optical_file = request.FILES.get(
+            "optical_image"
+        )
+
+        sar_file = request.FILES.get(
+            "sar_image"
+        )
+
+        single_file = (
+            request.FILES.get("image")
+            or request.FILES.get("file")
+        )
+
+        if before_file is None:
+            before_file = _decode_base64_file(
+                request.data.get(
+                    "before_image_base64"
+                ),
+                "before_image",
             )
-            return asset
 
-        def _parse_base64(data_str, name="image.png"):
-            if not data_str or not isinstance(data_str, str):
-                return None
-            if "," in data_str:
-                _, data_str = data_str.split(",", 1)
-            try:
-                decoded = base64.b64decode(data_str)
-                return ContentFile(decoded, name=name)
-            except Exception:
-                return None
+        if after_file is None:
+            after_file = _decode_base64_file(
+                request.data.get(
+                    "after_image_base64"
+                ),
+                "after_image",
+            )
 
-        # Inspect uploaded files
-        before_file = request.FILES.get("before_image") or request.FILES.get("image_before")
-        after_file = request.FILES.get("after_image") or request.FILES.get("image_after")
-        optical_file = request.FILES.get("optical_image")
-        sar_file = request.FILES.get("sar_image")
-        single_file = request.FILES.get("image") or request.FILES.get("file")
+        if single_file is None:
+            single_file = _decode_base64_file(
+                request.data.get(
+                    "image_base64"
+                ),
+                "uploaded_image",
+            )
 
-        # Inspect base64 fallbacks
-        if not before_file and request.data.get("before_image_base64"):
-            before_file = _parse_base64(request.data.get("before_image_base64"), "before.png")
-        if not after_file and request.data.get("after_image_base64"):
-            after_file = _parse_base64(request.data.get("after_image_base64"), "after.png")
-        if not single_file and request.data.get("image_base64"):
-            single_file = _parse_base64(request.data.get("image_base64"), "upload.png")
+        assets: list[ImageAsset] = []
 
-        # Create Query record
-        query_obj = Query.objects.create(session=session, user=user, text=query_text)
-
-        uploaded_assets = []
         if before_file and after_file:
-            a_before = _save_file_asset(before_file, modality="OPTICAL", sensor=source.upper(), acq_date=start_date, default_name="before.png")
-            a_after = _save_file_asset(after_file, modality="OPTICAL", sensor=source.upper(), acq_date=end_date, default_name="after.png")
-            pair, _ = ImagePair.objects.get_or_create(
+            before_asset = self._create_asset(
                 session=session,
-                image_a=a_before,
-                image_b=a_after,
-                pair_type="BI_TEMPORAL",
-                defaults={"compatibility_status": "COMPATIBLE", "coregistration_status": "DONE"},
+                file_obj=before_file,
+                modality="OPTICAL",
+                sensor=source,
+                acquisition_date=_request_date(
+                    start_date_raw
+                ),
             )
-            query_obj.image_pair = pair
-            query_obj.save(update_fields=["image_pair"])
-            uploaded_assets = [a_before, a_after]
+
+            after_asset = self._create_asset(
+                session=session,
+                file_obj=after_file,
+                modality="OPTICAL",
+                sensor=source,
+                acquisition_date=_request_date(
+                    end_date_raw
+                ),
+            )
+
+            assets.extend(
+                [
+                    before_asset,
+                    after_asset,
+                ]
+            )
+
         elif optical_file and sar_file:
-            a_opt = _save_file_asset(optical_file, modality="OPTICAL", sensor="SENTINEL-2", acq_date=start_date, default_name="optical.png")
-            a_sar = _save_file_asset(sar_file, modality="SAR", sensor="SENTINEL-1", acq_date=start_date, default_name="sar.png")
-            pair, _ = ImagePair.objects.get_or_create(
+            optical_asset = self._create_asset(
                 session=session,
-                image_a=a_opt,
-                image_b=a_sar,
-                pair_type="CROSS_MODAL",
-                defaults={"compatibility_status": "COMPATIBLE", "coregistration_status": "DONE"},
+                file_obj=optical_file,
+                modality="OPTICAL",
+                sensor="UNKNOWN",
+                acquisition_date=_request_date(
+                    start_date_raw
+                ),
             )
-            query_obj.image_pair = pair
-            query_obj.save(update_fields=["image_pair"])
-            uploaded_assets = [a_opt, a_sar]
+
+            sar_asset = self._create_asset(
+                session=session,
+                file_obj=sar_file,
+                modality="SAR",
+                sensor="UNKNOWN",
+                acquisition_date=_request_date(
+                    start_date_raw
+                ),
+            )
+
+            assets.extend(
+                [
+                    optical_asset,
+                    sar_asset,
+                ]
+            )
+
         elif single_file:
-            a_single = _save_file_asset(single_file, modality="OPTICAL", sensor=source.upper(), acq_date=start_date, default_name="single.png")
-            query_obj.image = a_single
-            query_obj.save(update_fields=["image"])
-            uploaded_assets = [a_single]
-
-        # Populate conversation context
-        ctx = dict(session.conversation_context or {})
-        if bbox and len(bbox) == 4:
-            ctx["current_viewport"] = {
-                "west": float(bbox[0]),
-                "south": float(bbox[1]),
-                "east": float(bbox[2]),
-                "north": float(bbox[3]),
-            }
-        if location:
-            ctx["active_aoi"] = {"name": location, "bbox": bbox or [76.7, 10.9, 77.2, 11.2]}
-        elif not uploaded_assets and not bbox and not (session.conversation_history) and "active_aoi" in ctx:
-            # Clear stale AOI only if brand-new session with no conversation history
-            del ctx["active_aoi"]
-
-        ctx["time_range"] = {"start": start_date, "end": end_date}
-        ctx["sensor"] = source.upper()
-        if uploaded_assets:
-            ctx["has_images"] = True
-            ctx["image_count"] = len(uploaded_assets)
-        else:
-            ctx["has_images"] = False
-            ctx["image_count"] = 0
-
-        session.conversation_context = ctx
-        session.save(update_fields=["conversation_context"])
-
-        # Run SatQuery Agent
-        result = Agent.run(query_obj, session_context=ctx)
-
-        # Check clarification
-        clarification_required = (
-            result.get("clarification_required")
-            or getattr(query_obj, "structured_plan", {}).get("clarification_prompt") is not None
-        )
-        clarification_prompt = result.get("answer") if clarification_required else None
-        clarification_options = result.get("clarification_options", [])
-
-        # Extract agent execution steps (11-stage trace or planner steps)
-        agent_steps = []
-        if result.get("agent_steps"):
-            agent_steps = result["agent_steps"]
-        else:
-            raw_steps = []
-            if isinstance(query_obj.plan, dict) and "steps" in query_obj.plan:
-                raw_steps = query_obj.plan.get("steps", [])
-            elif isinstance(query_obj.plan, list):
-                raw_steps = query_obj.plan
-            elif isinstance(query_obj.structured_plan, dict) and "steps" in query_obj.structured_plan:
-                raw_steps = query_obj.structured_plan.get("steps", [])
-
-            for step in raw_steps:
-                tool_name = step.get("tool", "agent_step")
-                desc = step.get("action", step.get("description", tool_name))
-                agent_steps.append({"tool": tool_name, "action": desc, "status": "COMPLETED"})
-
-        workflow = query_obj.detected_mode or result.get("mode") or "SINGLE_IMAGE"
-
-        # Build structured observations and visual previews (decoupling scientific GeoTIFFs from browser visuals)
-        from apps.imagery.services.artifacts import register_imagery_artifacts, make_absolute_url
-        from apps.imagery.services.preview import generate_change_mask_artifact
-
-        asset_a = None
-        asset_b = None
-        if query_obj.image_pair:
-            asset_a = query_obj.image_pair.image_a
-            asset_b = query_obj.image_pair.image_b
-        elif query_obj.image:
-            asset_a = query_obj.image
-
-        observations = {}
-        if asset_a:
-            dto_a = register_imagery_artifacts(asset_a)
-            bounds_a = asset_a.bounds_wgs84 or (
-                [ctx.get("active_aoi", {}).get("bbox")[0], ctx.get("active_aoi", {}).get("bbox")[1],
-                 ctx.get("active_aoi", {}).get("bbox")[2], ctx.get("active_aoi", {}).get("bbox")[3]]
-                if ctx.get("active_aoi", {}).get("bbox") else [76.85, 10.95, 77.10, 11.15]
+            single_asset = self._create_asset(
+                session=session,
+                file_obj=single_file,
+                modality="UNKNOWN",
+                sensor=source,
+                acquisition_date=_request_date(
+                    start_date_raw
+                ),
             )
-            acq_date_a = str(asset_a.acquisition_date) if asset_a.acquisition_date else (start_date or "2024-03-15")
-            observations["t1"] = {
-                "id": str(asset_a.id),
-                "date": acq_date_a,
-                "satellite": "Sentinel-2" if "2" in (asset_a.sensor or "").upper() else (asset_a.sensor or "Sentinel-2"),
-                "product": "L2A (Surface Reflectance)",
-                "source": "Copernicus CDSE",
-                "geotiff_url": make_absolute_url(dto_a.geotiff_url, request),
-                "preview_url": make_absolute_url(dto_a.preview_url, request),
-                "thumbnail_url": make_absolute_url(dto_a.thumbnail_url, request),
-                "bounds": bounds_a,
-                "cloud_cover_pct": float(asset_a.cloud_cover_pct or 1.2),
-                "resolution_m": float(asset_a.resolution_m or 10.0),
-            }
 
-        if asset_b:
-            dto_b = register_imagery_artifacts(asset_b)
-            bounds_b = asset_b.bounds_wgs84 or observations.get("t1", {}).get("bounds", [76.85, 10.95, 77.10, 11.15])
-            acq_date_b = str(asset_b.acquisition_date) if asset_b.acquisition_date else (end_date or "2024-09-02")
-            observations["t2"] = {
-                "label": "T2 Comparison Observation",
-                "sensor": asset_b.sensor or "SENTINEL-2",
-                "date": asset_b.acquisition_date.strftime("%Y-%m-%d") if asset_b.acquisition_date else "2026-09-05",
-                "preview_url": art_b["preview_url"],
-                "geotiff_url": art_b["geotiff_url"],
-                "metadata_url": art_b["metadata_url"],
-                "bounds": [76.85, 10.95, 77.10, 11.15],
-                "cloud_cover_pct": float(asset_b.cloud_cover_pct or 2.4),
-                "resolution_m": float(asset_b.resolution_m or 10.0),
-            }
+            assets.append(single_asset)
 
-        # Build analysis artifacts (Visual WebP/PNG Mask, GeoTIFF Mask, GeoJSON, Evidence JSON)
-        is_change_task = (
-            workflow in ("BI_TEMPORAL", "THERMAL_HOTSPOT")
-            or "change" in (query_obj.detected_task or "").lower()
-            or (result.get("metrics") and "detected_change_km2" in result["metrics"])
-            or bool(observations.get("t2"))
+        elif any(
+            value is not None
+            for value in (
+                before_file,
+                after_file,
+                optical_file,
+                sar_file,
+            )
+        ):
+            return Response(
+                {
+                    "error": (
+                        "The supplied imagery inputs do not form a "
+                        "supported image request."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        self._update_session_context(
+            session,
+            location=location,
+            bbox=bbox,
+            source=source,
+            start_date=start_date_raw or None,
+            end_date=end_date_raw or None,
+            assets=assets,
         )
 
-        analysis_artifacts = {}
-        if is_change_task:
-            t1_bounds = observations.get("t1", {}).get("bounds") if observations.get("t1") else None
-            bounds_dict = {
-                "west": t1_bounds[0],
-                "south": t1_bounds[1],
-                "east": t1_bounds[2],
-                "north": t1_bounds[3],
-            } if isinstance(t1_bounds, list) and len(t1_bounds) == 4 else {
-                "west": float(bbox[0]) if bbox and len(bbox) == 4 else 76.85,
-                "south": float(bbox[1]) if bbox and len(bbox) == 4 else 10.95,
-                "east": float(bbox[2]) if bbox and len(bbox) == 4 else 77.10,
-                "north": float(bbox[3]) if bbox and len(bbox) == 4 else 11.15,
-            }
-            mask_res = generate_change_mask_artifact(str(query_obj.id), bounds_dict)
-            mask_url = f"{settings.MEDIA_URL}results/{mask_res.get('mask_webp_fname', f'{query_obj.id}_mask.png')}"
-            mask_tif_url = f"{settings.MEDIA_URL}results/{mask_res.get('mask_tif_fname', f'{query_obj.id}_mask.tif')}"
-            geojson_url = f"{settings.MEDIA_URL}results/{mask_res.get('geojson_fname', f'{query_obj.id}_polygons.geojson')}"
-            evidence_json_url = f"{settings.MEDIA_URL}results/{query_obj.id}_evidence.json"
-            hotspot_fname = f"{query_obj.id}_hotspots.geojson"
-            hotspot_path = os.path.join(settings.MEDIA_ROOT, "results", hotspot_fname)
-            heatmap_url = make_absolute_url(f"{settings.MEDIA_URL}results/{hotspot_fname}", request) if os.path.exists(hotspot_path) else None
-
-            analysis_artifacts = {
-                "change_mask_url": make_absolute_url(mask_url, request),
-                "change_mask_geotiff_url": make_absolute_url(mask_tif_url, request),
-                "change_geojson_url": make_absolute_url(geojson_url, request),
-                "heatmap_geojson_url": heatmap_url,
-                "evidence_json_url": make_absolute_url(evidence_json_url, request),
-            }
-        else:
-            geojson_url = f"{settings.MEDIA_URL}results/{query_obj.id}.geojson"
-            evidence_json_url = f"{settings.MEDIA_URL}results/{query_obj.id}_evidence.json"
-            hotspot_fname = f"{query_obj.id}_hotspots.geojson"
-            hotspot_path = os.path.join(settings.MEDIA_ROOT, "results", hotspot_fname)
-            heatmap_url = make_absolute_url(f"{settings.MEDIA_URL}results/{hotspot_fname}", request) if os.path.exists(hotspot_path) else None
-
-            analysis_artifacts = {
-                "change_mask_url": None,
-                "change_mask_geotiff_url": None,
-                "change_geojson_url": make_absolute_url(geojson_url, request),
-                "heatmap_geojson_url": heatmap_url,
-                "evidence_json_url": make_absolute_url(evidence_json_url, request),
-            }
-
-        before_preview_url = observations.get("t1", {}).get("preview_url")
-        after_preview_url = observations.get("t2", {}).get("preview_url")
-        before_geotiff_url = observations.get("t1", {}).get("geotiff_url")
-        after_geotiff_url = observations.get("t2", {}).get("geotiff_url")
-        change_mask_url = analysis_artifacts.get("change_mask_url")
-        change_mask_geotiff_url = analysis_artifacts.get("change_mask_geotiff_url")
-        geojson_url = analysis_artifacts.get("change_geojson_url")
-        heatmap_geojson_url = analysis_artifacts.get("heatmap_geojson_url")
-        evidence_json_url = analysis_artifacts.get("evidence_json_url")
-
-        # Dynamically compute metrics from real GIS rasters via EvidenceEngine without static fallbacks
-        from apps.agent.evidence_engine import EvidenceEngine
-        metrics = result.get("metrics") or EvidenceEngine.extract_dynamic_metrics(
-            query_obj=query_obj,
-            step_outputs=result.get("step_outputs"),
-            image_assets=uploaded_assets,
-            image_pair=query_obj.image_pair,
-        )
-        if "aoi_total_area_km2" in metrics and "total_area_km2" not in metrics:
-            metrics["total_area_km2"] = metrics["aoi_total_area_km2"]
-        if "detected_change_km2" in metrics and "vegetation_decreased_km2" not in metrics:
-            metrics["vegetation_decreased_km2"] = metrics["detected_change_km2"]
-
-        # Ensure evidence chain is present with exact pixel count and CRS separation
-        chg_val = metrics.get("detected_change_km2") or metrics.get("vegetation_decreased_km2") or 18.4
-        if "evidence_chain" not in metrics:
-            metrics["evidence_chain"] = {
-                "pixel_count": int(float(chg_val) * 10000),
-                "pixel_ground_area_m2": 100.0,
-                "total_area_m2": int(float(chg_val) * 1000000),
-                "total_area_km2": round(float(chg_val), 2),
-                "source_crs": "EPSG:4326 (WGS-84 Geographic 2D)",
-                "analysis_crs": "EPSG:6933 (World Cylindrical Equal Area)",
-                "measurement_method": "Geodesic Cylindrical Equal-Area Metric Pixel Integration",
-            }
-
-        # If agent returned 11-stage trace directly in result, prioritize it
-        if result.get("agent_steps") and len(result["agent_steps"]) >= 8:
-            agent_steps = result["agent_steps"]
-
-        base_conf = float(query_obj.confidence or 0.94)
-
-        # Independent multi-factor confidence computation (Result != Model)
-        cloud_t1 = observations.get("t1", {}).get("cloud_cover_pct", 1.2) if observations else 1.2
-        cloud_frac = max(0.0, min(1.0, float(cloud_t1) / 100.0))
-        usable_data_frac = 0.98
-        reg_score = 1.0
-        shadow_frac = cloud_frac * 0.35
-        data_qual = round(usable_data_frac * (1.0 - cloud_frac) * (1.0 - shadow_frac) * reg_score * 100.0, 1)
-
-        model_conf_val = round(float(metrics.get("model_confidence_pct") or (base_conf * 100.0)), 1)
-        geom_qual_val = 98.0
-        evid_cov_val = 97.5
-
-        # Result confidence derived mathematically as a weighted combination
-        result_conf_val = round(
-            0.35 * model_conf_val + 0.30 * data_qual + 0.20 * evid_cov_val + 0.15 * geom_qual_val, 1
+        query_obj = Query.objects.create(
+            session=session,
+            user=request.user,
+            text=query_text,
+            image=assets[0] if assets else None,
         )
 
-        confidence_breakdown = {
-            "data_quality_pct": data_qual,
-            "model_confidence_pct": model_conf_val,
-            "geometry_quality_pct": geom_qual_val,
-            "evidence_coverage_pct": evid_cov_val,
-            "result_confidence_pct": result_conf_val,
-        }
+        # Store all uploaded assets when the current model supports the
+        # normalized many-to-many input relationship.
+        if assets and hasattr(
+            query_obj,
+            "input_assets",
+        ):
+            query_obj.input_assets.set(assets)
 
-        return Response({
-            "analysis_id": str(query_obj.id),
-            "answer": query_obj.answer or result.get("answer", "Analysis completed successfully."),
-            "confidence": round(result_conf_val / 100.0, 2),
-            "confidence_breakdown": confidence_breakdown,
-            "evidence_chain": metrics.get("evidence_chain"),
-            "source_crs": "EPSG:4326 (WGS-84 Geographic 2D)",
-            "analysis_crs": "EPSG:6933 (World Cylindrical Equal Area)",
-            "hotspots": metrics.get("hotspots", []),
-            "workflow": workflow,
-            "agent_steps": agent_steps,
-            "clarification_required": clarification_required,
-            "clarification_prompt": clarification_prompt,
-            "clarification_options": clarification_options,
-            "metrics": metrics,
-            "observations": observations,
-            "analysis": analysis_artifacts,
-            "result_image_url": change_mask_url or after_preview_url or before_preview_url,
-            "change_mask_url": change_mask_url,
-            "change_mask_geotiff_url": change_mask_geotiff_url,
-            "t1_geotiff_url": before_geotiff_url,
-            "t2_geotiff_url": after_geotiff_url,
-            "before_image_url": before_preview_url,
-            "after_image_url": after_preview_url,
-            "geojson_url": geojson_url,
-            "result_geojson_url": geojson_url,
-            "heatmap_geojson_url": heatmap_geojson_url,
-            "evidence_json_url": evidence_json_url,
-        })
+        pair = None
+
+        if len(assets) == 2:
+            requested_pair_type = (
+                "CROSS_MODAL"
+                if (
+                    assets[0].modality == "OPTICAL"
+                    and assets[1].modality == "SAR"
+                )
+                or (
+                    assets[0].modality == "SAR"
+                    and assets[1].modality == "OPTICAL"
+                )
+                else "BI_TEMPORAL"
+            )
+
+            # Do NOT mark a pair compatible here.
+            # Compatibility must be established by the imagery pipeline.
+            existing_pair = (
+                ImagePair.objects
+                .filter(
+                    session=session,
+                    image_a=assets[0],
+                    image_b=assets[1],
+                    pair_type=requested_pair_type,
+                )
+                .first()
+            )
+
+            if existing_pair is None:
+                existing_pair = (
+                    ImagePair.objects
+                    .filter(
+                        session=session,
+                        image_a=assets[1],
+                        image_b=assets[0],
+                        pair_type=requested_pair_type,
+                    )
+                    .first()
+                )
+
+            if existing_pair is not None:
+                pair = existing_pair
+                query_obj.image_pair = pair
+
+        if pair is not None:
+            query_obj.save(
+                update_fields=["image_pair"]
+            )
+
+        # Queue ingestion before query execution when imagery was uploaded.
+        for asset in assets:
+            try:
+                self._ingest_asset(asset)
+            except Exception:
+                # The query remains persisted. The frontend receives the
+                # failure instead of a fabricated analysis.
+                pass
+
+        try:
+            task_result = run_query_task.delay(
+                str(query_obj.id)
+            )
+
+            query_obj.refresh_from_db()
+
+            response_payload = _query_response(
+                query_obj,
+                task_id=str(task_result.id),
+            )
+
+            response_payload.update(
+                {
+                    "workflow": query_obj.detected_mode,
+                    "session_id": str(session.id),
+                    "image_ids": [
+                        str(asset.id)
+                        for asset in assets
+                    ],
+                    "pair_id": (
+                        str(pair.id)
+                        if pair is not None
+                        else None
+                    ),
+                    "queued": True,
+                }
+            )
+
+            return Response(
+                response_payload,
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        except Exception as exc:
+            query_obj.refresh_from_db()
+
+            return Response(
+                {
+                    **_query_response(query_obj),
+                    "session_id": str(session.id),
+                    "image_ids": [
+                        str(asset.id)
+                        for asset in assets
+                    ],
+                    "pair_id": (
+                        str(pair.id)
+                        if pair is not None
+                        else None
+                    ),
+                    "queued": False,
+                    "error": (
+                        "The analysis could not be queued."
+                    ),
+                    "detail": str(exc),
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Analysis history/detail
+# ---------------------------------------------------------------------------
 
 
 class ContractAnalysisHistoryView(views.APIView):
-    permission_classes = [permissions.AllowAny]
+    """
+    GET /api/analysis/history/
 
-    def get(self, request):
-        user = request.user if (request.user and request.user.is_authenticated) else get_or_create_default_user()
-        queries = Query.objects.filter(session__user=user, status="COMPLETED").order_by("-completed_at")[:20]
-        history = [
-            {
-                "analysis_id": str(q.id),
-                "query": q.text,
-                "answer": q.answer[:250] + "..." if len(q.answer) > 250 else q.answer,
-                "confidence": round(q.confidence or 0.90, 2),
-                "created_at": q.created_at.isoformat() if q.created_at else "",
-            }
-            for q in queries
-        ]
-        return Response(history)
+    Returns only the authenticated user's analysis history.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        queries = (
+            Query.objects
+            .filter(session__user=request.user)
+            .order_by("-created_at")[:20]
+        )
+
+        history = []
+
+        for query in queries:
+            answer = query.answer or ""
+
+            history.append(
+                {
+                    "analysis_id": str(query.id),
+                    "query_id": str(query.id),
+                    "query": query.text,
+                    "answer": (
+                        answer[:250] + "..."
+                        if len(answer) > 250
+                        else answer
+                    ),
+                    "confidence": query.confidence,
+                    "status": query.status,
+                    "clarification_required": getattr(
+                        query,
+                        "clarification_required",
+                        False,
+                    ),
+                    "created_at": (
+                        query.created_at.isoformat()
+                        if query.created_at
+                        else ""
+                    ),
+                    "completed_at": (
+                        query.completed_at.isoformat()
+                        if getattr(
+                            query,
+                            "completed_at",
+                            None,
+                        )
+                        else None
+                    ),
+                }
+            )
+
+        return Response(
+            history,
+            status=status.HTTP_200_OK,
+        )
 
 
 class ContractAnalysisDetailView(views.APIView):
-    permission_classes = [permissions.AllowAny]
+    """
+    GET /api/analysis/<pk>/
 
-    def get(self, request, pk):
-        query_obj = get_object_or_404(Query, id=pk)
-        return Response({
-            "analysis_id": str(query_obj.id),
-            "query": query_obj.text,
-            "answer": query_obj.answer,
-            "confidence": round(query_obj.confidence or 0.90, 2),
-            "created_at": query_obj.created_at.isoformat() if query_obj.created_at else "",
-            "plan": query_obj.plan,
-            "evidence_graph": query_obj.evidence_graph,
-        })
+    Returns a query only when it belongs to the authenticated user.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk, *args, **kwargs):
+        query_obj = (
+            Query.objects
+            .filter(
+                id=pk,
+                session__user=request.user,
+            )
+            .first()
+        )
+
+        if query_obj is None:
+            return Response(
+                {
+                    "error": "Analysis not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            _query_response(query_obj),
+            status=status.HTTP_200_OK,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
 
 
 class ContractProjectListCreateView(views.APIView):
-    permission_classes = [permissions.AllowAny]
+    """
+    Compatibility bridge for project management.
 
-    def get(self, request):
-        user = request.user if (request.user and request.user.is_authenticated) else get_or_create_default_user()
-        projects = Project.objects.all()[:15]
-        return Response([
+    Project ownership is enforced using the actual project/session model
+    relationships where available.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        queryset = Project.objects.all()
+
+        # Prefer an explicit user relationship when the model provides one.
+        field_names = {
+            field.name
+            for field in Project._meta.get_fields()
+        }
+
+        if "user" in field_names:
+            queryset = queryset.filter(
+                user=request.user
+            )
+        elif "owner" in field_names:
+            queryset = queryset.filter(
+                owner=request.user
+            )
+        elif "created_by" in field_names:
+            queryset = queryset.filter(
+                created_by=request.user
+            )
+        else:
+            # If the Project model has no ownership relation, do not expose
+            # the entire project table to an authenticated user.
+            queryset = queryset.none()
+
+        projects = queryset.order_by(
+            "-created_at"
+        )[:15]
+
+        return Response(
+            [
+                {
+                    "id": str(project.id),
+                    "name": project.name,
+                    "description": project.description,
+                    "created_at": (
+                        project.created_at.isoformat()
+                        if project.created_at
+                        else ""
+                    ),
+                }
+                for project in projects
+            ],
+            status=status.HTTP_200_OK,
+        )
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        name = _normalise_text(
+            request.data.get("name")
+        )
+
+        description = _normalise_text(
+            request.data.get("description")
+        )
+
+        if not name:
+            return Response(
+                {
+                    "error": "Project name is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        field_names = {
+            field.name
+            for field in Project._meta.get_fields()
+        }
+
+        project_kwargs: dict[str, Any] = {
+            "name": name,
+            "description": description,
+        }
+
+        if "user" in field_names:
+            project_kwargs["user"] = request.user
+        elif "owner" in field_names:
+            project_kwargs["owner"] = request.user
+        elif "created_by" in field_names:
+            project_kwargs["created_by"] = request.user
+        else:
+            return Response(
+                {
+                    "error": (
+                        "Project ownership is not configured for "
+                        "the current backend model."
+                    )
+                },
+                status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
+
+        project = Project.objects.create(
+            **project_kwargs
+        )
+
+        return Response(
             {
-                "id": str(p.id),
-                "name": p.name,
-                "description": p.description,
-                "created_at": p.created_at.isoformat(),
-            }
-            for p in projects
-        ])
-
-    def post(self, request):
-        name = request.data.get("name", "New Project")
-        description = request.data.get("description", "")
-        p = Project.objects.create(name=name, description=description)
-        return Response({
-            "id": str(p.id),
-            "name": p.name,
-            "description": p.description,
-            "created_at": p.created_at.isoformat(),
-        }, status=status.HTTP_201_CREATED)
+                "id": str(project.id),
+                "name": project.name,
+                "description": project.description,
+                "created_at": (
+                    project.created_at.isoformat()
+                    if project.created_at
+                    else ""
+                ),
+            },
+            status=status.HTTP_201_CREATED,
+        )

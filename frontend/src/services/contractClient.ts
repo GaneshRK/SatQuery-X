@@ -92,3 +92,29 @@ export const analysisApi = {
   projects: () =>
     request("/projects/"),
 };
+
+export const systemApi = {
+  health: () =>
+    request("http://localhost:8000/api/v1/health/"),
+  demoScenarios: () =>
+    request("http://localhost:8000/api/v1/demo-scenarios/"),
+  bootstrapDemo: (scenarioKey: string) =>
+    request(`http://localhost:8000/api/v1/demo-scenarios/bootstrap/${scenarioKey}/`, { method: "POST" }),
+};
+
+export const satelliteApi = {
+  search: (payload: any) =>
+    request("http://localhost:8000/api/v1/satellite/search/", { method: "POST", body: JSON.stringify(payload) }),
+  scenes: (params?: any) => {
+    const q = params ? `?${new URLSearchParams(params).toString()}` : "";
+    return request(`http://localhost:8000/api/v1/satellite/scenes/${q}`);
+  },
+  aois: () =>
+    request("http://localhost:8000/api/v1/satellite/aoi/"),
+  createAoi: (payload: any) =>
+    request("http://localhost:8000/api/v1/satellite/aoi/", { method: "POST", body: JSON.stringify(payload) }),
+  changeAnalysis: (payload: any) =>
+    request("http://localhost:8000/api/v1/satellite/change-analysis/", { method: "POST", body: JSON.stringify(payload) }),
+  models: () =>
+    request("http://localhost:8000/api/v1/models/"),
+};

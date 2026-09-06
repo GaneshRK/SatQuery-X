@@ -1,338 +1,1238 @@
-from __future__ import annotations
-import logging
-import math
-from datetime import datetime, date
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from rest_framework import permissions, status, views
-from rest_framework.response import Response
-from shapely.geometry import shape, box
+"""
+Temporal and monitoring API views for SatQuery-X.
 
-from apps.satellite.models import (
+Grounded satellite intelligence API.
+
+Rules:
+- Only authenticated user-owned data is exposed.
+- No synthetic satellite observations.
+- No fabricated AOIs or coordinates.
+- No fabricated NDVI, change percentage, area, confidence, or causes.
+- Satellite scenes are associated with an AOI.
+- Change events use scene_before / scene_after.
+- AOI monitoring uses AOIMonitoring.
+- Temporal responses expose persisted/indexed evidence only.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date
+from typing import Any
+
+from django.db import transaction
+from django.db.models import Q
+from django.http import Http404
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import (
+    AcquisitionRequest,
+    AOIMonitoring,
     AreaOfInterest,
+    ChangeEvent,
+    DataSyncJob,
     SatelliteScene,
     TemporalObservation,
-    ChangeEvent,
-    AOIMonitoring,
-    DataSyncJob,
-    DataProvider,
 )
-from apps.satellite.serializers import (
+
+from .serializers import (
+    AcquisitionRequestSerializer,
+    AOIMonitoringSerializer,
     AreaOfInterestSerializer,
+    ChangeEventSerializer,
+    DataSyncJobSerializer,
     SatelliteSceneSerializer,
     TemporalObservationSerializer,
-    ChangeEventSerializer,
-    AOIMonitoringSerializer,
-    DataSyncJobSerializer,
 )
-from apps.satellite.indexer import HistoricalCatalogueIndexer
-from apps.satellite.sync import RealtimeCatalogueSynchronizer
-from apps.audit.models import log_audit_event
 
 logger = logging.getLogger(__name__)
 
 
-class SatelliteSceneListView(views.APIView):
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+
+def _get_session_model():
     """
-    Search and filter catalogued satellite scenes.
-    Supports filtering by sensor, platform, date range, and maximum cloud cover.
+    Import the current SatQuery-X Session model lazily.
     """
-    permission_classes = [permissions.AllowAny]
+    try:
+        from apps.sessions.models import Session
+    except ImportError as exc:
+        raise RuntimeError(
+            "SatQuery-X Session model could not be imported."
+        ) from exc
 
-    def get(self, request):
-        qs = SatelliteScene.objects.all().prefetch_related("assets")
-
-        sensor = request.query_params.get("sensor")
-        if sensor:
-            qs = qs.filter(sensor=sensor.upper())
-
-        platform = request.query_params.get("platform")
-        if platform:
-            qs = qs.filter(platform__icontains=platform)
-
-        year = request.query_params.get("year")
-        if year:
-            qs = qs.filter(acquisition_datetime__year=int(year))
-
-        max_cloud = request.query_params.get("max_cloud_cover")
-        if max_cloud:
-            qs = qs.filter(cloud_cover__lte=float(max_cloud))
-
-        limit = min(int(request.query_params.get("limit", 50)), 100)
-        scenes = qs.order_by("-acquisition_datetime")[:limit]
-
-        serializer = SatelliteSceneSerializer(scenes, many=True)
-        return Response({
-            "count": len(serializer.data),
-            "scenes": serializer.data,
-        })
+    return Session
 
 
-class SatelliteSceneDetailView(views.APIView):
+def _get_owned_session(request, session_id):
     """
-    Retrieve single satellite scene metadata and asset URLs.
+    Return a session only when it belongs to the authenticated user.
     """
-    permission_classes = [permissions.AllowAny]
+    Session = _get_session_model()
 
-    def get(self, request, scene_id):
-        scene = get_object_or_404(SatelliteScene.objects.prefetch_related("assets"), id=scene_id)
-        serializer = SatelliteSceneSerializer(scene)
-        return Response(serializer.data)
+    try:
+        return Session.objects.get(
+            pk=session_id,
+            user=request.user,
+        )
+    except Session.DoesNotExist:
+        raise Http404("Session not found.")
 
 
-class AOIListCreateView(views.APIView):
+def _get_owned_aoi(request, aoi_id):
     """
-    List user Areas of Interest or create a new AOI with automatic spatial bounding and history indexing.
+    Resolve an AOI through its owning session.
     """
-    permission_classes = [permissions.AllowAny]
+    try:
+        return (
+            AreaOfInterest.objects
+            .select_related("session")
+            .get(
+                pk=aoi_id,
+                session__user=request.user,
+            )
+        )
+    except AreaOfInterest.DoesNotExist:
+        raise Http404("Area of interest not found.")
 
-    def get(self, request):
-        aois = AreaOfInterest.objects.all()
-        serializer = AreaOfInterestSerializer(aois, many=True)
-        return Response(serializer.data)
 
-    def post(self, request):
-        data = request.data
-        name = data.get("name", "Untitled AOI")
-        description = data.get("description", "")
-        geometry = data.get("geometry")
+def _get_owned_scene(request, scene_id):
+    """
+    Resolve a satellite scene through its AOI/session ownership.
+    """
+    try:
+        return (
+            SatelliteScene.objects
+            .select_related(
+                "aoi",
+                "aoi__session",
+                "collection",
+            )
+            .get(
+                pk=scene_id,
+                aoi__session__user=request.user,
+            )
+        )
+    except SatelliteScene.DoesNotExist:
+        raise Http404("Satellite scene not found.")
 
-        if not geometry:
-            # Fallback: create polygon from bbox or default Chennai coordinates
-            bbox = data.get("bbox", [80.20, 12.95, 80.32, 13.08])
-            geom_shape = box(bbox[0], bbox[1], bbox[2], bbox[3])
-            geometry = geom_shape.__geo_interface__
-        else:
-            geom_shape = shape(geometry)
-            bbox = list(geom_shape.bounds)
 
-        # Calculate approximate area in sq km
-        centroid = [geom_shape.centroid.x, geom_shape.centroid.y]
-        # Approximate degrees to km at given latitude
-        lat_rad = math.radians(centroid[1])
-        km_per_deg_lat = 111.32
-        km_per_deg_lon = 111.32 * math.cos(lat_rad)
-        width_km = abs(bbox[2] - bbox[0]) * km_per_deg_lon
-        height_km = abs(bbox[3] - bbox[1]) * km_per_deg_lat
-        area_sqkm = round(width_km * height_km, 2)
+def _get_owned_change_event(request, event_id):
+    """
+    Resolve a change event through its AOI/session ownership.
+    """
+    try:
+        return (
+            ChangeEvent.objects
+            .select_related(
+                "aoi",
+                "aoi__session",
+                "scene_before",
+                "scene_after",
+            )
+            .get(
+                pk=event_id,
+                aoi__session__user=request.user,
+            )
+        )
+    except ChangeEvent.DoesNotExist:
+        raise Http404("Change event not found.")
 
-        aoi = AreaOfInterest.objects.create(
-            name=name,
-            description=description,
-            geometry=geometry,
-            bbox=bbox,
-            centroid=centroid,
-            area_sqkm=area_sqkm,
+
+def _parse_date(
+    value: Any,
+    *,
+    field_name: str,
+) -> date | None:
+    """
+    Parse an optional ISO date.
+    """
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, date):
+        return value
+
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must use YYYY-MM-DD format."
+        ) from exc
+
+
+def _date_window_from_request(request):
+    """
+    Resolve optional start/end date query parameters.
+    """
+    start_date = _parse_date(
+        request.query_params.get("start_date"),
+        field_name="start_date",
+    )
+
+    end_date = _parse_date(
+        request.query_params.get("end_date"),
+        field_name="end_date",
+    )
+
+    if (
+        start_date is not None
+        and end_date is not None
+        and start_date > end_date
+    ):
+        raise ValueError(
+            "start_date cannot be later than end_date."
         )
 
-        # Automatically index multi-year history for this AOI
-        indexer = HistoricalCatalogueIndexer()
-        index_res = indexer.index_aoi_history(
-            aoi=aoi,
-            start_year=2018,
-            end_year=timezone.now().year,
-            sensor=data.get("sensor", "SENTINEL-2"),
-            max_cloud_cover=30.0,
-            samples_per_year=2,
+    return start_date, end_date
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _evidence_measurements(evidence: Any) -> dict[str, Any]:
+    """
+    Return only explicitly persisted measurements.
+
+    Nothing is calculated or invented here.
+    """
+    bundle = _as_dict(evidence)
+
+    measurements = bundle.get("measurements")
+
+    if isinstance(measurements, dict):
+        return measurements
+
+    graph = _as_dict(
+        bundle.get("evidence_graph")
+    )
+
+    measurements = graph.get("measurements")
+
+    if isinstance(measurements, dict):
+        return measurements
+
+    return {}
+
+
+def _change_evidence(event: ChangeEvent) -> dict[str, Any]:
+    """
+    Read explicitly persisted evidence from a change event.
+    """
+    evidence = getattr(
+        event,
+        "evidence",
+        None,
+    )
+
+    if isinstance(evidence, dict):
+        return evidence
+
+    metadata = getattr(
+        event,
+        "metadata",
+        None,
+    )
+
+    if isinstance(metadata, dict):
+        return metadata
+
+    return {}
+
+
+def _scene_queryset(request):
+    """
+    User-owned satellite scenes.
+    """
+    return (
+        SatelliteScene.objects
+        .select_related(
+            "aoi",
+            "aoi__session",
+            "collection",
+        )
+        .filter(
+            aoi__session__user=request.user
+        )
+    )
+
+
+def _aoi_queryset(request):
+    """
+    User-owned AOIs.
+    """
+    return (
+        AreaOfInterest.objects
+        .select_related("session")
+        .filter(
+            session__user=request.user
+        )
+    )
+
+
+def _timeline_queryset(aoi):
+    """
+    Actual temporal observations associated with an AOI.
+    """
+    return (
+        TemporalObservation.objects
+        .filter(
+            aoi=aoi
+        )
+        .select_related(
+            "scene",
+            "scene__collection",
+        )
+        .order_by(
+            "observation_date",
+            "scene__acquisition_datetime",
+        )
+    )
+
+
+# =============================================================================
+# SATELLITE SCENES
+# =============================================================================
+
+
+class SatelliteSceneListView(APIView):
+    """
+    List indexed satellite scenes belonging to the authenticated user.
+
+    Optional filters:
+
+        ?session_id=
+        ?aoi_id=
+        ?sensor=
+        ?start_date=
+        ?end_date=
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(self, request):
+        queryset = _scene_queryset(request)
+
+        session_id = request.query_params.get(
+            "session_id"
         )
 
-        serializer = AreaOfInterestSerializer(aoi)
-        return Response({
-            "aoi": serializer.data,
-            "indexing": index_res,
-        }, status=status.HTTP_201_CREATED)
-
-
-class AOITimelineView(views.APIView):
-    """
-    Temporal Observation Engine:
-    Returns chronological observations from 2015 to 2026 for a given AOI.
-    Flags earliest and latest observations and documents data gaps without fabricating data.
-    """
-    permission_classes = [permissions.AllowAny]
-
-    def get(self, request, aoi_id):
-        aoi = get_object_or_404(AreaOfInterest, id=aoi_id)
-        observations = TemporalObservation.objects.filter(aoi=aoi).select_related("scene").order_by("observation_date")
-
-        if not observations.exists():
-            # Trigger indexing on demand
-            indexer = HistoricalCatalogueIndexer()
-            indexer.index_aoi_history(aoi=aoi, start_year=2018, end_year=timezone.now().year)
-            observations = TemporalObservation.objects.filter(aoi=aoi).select_related("scene").order_by("observation_date")
-
-        obs_list = list(observations)
-        serializer = TemporalObservationSerializer(obs_list, many=True)
-
-        earliest = serializer.data[0] if serializer.data else None
-        latest = serializer.data[-1] if serializer.data else None
-
-        # Build year summary and identify data availability
-        years_covered = sorted(list(set(o.year for o in obs_list)))
-        current_year = timezone.now().year
-        all_expected_years = list(range(2018, current_year + 1))
-        missing_years = [y for y in all_expected_years if y not in years_covered]
-
-        return Response({
-            "aoi_id": str(aoi.id),
-            "aoi_name": aoi.name,
-            "area_sqkm": aoi.area_sqkm,
-            "centroid": aoi.centroid,
-            "bbox": aoi.bbox,
-            "observation_count": len(obs_list),
-            "years_covered": years_covered,
-            "data_gaps": missing_years,
-            "earliest_observation": earliest,
-            "latest_observation": latest,
-            "observations": serializer.data,
-        })
-
-
-class ChangeAnalysisView(views.APIView):
-    """
-    Bi-temporal change detection pipeline.
-    Compares two satellite observations and generates ChangeEvent polygons and scientific metrics.
-    """
-    permission_classes = [permissions.AllowAny]
-
-    def post(self, request):
-        aoi_id = request.data.get("aoi_id")
-        before_scene_id = request.data.get("before_scene_id")
-        after_scene_id = request.data.get("after_scene_id")
-
-        aoi = get_object_or_404(AreaOfInterest, id=aoi_id) if aoi_id else AreaOfInterest.objects.first()
-        if not aoi:
-            # Create default Chennai AOI
-            aoi = AreaOfInterest.objects.create(
-                name="Chennai Metropolitan Urban Region",
-                bbox=[80.20, 12.95, 80.32, 13.08],
-                geometry={"type": "Polygon", "coordinates": [[[80.20, 12.95], [80.32, 12.95], [80.32, 13.08], [80.20, 13.08], [80.20, 12.95]]]},
-                centroid=[80.26, 13.015],
-                area_sqkm=198.4,
+        if session_id:
+            queryset = queryset.filter(
+                aoi__session_id=session_id
             )
 
-        before_scene = get_object_or_404(SatelliteScene, id=before_scene_id) if before_scene_id else SatelliteScene.objects.filter(geometry__isnull=False).order_by("acquisition_datetime").first()
-        after_scene = get_object_or_404(SatelliteScene, id=after_scene_id) if after_scene_id else SatelliteScene.objects.filter(geometry__isnull=False).order_by("-acquisition_datetime").first()
-
-        if not before_scene or not after_scene:
-            # Index history first
-            indexer = HistoricalCatalogueIndexer()
-            indexer.index_aoi_history(aoi=aoi, start_year=2018, end_year=timezone.now().year)
-            before_scene = SatelliteScene.objects.order_by("acquisition_datetime").first()
-            after_scene = SatelliteScene.objects.order_by("-acquisition_datetime").first()
-
-        # Remote sensing change detection calculation
-        change_type = request.data.get("change_type", "URBAN_EXPANSION")
-        
-        # Calculate polygon delta from AOI centroid
-        cx, cy = aoi.centroid if aoi.centroid else [80.25, 13.00]
-        offset = 0.02
-        change_poly = {
-            "type": "Feature",
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [[
-                    [cx - offset, cy - offset],
-                    [cx + offset, cy - offset],
-                    [cx + offset, cy + offset],
-                    [cx - offset, cy + offset],
-                    [cx - offset, cy - offset],
-                ]]
-            },
-            "properties": {
-                "change_class": change_type,
-                "confidence": 0.89,
-                "period": f"{before_scene.acquisition_datetime.year} -> {after_scene.acquisition_datetime.year}",
-            }
-        }
-
-        # Deterministic area calculation
-        area_ha = round((offset * 2 * 111.32) * (offset * 2 * 111.32) * 100 * 0.45, 1)
-        change_pct = round(min(35.0, (area_ha / (aoi.area_sqkm * 100)) * 100), 1)
-
-        event = ChangeEvent.objects.create(
-            aoi=aoi,
-            scene_before=before_scene,
-            scene_after=after_scene,
-            change_type=change_type,
-            change_polygon=change_poly,
-            area_hectares=area_ha,
-            change_percentage=change_pct,
-            confidence=0.89,
-            algorithm="NDVI_DIFFERENCING+CANNY_CONTOURS",
-            evidence_data={
-                "before_scene": before_scene.external_id,
-                "before_date": before_scene.acquisition_datetime.strftime("%Y-%m-%d"),
-                "after_scene": after_scene.external_id,
-                "after_date": after_scene.acquisition_datetime.strftime("%Y-%m-%d"),
-                "sensor": before_scene.sensor,
-                "spectral_index": "NDVI",
-                "mean_delta": -0.24,
-            }
+        aoi_id = request.query_params.get(
+            "aoi_id"
         )
 
-        serializer = ChangeEventSerializer(event)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        if aoi_id:
+            queryset = queryset.filter(
+                aoi_id=aoi_id
+            )
 
+        sensor = request.query_params.get(
+            "sensor"
+        )
 
-class ChangeEventListView(views.APIView):
-    """
-    Global Change Explorer:
-    Lists detected change events across Earth observation targets.
-    """
-    permission_classes = [permissions.AllowAny]
+        if sensor:
+            queryset = queryset.filter(
+                Q(sensor__iexact=sensor)
+                | Q(
+                    collection__sensor_type__iexact=sensor
+                )
+            )
 
-    def get(self, request):
-        events = ChangeEvent.objects.select_related("aoi", "scene_before", "scene_after").all()
-        serializer = ChangeEventSerializer(events, many=True)
-        return Response({
-            "count": len(serializer.data),
-            "events": serializer.data,
-        })
+        try:
+            start_date, end_date = (
+                _date_window_from_request(request)
+            )
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
+        if start_date:
+            queryset = queryset.filter(
+                acquisition_datetime__date__gte=start_date
+            )
 
-class SyncStatusView(views.APIView):
-    """
-    Returns catalogue watermark and near-real-time synchronization metrics.
-    """
-    permission_classes = [permissions.AllowAny]
+        if end_date:
+            queryset = queryset.filter(
+                acquisition_datetime__date__lte=end_date
+            )
 
-    def get(self, request):
-        status_info = RealtimeCatalogueSynchronizer.get_latest_sync_status()
-        return Response(status_info)
+        queryset = queryset.order_by(
+            "-acquisition_datetime",
+            "-created_at",
+        )
 
-    def post(self, request):
-        synchronizer = RealtimeCatalogueSynchronizer()
-        result = synchronizer.sync_active_aois(lookback_days=30)
-        return Response(result)
+        serializer = SatelliteSceneSerializer(
+            queryset,
+            many=True,
+            context={"request": request},
+        )
 
-
-class AOIMonitoringView(views.APIView):
-    """
-    Manage automated AOI satellite surveillance schedules.
-    """
-    permission_classes = [permissions.AllowAny]
-
-    def get(self, request):
-        monitors = AOIMonitoring.objects.select_related("aoi").all()
-        serializer = AOIMonitoringSerializer(monitors, many=True)
         return Response(serializer.data)
 
-    def post(self, request):
-        aoi_id = request.data.get("aoi_id")
-        aoi = get_object_or_404(AreaOfInterest, id=aoi_id)
-        cadence = request.data.get("cadence", "WEEKLY")
-        alert_pct = float(request.data.get("alert_on_change_pct", 5.0))
-        sensor = request.data.get("target_sensor", "SENTINEL-2")
 
-        monitor, _ = AOIMonitoring.objects.update_or_create(
-            aoi=aoi,
-            defaults={
-                "cadence": cadence,
-                "alert_on_change_pct": alert_pct,
-                "target_sensor": sensor,
-                "is_active": True,
+class SatelliteSceneDetailView(APIView):
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(
+        self,
+        request,
+        scene_id,
+    ):
+        scene = _get_owned_scene(
+            request,
+            scene_id,
+        )
+
+        serializer = SatelliteSceneSerializer(
+            scene,
+            context={"request": request},
+        )
+
+        return Response(serializer.data)
+
+
+# =============================================================================
+# AOI
+# =============================================================================
+
+
+class AOIListCreateView(APIView):
+    """
+    List or create authenticated-user AOIs.
+
+    Creation requires explicit geometry.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(self, request):
+        queryset = _aoi_queryset(request)
+
+        session_id = request.query_params.get(
+            "session_id"
+        )
+
+        if session_id:
+            queryset = queryset.filter(
+                session_id=session_id
+            )
+
+        serializer = AreaOfInterestSerializer(
+            queryset,
+            many=True,
+            context={"request": request},
+        )
+
+        return Response(serializer.data)
+
+    @transaction.atomic
+    def post(self, request):
+        session_id = request.data.get(
+            "session_id"
+        )
+
+        if not session_id:
+            return Response(
+                {
+                    "detail": (
+                        "session_id is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            session = _get_owned_session(
+                request,
+                session_id,
+            )
+        except Http404:
+            return Response(
+                {
+                    "detail": "Session not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        geometry = request.data.get(
+            "geometry"
+        )
+
+        if not geometry:
+            return Response(
+                {
+                    "detail": (
+                        "geometry is required. "
+                        "SatQuery-X does not create "
+                        "default geographic coordinates."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payload = request.data.copy()
+        payload["session"] = session.pk
+
+        serializer = AreaOfInterestSerializer(
+            data=payload,
+            context={"request": request},
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        aoi = serializer.save(
+            session=session
+        )
+
+        return Response(
+            AreaOfInterestSerializer(
+                aoi,
+                context={"request": request},
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# =============================================================================
+# AOI TIMELINE
+# =============================================================================
+
+
+class AOITimelineView(APIView):
+    """
+    Return actual indexed temporal observations for an AOI.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(
+        self,
+        request,
+        aoi_id,
+    ):
+        aoi = _get_owned_aoi(
+            request,
+            aoi_id,
+        )
+
+        queryset = _timeline_queryset(
+            aoi
+        )
+
+        try:
+            start_date, end_date = (
+                _date_window_from_request(request)
+            )
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if start_date:
+            queryset = queryset.filter(
+                observation_date__gte=start_date
+            )
+
+        if end_date:
+            queryset = queryset.filter(
+                observation_date__lte=end_date
+            )
+
+        serializer = TemporalObservationSerializer(
+            queryset,
+            many=True,
+            context={"request": request},
+        )
+
+        observations = serializer.data
+
+        years = sorted(
+            {
+                int(
+                    item["observation_date"][:4]
+                )
+                for item in observations
+                if item.get("observation_date")
             }
         )
-        serializer = AOIMonitoringSerializer(monitor)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        return Response(
+            {
+                "aoi": AreaOfInterestSerializer(
+                    aoi,
+                    context={"request": request},
+                ).data,
+                "observation_count": len(
+                    observations
+                ),
+                "years": years,
+                "observations": observations,
+                "data_status": (
+                    "available"
+                    if observations
+                    else "no_indexed_observations"
+                ),
+            }
+        )
+
+
+# =============================================================================
+# CHANGE ANALYSIS
+# =============================================================================
+
+
+class ChangeAnalysisView(APIView):
+    """
+    Return persisted evidence-backed change analysis.
+
+    This view does not calculate scientific values.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(self, request):
+        aoi_id = request.query_params.get(
+            "aoi_id"
+        )
+
+        if not aoi_id:
+            return Response(
+                {
+                    "detail": "aoi_id is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            aoi = _get_owned_aoi(
+                request,
+                aoi_id,
+            )
+        except Http404:
+            return Response(
+                {
+                    "detail": (
+                        "Area of interest not found."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        queryset = (
+            ChangeEvent.objects
+            .filter(
+                aoi=aoi
+            )
+            .select_related(
+                "aoi",
+                "scene_before",
+                "scene_after",
+            )
+            .order_by("-created_at")
+        )
+
+        before_scene_id = request.query_params.get(
+            "before_scene_id"
+        )
+
+        after_scene_id = request.query_params.get(
+            "after_scene_id"
+        )
+
+        if before_scene_id:
+            queryset = queryset.filter(
+                scene_before_id=before_scene_id
+            )
+
+        if after_scene_id:
+            queryset = queryset.filter(
+                scene_after_id=after_scene_id
+            )
+
+        event = queryset.first()
+
+        if event is None:
+            return Response(
+                {
+                    "status": "no_analysis",
+                    "aoi_id": str(aoi.pk),
+                    "detail": (
+                        "No completed change analysis "
+                        "is available for this AOI."
+                    ),
+                    "evidence_available": False,
+                }
+            )
+
+        serializer = ChangeEventSerializer(
+            event,
+            context={"request": request},
+        )
+
+        payload = dict(
+            serializer.data
+        )
+
+        evidence = _change_evidence(
+            event
+        )
+
+        measurements = _evidence_measurements(
+            evidence
+        )
+
+        payload["evidence_available"] = bool(
+            evidence
+        )
+
+        payload["measurements"] = measurements
+
+        payload["analysis_status"] = (
+            "evidence_backed"
+            if evidence
+            else "metadata_only"
+        )
+
+        return Response(payload)
+
+    def post(self, request):
+        """
+        Validate already-persisted change evidence.
+
+        Actual analysis belongs to the agent/CV pipeline.
+        """
+        event_id = request.data.get(
+            "change_event_id"
+        )
+
+        if not event_id:
+            return Response(
+                {
+                    "detail": (
+                        "change_event_id is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            event = _get_owned_change_event(
+                request,
+                event_id,
+            )
+        except Http404:
+            return Response(
+                {
+                    "detail": (
+                        "Change event not found."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        evidence = _change_evidence(
+            event
+        )
+
+        measurements = _evidence_measurements(
+            evidence
+        )
+
+        return Response(
+            {
+                "status": (
+                    "validated"
+                    if evidence
+                    else "insufficient_evidence"
+                ),
+                "change_event": ChangeEventSerializer(
+                    event,
+                    context={"request": request},
+                ).data,
+                "measurements": measurements,
+                "evidence_available": bool(
+                    evidence
+                ),
+            }
+        )
+
+
+# =============================================================================
+# CHANGE EVENTS
+# =============================================================================
+
+
+class ChangeEventListView(APIView):
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(self, request):
+        queryset = (
+            ChangeEvent.objects
+            .select_related(
+                "aoi",
+                "aoi__session",
+                "scene_before",
+                "scene_after",
+            )
+            .filter(
+                aoi__session__user=request.user
+            )
+            .order_by("-created_at")
+        )
+
+        aoi_id = request.query_params.get(
+            "aoi_id"
+        )
+
+        if aoi_id:
+            queryset = queryset.filter(
+                aoi_id=aoi_id
+            )
+
+        session_id = request.query_params.get(
+            "session_id"
+        )
+
+        if session_id:
+            queryset = queryset.filter(
+                aoi__session_id=session_id
+            )
+
+        serializer = ChangeEventSerializer(
+            queryset,
+            many=True,
+            context={"request": request},
+        )
+
+        return Response(serializer.data)
+
+
+class ChangeEventDetailView(APIView):
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(
+        self,
+        request,
+        event_id,
+    ):
+        event = _get_owned_change_event(
+            request,
+            event_id,
+        )
+
+        serializer = ChangeEventSerializer(
+            event,
+            context={"request": request},
+        )
+
+        return Response(serializer.data)
+
+
+# =============================================================================
+# DATA SYNCHRONIZATION
+# =============================================================================
+
+
+class SyncStatusView(APIView):
+    """
+    Show persisted satellite catalogue synchronization jobs.
+
+    POST queues actual catalogue synchronization.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(self, request):
+        queryset = (
+            DataSyncJob.objects
+            .select_related(
+                "aoi",
+                "aoi__session",
+            )
+            .filter(
+                aoi__session__user=request.user
+            )
+            .order_by("-started_at")
+        )
+
+        session_id = request.query_params.get(
+            "session_id"
+        )
+
+        if session_id:
+            queryset = queryset.filter(
+                aoi__session_id=session_id
+            )
+
+        serializer = DataSyncJobSerializer(
+            queryset[:50],
+            many=True,
+            context={"request": request},
+        )
+
+        return Response(
+            {
+                "jobs": serializer.data,
+                "count": len(serializer.data),
+            }
+        )
+
+    def post(self, request):
+        session_id = request.data.get(
+            "session_id"
+        )
+
+        if not session_id:
+            return Response(
+                {
+                    "detail": (
+                        "session_id is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            session = _get_owned_session(
+                request,
+                session_id,
+            )
+        except Http404:
+            return Response(
+                {
+                    "detail": "Session not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        aoi_id = request.data.get(
+            "aoi_id"
+        )
+
+        aoi = None
+
+        if aoi_id:
+            try:
+                aoi = _get_owned_aoi(
+                    request,
+                    aoi_id,
+                )
+            except Http404:
+                return Response(
+                    {
+                        "detail": (
+                            "Area of interest not found."
+                        )
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            if aoi.session_id != session.pk:
+                return Response(
+                    {
+                        "detail": (
+                            "AOI does not belong "
+                            "to the selected session."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            from .tasks import (
+                sync_latest_available_catalogue_task
+            )
+        except ImportError:
+            logger.exception(
+                "Satellite synchronization task unavailable."
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        "Satellite synchronization "
+                        "service is unavailable."
+                    )
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        task = sync_latest_available_catalogue_task.delay(
+            aoi_id=(
+                str(aoi.pk)
+                if aoi is not None
+                else None
+            )
+        )
+
+        return Response(
+            {
+                "status": "queued",
+                "task_id": task.id,
+                "session_id": str(session.pk),
+                "aoi_id": (
+                    str(aoi.pk)
+                    if aoi is not None
+                    else None
+                ),
+                "data_mode": (
+                    "latest_available_catalogue"
+                ),
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+# =============================================================================
+# AOI MONITORING
+# =============================================================================
+
+
+class AOIMonitoringView(APIView):
+    """
+    Read/update AOIMonitoring configuration.
+
+    Monitoring configuration is separate from satellite observations.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get(
+        self,
+        request,
+        aoi_id,
+    ):
+        aoi = _get_owned_aoi(
+            request,
+            aoi_id,
+        )
+
+        monitoring = (
+            AOIMonitoring.objects
+            .filter(aoi=aoi)
+            .first()
+        )
+
+        if monitoring is None:
+            return Response(
+                {
+                    "aoi_id": str(aoi.pk),
+                    "monitoring": None,
+                    "status": "not_configured",
+                }
+            )
+
+        return Response(
+            {
+                "aoi_id": str(aoi.pk),
+                "monitoring": AOIMonitoringSerializer(
+                    monitoring,
+                    context={"request": request},
+                ).data,
+                "status": "configured",
+            }
+        )
+
+    @transaction.atomic
+    def post(
+        self,
+        request,
+        aoi_id,
+    ):
+        """
+        Create or update monitoring configuration.
+        """
+        aoi = _get_owned_aoi(
+            request,
+            aoi_id,
+        )
+
+        monitoring = (
+            AOIMonitoring.objects
+            .filter(aoi=aoi)
+            .first()
+        )
+
+        if monitoring is None:
+            serializer = AOIMonitoringSerializer(
+                data={
+                    **request.data,
+                    "aoi": aoi.pk,
+                },
+                context={"request": request},
+            )
+
+            serializer.is_valid(
+                raise_exception=True
+            )
+
+            monitoring = serializer.save(
+                aoi=aoi
+            )
+        else:
+            serializer = AOIMonitoringSerializer(
+                monitoring,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
+
+            serializer.is_valid(
+                raise_exception=True
+            )
+
+            monitoring = serializer.save()
+
+        return Response(
+            {
+                "status": "configured",
+                "aoi_id": str(aoi.pk),
+                "monitoring": AOIMonitoringSerializer(
+                    monitoring,
+                    context={"request": request},
+                ).data,
+            }
+        )
+
+    @transaction.atomic
+    def patch(
+        self,
+        request,
+        aoi_id,
+    ):
+        aoi = _get_owned_aoi(
+            request,
+            aoi_id,
+        )
+
+        monitoring = (
+            AOIMonitoring.objects
+            .filter(aoi=aoi)
+            .first()
+        )
+
+        if monitoring is None:
+            return Response(
+                {
+                    "detail": (
+                        "Monitoring is not configured "
+                        "for this AOI."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = AOIMonitoringSerializer(
+            monitoring,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        monitoring = serializer.save()
+
+        return Response(
+            {
+                "status": "updated",
+                "aoi_id": str(aoi.pk),
+                "monitoring": AOIMonitoringSerializer(
+                    monitoring,
+                    context={"request": request},
+                ).data,
+            }
+        )
+
+    @transaction.atomic
+    def delete(
+        self,
+        request,
+        aoi_id,
+    ):
+        aoi = _get_owned_aoi(
+            request,
+            aoi_id,
+        )
+
+        deleted, _ = (
+            AOIMonitoring.objects
+            .filter(aoi=aoi)
+            .delete()
+        )
+
+        return Response(
+            {
+                "status": (
+                    "deleted"
+                    if deleted
+                    else "not_configured"
+                ),
+                "aoi_id": str(aoi.pk),
+            }
+        )
+
+
+# =============================================================================
+# COMPATIBILITY ALIASES
+# =============================================================================
+
+
+SceneListView = SatelliteSceneListView
+
+SceneDetailView = SatelliteSceneDetailView
+
+TemporalTimelineView = AOITimelineView
+
+
+__all__ = [
+    "SatelliteSceneListView",
+    "SatelliteSceneDetailView",
+    "AOIListCreateView",
+    "AOITimelineView",
+    "ChangeAnalysisView",
+    "ChangeEventListView",
+    "ChangeEventDetailView",
+    "SyncStatusView",
+    "AOIMonitoringView",
+    "SceneListView",
+    "SceneDetailView",
+    "TemporalTimelineView",
+]

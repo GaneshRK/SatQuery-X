@@ -56,3 +56,4 @@ secrets/
 # Scratch & local verification scripts
 scratch/
 backend/scratch/
+*.zip

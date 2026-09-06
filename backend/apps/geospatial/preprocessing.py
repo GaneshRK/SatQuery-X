@@ -1,18 +1,27 @@
 """
-AI Noise & Artifact Detection and Preprocessing Pipeline per SIH 26167.
+Remote-sensing preprocessing and artifact-quality assessment.
 
-Handles:
-- Cloud & Cloud Shadow Detection & Masking
-- Atmospheric Haze Reduction (Dark Object Subtraction)
-- SAR Speckle Denoising (Lee Filter)
-- Missing Data / NoData Interpolation
-- Artifact Quality Metrics Reporting
+The preprocessing layer is intentionally conservative.
+
+Optical:
+- cloud screening
+- shadow screening
+- optional haze correction
+
+SAR:
+- speckle filtering
+
+Important:
+Thermal/SAR signal is never classified as "noise" merely because it is
+unusual. Scientific preprocessing must respect modality and product metadata.
 """
 
 from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -20,54 +29,191 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ArtifactQualityReport:
-    cloud_cover_pct: float  # Maintained for backwards compatibility (AOI level)
-    shadow_cover_pct: float
+    cloud_cover_pct: float | None
+    shadow_cover_pct: float | None
+
     haze_detected: bool
     sar_speckle_reduced: bool
-    usable_clear_data_pct: float
-    cleaning_methods_applied: List[str] = field(default_factory=list)
-    scene_cloud_cover_pct: float = 0.0
-    aoi_cloud_cover_pct: float = 0.0
-    haze_pct: float = 0.0
-    nodata_pct: float = 0.0
+
+    usable_clear_data_pct: float | None
+
+    cleaning_methods_applied: list[str] = field(
+        default_factory=list
+    )
+
+    scene_cloud_cover_pct: float | None = None
+    aoi_cloud_cover_pct: float | None = None
+
+    haze_pct: float | None = None
+    nodata_pct: float | None = None
+
     valid_pixels_count: int = 0
     total_pixels_count: int = 0
+
+    warnings: list[str] = field(
+        default_factory=list
+    )
+
+    metrics: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+
+def _to_hwc(
+    raster: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert raster to HWC layout.
+
+    For preprocessing this function only accepts arrays where one dimension
+    is plausibly a small band dimension.
+    """
+
+    arr = np.asarray(raster)
+
+    if arr.ndim == 2:
+        return arr[:, :, None]
+
+    if arr.ndim != 3:
+        raise ValueError(
+            "Raster must be 2D or 3D."
+        )
+
+    if arr.shape[0] <= 16 and arr.shape[1] > 16:
+        return np.transpose(
+            arr,
+            (1, 2, 0),
+        )
+
+    if arr.shape[2] <= 16:
+        return arr
+
+    raise ValueError(
+        "Unable to safely determine raster band layout."
+    )
+
+
+def _normalize_for_screening(
+    raster: np.ndarray,
+) -> np.ndarray:
+    """
+    Normalize only for artifact screening.
+
+    This does not modify the scientific raster.
+    """
+
+    arr = np.asarray(
+        raster,
+        dtype=np.float32,
+    )
+
+    finite = arr[
+        np.isfinite(arr)
+    ]
+
+    if finite.size == 0:
+        return np.zeros_like(
+            arr,
+            dtype=np.float32,
+        )
+
+    low = float(
+        np.percentile(
+            finite,
+            1.0,
+        )
+    )
+
+    high = float(
+        np.percentile(
+            finite,
+            99.0,
+        )
+    )
+
+    if high <= low:
+        return np.zeros_like(
+            arr,
+            dtype=np.float32,
+        )
+
+    return np.clip(
+        (arr - low) / (high - low),
+        0.0,
+        1.0,
+    )
 
 
 def detect_clouds(
     raster: np.ndarray,
-    sensor: str = "SENTINEL-2",
-    brightness_threshold: float = 0.35,
+    sensor: str | None = None,
+    brightness_threshold: float = 0.75,
 ) -> np.ndarray:
     """
-    Detects cloud pixels in optical/multispectral imagery.
-    Returns binary boolean mask where True = cloud contaminated.
+    Conservative optical cloud screening.
+
+    This is a heuristic screening method, not a replacement for a
+    sensor-specific cloud-probability product.
+
+    Returns:
+        Boolean array [height,width].
     """
-    # Normalize array to [0, 1] if needed
-    arr = raster.astype(float)
-    if arr.max() > 1.0:
-        arr = arr / (255.0 if arr.max() <= 255 else 10000.0)
 
-    if len(arr.shape) == 3 and arr.shape[0] >= 3:
-        # Optical RGB/NIR bands
-        # Clouds are typically bright across all optical wavelengths (high Blue, Green, Red)
-        blue = arr[0]
-        green = arr[1]
-        red = arr[2]
-        whiteness = (blue + green + red) / 3.0
-        cloud_mask = (whiteness > brightness_threshold) & (np.abs(blue - red) < 0.15)
-    elif len(arr.shape) == 3 and arr.shape[2] >= 3:
-        blue = arr[:, :, 0]
-        green = arr[:, :, 1]
-        red = arr[:, :, 2]
-        whiteness = (blue + green + red) / 3.0
-        cloud_mask = (whiteness > brightness_threshold) & (np.abs(blue - red) < 0.15)
-    else:
-        # Single band brightness threshold
-        single = arr[0] if len(arr.shape) == 3 else arr
-        cloud_mask = single > brightness_threshold
+    if brightness_threshold <= 0:
+        raise ValueError(
+            "brightness_threshold must be positive."
+        )
 
-    return cloud_mask.astype(bool)
+    hwc = _to_hwc(
+        raster
+    )
+
+    normalized = _normalize_for_screening(
+        hwc
+    )
+
+    height, width, bands = normalized.shape
+
+    if bands >= 3:
+        blue = normalized[:, :, 0]
+        green = normalized[:, :, 1]
+        red = normalized[:, :, 2]
+
+        brightness = (
+            blue
+            + green
+            + red
+        ) / 3.0
+
+        chromaticity = np.maximum.reduce(
+            [
+                blue,
+                green,
+                red,
+            ]
+        ) - np.minimum.reduce(
+            [
+                blue,
+                green,
+                red,
+            ]
+        )
+
+        return (
+            (brightness >= brightness_threshold)
+            & (chromaticity <= 0.20)
+        )
+
+    if bands == 1:
+        return (
+            normalized[:, :, 0]
+            >= brightness_threshold
+        )
+
+    return np.zeros(
+        (height, width),
+        dtype=bool,
+    )
 
 
 def detect_cloud_shadows(
@@ -76,171 +222,611 @@ def detect_cloud_shadows(
     shadow_threshold: float = 0.12,
 ) -> np.ndarray:
     """
-    Detects cloud shadow pixels based on low near-infrared/visible reflectance
-    located adjacent to detected clouds.
-    """
-    arr = raster.astype(float)
-    if arr.max() > 1.0:
-        arr = arr / (255.0 if arr.max() <= 255 else 10000.0)
+    Screen likely dark optical shadow regions.
 
-    if len(arr.shape) == 3 and arr.shape[0] >= 3:
-        luminance = (arr[0] + arr[1] + arr[2]) / 3.0
-    elif len(arr.shape) == 3 and arr.shape[2] >= 3:
-        luminance = (arr[:, :, 0] + arr[:, :, 1] + arr[:, :, 2]) / 3.0
+    This does not claim that every dark pixel is a cloud shadow.
+    """
+
+    hwc = _to_hwc(
+        raster
+    )
+
+    normalized = _normalize_for_screening(
+        hwc
+    )
+
+    if cloud_mask.shape != normalized.shape[:2]:
+        raise ValueError(
+            "cloud_mask shape does not match raster."
+        )
+
+    if normalized.shape[2] >= 3:
+        luminance = np.mean(
+            normalized[:, :, :3],
+            axis=2,
+        )
     else:
-        luminance = arr[0] if len(arr.shape) == 3 else arr
+        luminance = normalized[:, :, 0]
 
-    # Shadow candidates have very low optical luminance and are not already clouds
-    shadow_mask = (luminance < shadow_threshold) & (~cloud_mask)
-    return shadow_mask.astype(bool)
+    shadow = (
+        luminance <= shadow_threshold
+    ) & (~cloud_mask)
+
+    return shadow.astype(bool)
 
 
-def reduce_haze_dos(raster: np.ndarray) -> Tuple[np.ndarray, bool]:
+def reduce_haze_dos(
+    raster: np.ndarray,
+    dark_percentile: float = 1.0,
+    correction_fraction: float = 1.0,
+) -> tuple[np.ndarray, bool]:
     """
-    Reduces atmospheric haze using Dark Object Subtraction (DOS).
-    Finds minimum non-zero background scatter per band and subtracts it.
+    Dark Object Subtraction-style correction.
+
+    This function returns the corrected array and whether a non-zero
+    dark-object offset was detected.
+
+    It should be applied only when the input is compatible with this
+    type of optical correction.
     """
-    arr = raster.astype(np.float32).copy()
-    haze_detected = False
 
-    if len(arr.shape) == 3:
-        for b in range(arr.shape[0]):
-            band = arr[b]
-            valid = band[band > 0]
-            if len(valid) > 0:
-                dark_val = np.percentile(valid, 1.0)
-                if dark_val > 10.0:  # Threshold for atmospheric path radiance
-                    haze_detected = True
-                    arr[b] = np.maximum(0.0, band - dark_val * 0.8)
-    else:
-        valid = arr[arr > 0]
-        if len(valid) > 0:
-            dark_val = np.percentile(valid, 1.0)
-            if dark_val > 10.0:
-                haze_detected = True
-                arr = np.maximum(0.0, arr - dark_val * 0.8)
+    if not 0 <= dark_percentile <= 100:
+        raise ValueError(
+            "dark_percentile must be between 0 and 100."
+        )
 
-    return arr, haze_detected
+    if not 0 <= correction_fraction <= 1:
+        raise ValueError(
+            "correction_fraction must be between 0 and 1."
+        )
+
+    arr = np.asarray(
+        raster,
+        dtype=np.float32,
+    ).copy()
+
+    if arr.ndim not in {
+        2,
+        3,
+    }:
+        raise ValueError(
+            "Raster must be 2D or 3D."
+        )
+
+    detected = False
+
+    if arr.ndim == 2:
+        valid = arr[
+            np.isfinite(arr)
+            & (arr > 0)
+        ]
+
+        if valid.size == 0:
+            return arr, False
+
+        dark_value = float(
+            np.percentile(
+                valid,
+                dark_percentile,
+            )
+        )
+
+        if dark_value > 0:
+            detected = True
+            arr = np.maximum(
+                0.0,
+                arr
+                - (
+                    dark_value
+                    * correction_fraction
+                ),
+            )
+
+        return arr, detected
+
+    # CHW assumed for scientific raster arrays.
+    for band_index in range(
+        arr.shape[0]
+    ):
+        band = arr[
+            band_index
+        ]
+
+        valid = band[
+            np.isfinite(band)
+            & (band > 0)
+        ]
+
+        if valid.size == 0:
+            continue
+
+        dark_value = float(
+            np.percentile(
+                valid,
+                dark_percentile,
+            )
+        )
+
+        if dark_value > 0:
+            detected = True
+
+            arr[
+                band_index
+            ] = np.maximum(
+                0.0,
+                band
+                - (
+                    dark_value
+                    * correction_fraction
+                ),
+            )
+
+    return arr, detected
 
 
-def apply_lee_filter(sar_image: np.ndarray, window_size: int = 5) -> np.ndarray:
+def apply_lee_filter(
+    sar_image: np.ndarray,
+    window_size: int = 5,
+) -> np.ndarray:
     """
-    Applies standard Lee speckle reduction filter on SAR radar imagery.
-    Preserves structural edges while smoothing speckle noise in homogeneous zones.
+    Lee-style local-statistics speckle reduction.
+
+    The function preserves the input numeric domain and does not clip
+    the result to [0,255].
     """
-    arr = sar_image.astype(np.float32)
-    h, w = arr.shape[:2]
-    pad = window_size // 2
 
-    # Simple fast 2D local statistics filter
-    padded = np.pad(arr, pad, mode="reflect")
-    denoised = np.zeros_like(arr)
+    if window_size < 3:
+        raise ValueError(
+            "window_size must be >= 3."
+        )
 
-    # Estimate overall noise variance
-    sample_var = float(np.var(arr))
-    if sample_var < 1e-6:
-        return arr
+    if window_size % 2 == 0:
+        raise ValueError(
+            "window_size must be odd."
+        )
 
-    for i in range(h):
-        for j in range(w):
-            patch = padded[i : i + window_size, j : j + window_size]
-            mean = np.mean(patch)
-            var = np.var(patch)
-            if var > 0:
-                weight = max(0.0, min(1.0, (var - sample_var * 0.5) / var))
-            else:
-                weight = 0.0
-            denoised[i, j] = mean + weight * (arr[i, j] - mean)
+    try:
+        from scipy import ndimage
+    except ImportError as exc:
+        raise RuntimeError(
+            "scipy is required for Lee filtering."
+        ) from exc
 
-    return np.clip(denoised, 0, 255)
+    arr = np.asarray(
+        sar_image,
+        dtype=np.float32,
+    )
+
+    if arr.ndim != 2:
+        raise ValueError(
+            "apply_lee_filter expects a single 2D SAR band."
+        )
+
+    if not np.isfinite(arr).any():
+        return arr.copy()
+
+    local_mean = ndimage.uniform_filter(
+        arr,
+        size=window_size,
+        mode="reflect",
+    )
+
+    local_sq_mean = ndimage.uniform_filter(
+        arr * arr,
+        size=window_size,
+        mode="reflect",
+    )
+
+    local_variance = np.maximum(
+        local_sq_mean
+        - local_mean * local_mean,
+        0.0,
+    )
+
+    global_variance = float(
+        np.nanvar(arr)
+    )
+
+    if global_variance <= 0:
+        return arr.copy()
+
+    noise_variance = min(
+        global_variance,
+        float(
+            np.nanmedian(
+                local_variance
+            )
+        ),
+    )
+
+    weight = np.maximum(
+        local_variance - noise_variance,
+        0.0,
+    ) / np.maximum(
+        local_variance,
+        np.finfo(np.float32).eps,
+    )
+
+    weight = np.clip(
+        weight,
+        0.0,
+        1.0,
+    )
+
+    result = (
+        local_mean
+        + weight
+        * (
+            arr
+            - local_mean
+        )
+    )
+
+    return result.astype(
+        np.float32
+    )
+
+
+def _nodata_mask(
+    raster: np.ndarray,
+) -> np.ndarray:
+    """
+    Detect pixels where all channels are exactly zero.
+
+    Actual nodata masks from raster metadata should be preferred when
+    available.
+    """
+
+    arr = np.asarray(
+        raster
+    )
+
+    if arr.ndim == 2:
+        return arr == 0
+
+    hwc = _to_hwc(
+        arr
+    )
+
+    return np.all(
+        hwc == 0,
+        axis=2,
+    )
 
 
 def clean_satellite_imagery(
     raster: np.ndarray,
-    sensor: str = "SENTINEL-2",
+    sensor: str | None = None,
     modality: str = "OPTICAL",
-    scene_cloud_cover_pct: float = 0.0,
-) -> Tuple[np.ndarray, ArtifactQualityReport]:
+    scene_cloud_cover_pct: float | None = None,
+    apply_haze_correction: bool = False,
+    sar_speckle_filter_size: int = 5,
+) -> tuple[np.ndarray, ArtifactQualityReport]:
     """
-    Master preprocessing & noise reduction entrypoint.
-    Executes:
-    1. Cloud and shadow detection
-    2. Atmospheric haze correction (for optical/multispectral)
-    3. Lee speckle filtering (for SAR radar)
-    4. Compiles artifact quality telemetry
-    """
-    applied_methods = []
-    total_pixels = int(raster.shape[-2] * raster.shape[-1]) if len(raster.shape) >= 2 else 1
-    total_pixels_f = float(total_pixels)
+    Master preprocessing entry point.
 
-    if modality.upper() == "SAR" or "SENTINEL-1" in sensor.upper():
-        # SAR Radar Denoising
-        cleaned = apply_lee_filter(raster[0] if len(raster.shape) == 3 else raster)
-        if len(raster.shape) == 3:
-            cleaned = np.expand_dims(cleaned, axis=0)
-        applied_methods.append("Lee Speckle Filter (Radar Noise Reduction)")
+    The function reports actual detected percentages rather than fabricated
+    values.
+    """
+
+    arr = np.asarray(
+        raster
+    )
+
+    if arr.ndim not in {
+        2,
+        3,
+    }:
+        raise ValueError(
+            "Raster must be 2D or 3D."
+        )
+
+    modality_upper = (
+        modality or ""
+    ).strip().upper()
+
+    methods: list[str] = []
+    warnings: list[str] = []
+
+    hwc = _to_hwc(
+        arr
+    )
+
+    total_pixels = int(
+        hwc.shape[0]
+        * hwc.shape[1]
+    )
+
+    nodata = _nodata_mask(
+        arr
+    )
+
+    nodata_count = int(
+        np.count_nonzero(
+            nodata
+        )
+    )
+
+    nodata_pct = (
+        nodata_count
+        / total_pixels
+        * 100.0
+        if total_pixels
+        else None
+    )
+
+    # ------------------------------------------------------------------
+    # SAR
+    # ------------------------------------------------------------------
+
+    if modality_upper == "SAR":
+        from scipy import ndimage
+
+        if arr.ndim == 2:
+            cleaned = apply_lee_filter(
+                arr,
+                window_size=sar_speckle_filter_size,
+            )
+
+        else:
+            # Convert to CHW if needed.
+            if arr.shape[0] <= 16 and arr.shape[1] > 16:
+                chw = arr.copy()
+            else:
+                chw = np.transpose(
+                    arr,
+                    (2, 0, 1),
+                ).copy()
+
+            for index in range(
+                chw.shape[0]
+            ):
+                chw[index] = apply_lee_filter(
+                    chw[index],
+                    window_size=sar_speckle_filter_size,
+                )
+
+            cleaned = (
+                chw
+                if arr.shape[0] <= 16
+                and arr.shape[1] > 16
+                else np.transpose(
+                    chw,
+                    (1, 2, 0),
+                )
+            )
+
+        methods.append(
+            "SAR speckle reduction"
+        )
+
+        valid_count = int(
+            total_pixels
+            - nodata_count
+        )
+
+        usable_pct = (
+            valid_count
+            / total_pixels
+            * 100.0
+            if total_pixels
+            else None
+        )
 
         report = ArtifactQualityReport(
-            cloud_cover_pct=0.0,
-            shadow_cover_pct=0.0,
+            cloud_cover_pct=None,
+            shadow_cover_pct=None,
             haze_detected=False,
             sar_speckle_reduced=True,
-            usable_clear_data_pct=100.0,
-            cleaning_methods_applied=applied_methods,
+            usable_clear_data_pct=usable_pct,
+            cleaning_methods_applied=methods,
             scene_cloud_cover_pct=scene_cloud_cover_pct,
-            aoi_cloud_cover_pct=0.0,
-            haze_pct=0.0,
-            nodata_pct=0.0,
-            valid_pixels_count=total_pixels,
+            aoi_cloud_cover_pct=None,
+            haze_pct=None,
+            nodata_pct=round(
+                nodata_pct,
+                4,
+            )
+            if nodata_pct is not None
+            else None,
+            valid_pixels_count=valid_count,
             total_pixels_count=total_pixels,
+            warnings=warnings,
+            metrics={
+                "modality": "SAR",
+                "nodata_pixels": nodata_count,
+            },
         )
+
         return cleaned, report
 
-    # Check for NoData pixels (zeros across all channels)
-    if len(raster.shape) == 3:
-        nodata_mask = np.all(raster == 0, axis=-1 if raster.shape[-1] <= 4 else 0)
-    else:
-        nodata_mask = raster == 0
-    nodata_cnt = int(np.count_nonzero(nodata_mask))
-    nodata_pct = round((nodata_cnt / total_pixels_f) * 100.0, 1)
+    # ------------------------------------------------------------------
+    # Optical / multispectral
+    # ------------------------------------------------------------------
 
-    # Optical & Multispectral Pipeline
-    clouds = detect_clouds(raster, sensor=sensor)
-    shadows = detect_cloud_shadows(raster, clouds)
+    if modality_upper not in {
+        "OPTICAL",
+        "MULTISPECTRAL",
+    }:
+        warnings.append(
+            f"No modality-specific preprocessing pipeline exists "
+            f"for '{modality}'."
+        )
 
-    cloud_cnt = int(np.count_nonzero(clouds))
-    shadow_cnt = int(np.count_nonzero(shadows))
+        report = ArtifactQualityReport(
+            cloud_cover_pct=None,
+            shadow_cover_pct=None,
+            haze_detected=False,
+            sar_speckle_reduced=False,
+            usable_clear_data_pct=None,
+            cleaning_methods_applied=[],
+            scene_cloud_cover_pct=scene_cloud_cover_pct,
+            nodata_pct=(
+                round(
+                    nodata_pct,
+                    4,
+                )
+                if nodata_pct is not None
+                else None
+            ),
+            valid_pixels_count=(
+                total_pixels
+                - nodata_count
+            ),
+            total_pixels_count=total_pixels,
+            warnings=warnings,
+        )
 
-    cloud_pct = round((cloud_cnt / total_pixels_f) * 100.0, 1)
-    shadow_pct = round((shadow_cnt / total_pixels_f) * 100.0, 1)
+        return arr.copy(), report
 
-    if cloud_pct > 0:
-        applied_methods.append(f"AI Cloud Masking ({cloud_pct}% detected)")
-    if shadow_pct > 0:
-        applied_methods.append(f"Cloud Shadow Masking ({shadow_pct}% detected)")
+    cloud_mask = detect_clouds(
+        arr,
+        sensor=sensor,
+    )
 
-    # Atmospheric Haze Correction
-    cleaned, haze_detected = reduce_haze_dos(raster)
-    haze_pct = 2.1 if haze_detected else 0.0
-    if haze_detected:
-        applied_methods.append("Atmospheric Haze Correction (Dark Object Subtraction)")
+    shadow_mask = detect_cloud_shadows(
+        arr,
+        cloud_mask,
+    )
 
-    usable_pct = max(0.0, round(100.0 - cloud_pct - shadow_pct - nodata_pct, 1))
-    valid_pixels = int(total_pixels * (usable_pct / 100.0))
+    cloud_count = int(
+        np.count_nonzero(
+            cloud_mask
+        )
+    )
+
+    shadow_count = int(
+        np.count_nonzero(
+            shadow_mask
+        )
+    )
+
+    cloud_pct = (
+        cloud_count
+        / total_pixels
+        * 100.0
+        if total_pixels
+        else None
+    )
+
+    shadow_pct = (
+        shadow_count
+        / total_pixels
+        * 100.0
+        if total_pixels
+        else None
+    )
+
+    cleaned = arr.copy()
+
+    if cloud_count:
+        methods.append(
+            "Optical cloud screening"
+        )
+
+    if shadow_count:
+        methods.append(
+            "Optical shadow screening"
+        )
+
+    haze_detected = False
+    haze_pct = None
+
+    if apply_haze_correction:
+        cleaned, haze_detected = reduce_haze_dos(
+            cleaned
+        )
+
+        if haze_detected:
+            methods.append(
+                "Dark Object Subtraction haze correction"
+            )
+
+        # Haze percentage is intentionally not fabricated.
+        haze_pct = None
+
+    contaminated = (
+        cloud_mask
+        | shadow_mask
+        | nodata
+    )
+
+    valid_count = int(
+        total_pixels
+        - np.count_nonzero(
+            contaminated
+        )
+    )
+
+    usable_pct = (
+        valid_count
+        / total_pixels
+        * 100.0
+        if total_pixels
+        else None
+    )
+
+    if scene_cloud_cover_pct is not None:
+        if not 0 <= scene_cloud_cover_pct <= 100:
+            warnings.append(
+                "Provided scene cloud percentage is outside 0-100."
+            )
 
     report = ArtifactQualityReport(
-        cloud_cover_pct=cloud_pct,
-        shadow_cover_pct=shadow_pct,
+        cloud_cover_pct=(
+            round(
+                cloud_pct,
+                4,
+            )
+            if cloud_pct is not None
+            else None
+        ),
+        shadow_cover_pct=(
+            round(
+                shadow_pct,
+                4,
+            )
+            if shadow_pct is not None
+            else None
+        ),
         haze_detected=haze_detected,
         sar_speckle_reduced=False,
-        usable_clear_data_pct=usable_pct,
-        cleaning_methods_applied=applied_methods,
-        scene_cloud_cover_pct=scene_cloud_cover_pct or cloud_pct,
-        aoi_cloud_cover_pct=cloud_pct,
+        usable_clear_data_pct=(
+            round(
+                usable_pct,
+                4,
+            )
+            if usable_pct is not None
+            else None
+        ),
+        cleaning_methods_applied=methods,
+        scene_cloud_cover_pct=scene_cloud_cover_pct,
+        aoi_cloud_cover_pct=(
+            round(
+                cloud_pct,
+                4,
+            )
+            if cloud_pct is not None
+            else None
+        ),
         haze_pct=haze_pct,
-        nodata_pct=nodata_pct,
-        valid_pixels_count=valid_pixels,
+        nodata_pct=(
+            round(
+                nodata_pct,
+                4,
+            )
+            if nodata_pct is not None
+            else None
+        ),
+        valid_pixels_count=valid_count,
         total_pixels_count=total_pixels,
+        warnings=warnings,
+        metrics={
+            "modality": modality_upper,
+            "cloud_pixels": cloud_count,
+            "shadow_pixels": shadow_count,
+            "nodata_pixels": nodata_count,
+        },
     )
 
     return cleaned, report
