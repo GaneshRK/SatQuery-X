@@ -1,6 +1,5 @@
 import type { Metadata } from 'next';
 import './globals.css';
-import './starter-styles.css';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import Providers from '../components/Providers';
 

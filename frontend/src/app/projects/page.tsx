@@ -1,164 +1,268 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  FolderKanban,
+  FolderPlus,
+  Search,
+  Bot,
+  Calendar,
+  Layers,
+  ArrowRight,
+  Sparkles,
+  ShieldCheck,
+  CheckCircle2,
+  Clock,
+  Filter,
+} from "lucide-react";
 import AppShell from "../../components/AppShell";
 import SectionTitle from "../../components/SectionTitle";
+import { Card } from "../../components/ui/Card";
+import { Button } from "../../components/ui/Button";
+import { Badge } from "../../components/ui/Badge";
+import { Modal } from "../../components/ui/Modal";
 import { analysisApi } from "../../services/contractClient";
-import { FolderPlus } from "lucide-react";
 
-const initialCards = [
-  [
-    "Coimbatore Vegetation Analysis",
-    "Updated Sep 2026",
-    "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?auto=format&fit=crop&w=500&q=80",
-  ],
-  [
-    "Flood Impact Assessment - Kerala",
-    "Updated Aug 2026",
-    "https://images.unsplash.com/photo-1500534623283-312aade485b7?auto=format&fit=crop&w=500&q=80",
-  ],
-  [
-    "Urban Expansion - Chennai",
-    "Updated Aug 2026",
-    "https://images.unsplash.com/photo-1519501025264-65ba15a82390?auto=format&fit=crop&w=500&q=80",
-  ],
-  [
-    "Water Body Detection - Tamil Nadu",
-    "Updated Jul 2026",
-    "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=500&q=80",
-  ],
-];
+interface ProjectItem {
+  id: string | number;
+  name: string;
+  description?: string;
+  created_at?: string;
+  updated_at?: string;
+  imagery_count?: number;
+  analysis_count?: number;
+  status?: string;
+}
 
 export default function ProjectsPage() {
-  const [projects, setProjects] = useState<any[]>([]);
-  const [showModal, setShowModal] = useState(false);
+  const router = useRouter();
+  const [projects, setProjects] = useState<ProjectItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDesc, setNewProjectDesc] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const fetchProjects = async () => {
+    try {
+      setLoading(true);
+      const { data } = await analysisApi.projects();
+      const items = Array.isArray(data) ? data : data.results || [];
+      setProjects(items);
+    } catch (err) {
+      console.warn("Error fetching projects:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    analysisApi
-      .projects()
-      .then(({ data }) => {
-        if (data && data.length > 0) {
-          setProjects(data);
-        }
-      })
-      .catch((e) => console.warn("Projects load:", e));
+    fetchProjects();
   }, []);
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newProjectName.trim()) return;
+    if (!newProjectName.trim() || isSubmitting) return;
+
     try {
-      const { data } = await analysisApi.createProject({
+      setIsSubmitting(true);
+      await analysisApi.createProject({
         name: newProjectName.trim(),
         description: newProjectDesc.trim(),
       });
-      setProjects((prev) => [data, ...prev]);
       setNewProjectName("");
       setNewProjectDesc("");
-      setShowModal(false);
+      setShowCreateModal(false);
+      await fetchProjects();
     } catch (err) {
-      console.error(err);
+      console.error("Failed to create project:", err);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
+  const filteredProjects = projects.filter(
+    (p) =>
+      p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (p.description && p.description.toLowerCase().includes(searchQuery.toLowerCase()))
+  );
+
   return (
     <AppShell>
-      <div className="page">
+      <div className="p-6 max-w-7xl mx-auto space-y-6">
         <SectionTitle
-          title="My Projects"
-          subtitle="Create and manage your geospatial analysis investigations."
+          title="Mission Workspaces & Projects"
+          subtitle="Organize multi-temporal planetary investigations, sensor catalogs, and verified evidence logs."
           action={
-            <button className="btn primary" onClick={() => setShowModal(true)}>
-              + New Project
-            </button>
+            <Button
+              variant="primary"
+              icon={<FolderPlus className="w-4 h-4" />}
+              onClick={() => setShowCreateModal(true)}
+            >
+              New Investigation
+            </Button>
           }
         />
 
-        {showModal && (
-          <div
-            className="panel"
-            style={{
-              maxWidth: 500,
-              marginBottom: 16,
-              background: "#081e2a",
-              border: "1px solid #2ee79b",
-            }}
-          >
-            <h3 style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <FolderPlus size={16} color="#2ee79b" /> Create New Analysis Project
-            </h3>
-            <form onSubmit={handleCreateProject} style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
-              <input
-                value={newProjectName}
-                onChange={(e) => setNewProjectName(e.target.value)}
-                placeholder="Project title (e.g. Western Ghats Forest Cover)"
-                required
-                style={{
-                  background: "#071620",
-                  border: "1px solid #1c3d4c",
-                  padding: "8px 12px",
-                  borderRadius: 6,
-                  color: "#fff",
-                }}
-              />
-              <textarea
-                value={newProjectDesc}
-                onChange={(e) => setNewProjectDesc(e.target.value)}
-                placeholder="Project description & goals..."
-                rows={2}
-                style={{
-                  background: "#071620",
-                  border: "1px solid #1c3d4c",
-                  padding: "8px 12px",
-                  borderRadius: 6,
-                  color: "#fff",
-                }}
-              />
-              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                <button
-                  type="button"
-                  className="btn ghost small"
-                  onClick={() => setShowModal(false)}
-                >
-                  Cancel
-                </button>
-                <button type="submit" className="btn primary small">
-                  Save Project
-                </button>
-              </div>
-            </form>
+        {/* Search & Filter Header */}
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="relative w-full sm:w-80">
+            <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-3" />
+            <input
+              type="text"
+              placeholder="Search workspaces by name or description..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+            />
+          </div>
+
+          <div className="text-xs font-mono text-slate-400">
+            <span>Total Investigations: </span>
+            <span className="text-cyan-400 font-bold">{projects.length}</span>
+          </div>
+        </div>
+
+        {/* Projects Grid or Real Empty State */}
+        {loading ? (
+          <div className="py-24 text-center text-xs text-slate-500">
+            Loading investigation workspaces...
+          </div>
+        ) : filteredProjects.length === 0 ? (
+          <Card className="p-12 text-center space-y-4 max-w-xl mx-auto">
+            <div className="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 flex items-center justify-center mx-auto">
+              <FolderKanban className="w-6 h-6" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-base font-semibold text-slate-100">
+                {searchQuery ? "No Matching Workspaces" : "No Investigation Projects Yet"}
+              </h3>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                {searchQuery
+                  ? "Try refining your search keyword."
+                  : "Create an investigation workspace to group multi-temporal satellite analyses, Copernicus rasters, and SIH proof chains."}
+              </p>
+            </div>
+            {!searchQuery && (
+              <Button
+                variant="primary"
+                icon={<FolderPlus className="w-4 h-4" />}
+                onClick={() => setShowCreateModal(true)}
+              >
+                Create First Investigation
+              </Button>
+            )}
+          </Card>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {filteredProjects.map((project) => (
+              <Card
+                key={project.id}
+                className="p-5 hover:border-cyan-500/40 transition-all flex flex-col justify-between space-y-4"
+              >
+                <div className="space-y-2">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 flex items-center justify-center shrink-0">
+                        <FolderKanban className="w-4 h-4" />
+                      </div>
+                      <h3 className="text-sm font-bold text-white leading-tight">
+                        {project.name}
+                      </h3>
+                    </div>
+                    <Badge variant="cyan" size="sm">
+                      {project.status || "ACTIVE"}
+                    </Badge>
+                  </div>
+
+                  <p className="text-xs text-slate-400 line-clamp-2 leading-relaxed">
+                    {project.description || "Geospatial Earth observation investigation."}
+                  </p>
+                </div>
+
+                <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500 font-mono">
+                  <div className="flex items-center gap-1.5">
+                    <Calendar className="w-3.5 h-3.5 text-slate-400" />
+                    <span>
+                      {project.created_at
+                        ? new Date(project.created_at).toLocaleDateString()
+                        : "Sep 2026"}
+                    </span>
+                  </div>
+
+                  <button
+                    onClick={() =>
+                      router.push(`/assistant?q=${encodeURIComponent(`Analyze ${project.name}`)}`)
+                    }
+                    className="flex items-center gap-1 text-cyan-400 hover:text-cyan-300 font-sans font-semibold transition-colors"
+                  >
+                    <span>Open in AI Workstation</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </Card>
+            ))}
           </div>
         )}
 
-        <div className="projects-grid">
-          {projects.map((p) => (
-            <Link href="/analysis" className="project-card" key={p.id}>
-              <img
-                src="https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=500&q=80"
-                alt="Project Thumbnail"
+        {/* Modal: Create Investigation Project */}
+        <Modal
+          isOpen={showCreateModal}
+          onClose={() => setShowCreateModal(false)}
+          title="Create New Investigation Workspace"
+          maxWidth="max-w-lg"
+        >
+          <form onSubmit={handleCreateProject} className="space-y-4 pt-2">
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                Investigation / Project Name
+              </label>
+              <input
+                type="text"
+                placeholder="e.g. Coimbatore Urban Expansion & Canopy Audit"
+                value={newProjectName}
+                onChange={(e) => setNewProjectName(e.target.value)}
+                required
+                className="w-full px-3.5 py-2.5 rounded-lg bg-[#0d1f2e] border border-[#153245] text-white text-sm focus:outline-none focus:border-cyan-400 transition-colors"
               />
-              <div>
-                <h3>{p.name}</h3>
-                <span>{p.description || "Created recently"}</span>
-              </div>
-              <b>⋮</b>
-            </Link>
-          ))}
+            </div>
 
-          {initialCards.map(([title, date, img]) => (
-            <Link href="/analysis" className="project-card" key={title}>
-              <img src={img} alt={title} />
-              <div>
-                <h3>{title}</h3>
-                <span>{date}</span>
-              </div>
-              <b>⋮</b>
-            </Link>
-          ))}
-        </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                Investigation Objective & Scope
+              </label>
+              <textarea
+                placeholder="Describe the target AOI, monitoring interval, or physical hypotheses to test..."
+                value={newProjectDesc}
+                onChange={(e) => setNewProjectDesc(e.target.value)}
+                rows={3}
+                className="w-full px-3.5 py-2.5 rounded-lg bg-[#0d1f2e] border border-[#153245] text-white text-sm focus:outline-none focus:border-cyan-400 transition-colors"
+              />
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <Button
+                variant="ghost"
+                type="button"
+                onClick={() => setShowCreateModal(false)}
+                disabled={isSubmitting}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                type="submit"
+                loading={isSubmitting}
+                icon={<FolderPlus className="w-4 h-4" />}
+              >
+                Create Workspace
+              </Button>
+            </div>
+          </form>
+        </Modal>
       </div>
     </AppShell>
   );
