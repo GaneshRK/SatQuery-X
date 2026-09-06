@@ -6,6 +6,8 @@ from django.contrib import admin
 from django.urls import include, path
 
 from apps.imagery.views import (
+    DedicatedImageryDetailView,
+    DedicatedImageryPreviewView,
     ImageAssetClipAOIView,
     ImageAssetDetailView,
     ImageAssetPreviewView,
@@ -60,7 +62,9 @@ api_v1_patterns = [
     path("sessions/<uuid:session_id>/pairs/", SessionPairListCreateView.as_view(), name="session_pairs"),
     path("sessions/<uuid:session_id>/pairs/<uuid:pair_id>/", ImagePairDetailView.as_view(), name="pair_detail"),
 
-    # Dynamic XYZ Raster Tiles
+    # Dynamic XYZ Raster Tiles & Dedicated Imagery Details
+    path("imagery/<uuid:image_id>/", DedicatedImageryDetailView.as_view(), name="dedicated_image_detail"),
+    path("imagery/<uuid:image_id>/preview/", DedicatedImageryPreviewView.as_view(), name="dedicated_image_preview"),
     path("imagery/<uuid:image_id>/tiles/<int:z>/<int:x>/<int:y>/", ImageAssetTileView.as_view(), name="image_tiles"),
 
     # Queries & SSE stream & Multi-Format Exports
@@ -92,9 +96,38 @@ api_v1_patterns = [
     path("models/<str:model_id>/", ModelRegistryDetailView.as_view(), name="model_detail"),
 ]
 
+from apps.system.frontend_contract_views import (
+    ContractRegisterView,
+    ContractLoginView,
+    ContractMeView,
+    ContractForgotPasswordView,
+    ContractVerifyEmailView,
+    ContractAnalysisQueryView,
+    ContractAnalysisHistoryView,
+    ContractAnalysisDetailView,
+    ContractProjectListCreateView,
+)
+from rest_framework_simplejwt.views import TokenRefreshView
+
+frontend_starter_patterns = [
+    path("auth/register/", ContractRegisterView.as_view(), name="contract_register"),
+    path("auth/login/", ContractLoginView.as_view(), name="contract_login"),
+    path("auth/token/refresh/", TokenRefreshView.as_view(), name="contract_token_refresh"),
+    path("auth/me/", ContractMeView.as_view(), name="contract_me"),
+    path("auth/forgot-password/", ContractForgotPasswordView.as_view(), name="contract_forgot_password"),
+    path("auth/verify-email/", ContractVerifyEmailView.as_view(), name="contract_verify_email"),
+    path("analysis/query/", ContractAnalysisQueryView.as_view(), name="contract_analysis_query"),
+    path("analysis/history/", ContractAnalysisHistoryView.as_view(), name="contract_analysis_history"),
+    path("analysis/<str:pk>/", ContractAnalysisDetailView.as_view(), name="contract_analysis_detail"),
+    path("imagery/<uuid:image_id>/", DedicatedImageryDetailView.as_view(), name="contract_image_detail"),
+    path("imagery/<uuid:image_id>/preview/", DedicatedImageryPreviewView.as_view(), name="contract_image_preview"),
+    path("projects/", ContractProjectListCreateView.as_view(), name="contract_projects"),
+]
+
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/", include(api_v1_patterns)),
+    path("api/", include(frontend_starter_patterns)),
 ]
 
 if settings.DEBUG:

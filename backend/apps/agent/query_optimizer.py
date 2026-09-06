@@ -159,6 +159,19 @@ class QueryOptimizer:
         if history and any(k in q for k in ("only show", "filter", "which of these", "how many of them", "why", "what about", "focus on", "were they", "how much did")):
             is_follow_up = True
 
+        uncertainty_notes = []
+        if aoi.get("bbox") is None and not session_context.get("has_images"):
+            uncertainty_notes.append("Spatial bounding box is unspecified. Clarification required if no satellite scene is uploaded.")
+            if not clarification_prompt and intent in ("LATEST_OBSERVATION", "SATELLITE_SEARCH", "mission", "temporal_change"):
+                clarification_prompt = (
+                    "Please specify an area of interest, place name (e.g. 'Pollachi', 'Kaziranga', 'Chennai'), or bounding box coordinates."
+                )
+                clarification_options = [
+                    {"label": "Pollachi Agricultural Belt", "query": f"{text} around Pollachi"},
+                    {"label": "Kaziranga National Park", "query": f"{text} in Kaziranga"},
+                    {"label": "Chennai Metropolitan Area", "query": f"{text} in Chennai"},
+                ]
+
         return StructuredQueryPlan(
             intent=intent,
             target=target,
@@ -172,28 +185,22 @@ class QueryOptimizer:
             is_follow_up=is_follow_up,
             requested_measurements=measurements,
             confidence_threshold=0.75 if external_required else 0.70,
+            uncertainty_notes=uncertainty_notes,
             clarification_prompt=clarification_prompt,
             clarification_options=clarification_options,
         )
 
     def _resolve_aoi(self, q: str, session_context: Dict[str, Any]) -> Dict[str, Any]:
-        # Check explicit location mentions in query
-        for key, loc in self.KNOWN_LOCATIONS.items():
-            if key in q:
-                return loc
-
-        # Fall back to session context active AOI or default
-        if session_context.get("aoi_name") and session_context.get("bbox"):
-            return {
-                "name": session_context["aoi_name"],
-                "bbox": session_context["bbox"],
-                "coords": session_context.get("centroid", [80.25, 13.05]),
-            }
+        from apps.agent.geocoding import resolve_location
+        loc = resolve_location(q, session_context)
+        if loc:
+            return loc
 
         return {
-            "name": "Designated Area of Interest",
-            "bbox": [80.15, 12.95, 80.35, 13.15],
-            "coords": [80.2707, 13.0827],
+            "name": "Unspecified Area of Interest",
+            "bbox": None,
+            "coords": None,
+            "requires_clarification": True,
         }
 
     def _resolve_time_range(self, q: str, now: date) -> Dict[str, str]:

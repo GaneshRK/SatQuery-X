@@ -19,6 +19,7 @@ interface HeaderProps {
   onOpenUpload: () => void;
   onOpenReport: () => void;
   onOpenSatelliteSearch?: () => void;
+  onOpenHealth?: () => void;
   hasTrace: boolean;
   sessions?: SessionData[];
   activeSessionId?: string;
@@ -31,6 +32,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenUpload,
   onOpenReport,
   onOpenSatelliteSearch,
+  onOpenHealth,
   hasTrace,
   sessions = [],
   activeSessionId,
@@ -148,6 +150,18 @@ export const Header: React.FC<HeaderProps> = ({
           <span>Telemetry:</span>
           {getModeBadge()}
         </div>
+
+        {/* Diagnostics & Subsystems Modal */}
+        {onOpenHealth && (
+          <button
+            onClick={onOpenHealth}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900/90 hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-medium font-mono border border-slate-800 hover:border-slate-700 transition-all active:scale-95"
+            title="Inspect System Health & Models Registry"
+          >
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden sm:inline">Diagnostics</span>
+          </button>
+        )}
 
         {/* Satellite Copernicus Search */}
         {onOpenSatelliteSearch && (

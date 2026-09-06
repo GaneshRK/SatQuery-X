@@ -76,6 +76,16 @@ def generate_synthetic_sentinel_geotiff(filepath: str, sensor: str, bounds: dict
         for i in range(count):
             dst.write(data[i], i + 1)
 
+    # Automatically derive RGB WebP/PNG preview and thumbnail for browser visualization
+    from apps.imagery.services.preview import generate_rgb_preview
+    base_name = os.path.splitext(filepath)[0]
+    preview_path = f"{base_name}_rgb.webp"
+    thumb_path = f"{base_name}_thumb.webp"
+    try:
+        generate_rgb_preview(filepath, preview_path, thumb_path)
+    except Exception as exc:
+        logger.warning("Could not derive RGB preview for %s: %s", filepath, exc)
+
     return {
         "width": width,
         "height": height,
@@ -83,6 +93,8 @@ def generate_synthetic_sentinel_geotiff(filepath: str, sensor: str, bounds: dict
         "crs": crs,
         "affine": list(transform)[:6],
         "bounds": {"west": west, "south": south, "east": east, "north": north},
+        "preview_path": preview_path if os.path.exists(preview_path) else None,
+        "thumbnail_path": thumb_path if os.path.exists(thumb_path) else None,
     }
 
 

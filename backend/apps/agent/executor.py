@@ -78,6 +78,31 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
     if primary_arr is None:
         primary_arr = np.full((512, 512, 4), 100, dtype=np.uint8)
 
+    # AI Noise & Artifact Detection and Preprocessing Pipeline per SIH 26167
+    from apps.geospatial.preprocessing import clean_satellite_imagery
+    sensor_name = getattr(primary_img, "sensor", "SENTINEL-2") if primary_img else "SENTINEL-2"
+    modality_name = getattr(primary_img, "modality", "OPTICAL") if primary_img else "OPTICAL"
+    
+    cleaned_arr, quality_report = clean_satellite_imagery(
+        primary_arr,
+        sensor=sensor_name,
+        modality=modality_name,
+    )
+    primary_arr = cleaned_arr
+
+    publish_query_event(redis_client, str(query.id), {
+        "event": "PREPROCESSING_COMPLETED",
+        "query_id": str(query.id),
+        "sensor": sensor_name,
+        "modality": modality_name,
+        "cloud_cover_pct": quality_report.cloud_cover_pct,
+        "shadow_cover_pct": quality_report.shadow_cover_pct,
+        "haze_detected": quality_report.haze_detected,
+        "sar_speckle_reduced": quality_report.sar_speckle_reduced,
+        "usable_clear_data_pct": quality_report.usable_clear_data_pct,
+        "cleaning_methods": quality_report.cleaning_methods_applied,
+    })
+
     registry = ToolRegistry.get_instance()
 
     for item in steps:
@@ -123,36 +148,43 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
                 # If features were returned, create EvidenceRegion objects
                 features = tool_result.get("features", [])
                 for feat in features[:20]:
+                    feat_conf = feat.get("confidence")
                     EvidenceRegion.objects.create(
                         query=query,
                         geojson_geometry=feat["geometry"],
                         class_name=feat["label"],
-                        confidence=feat.get("confidence", 0.88),
+                        confidence=feat_conf,
                         area_m2=feat.get("area_m2", 0.0),
                         area_km2=feat.get("area_km2", 0.0),
                         source_step=step_row,
                     )
+
+                feat_confs = [float(f["confidence"]) for f in features if f.get("confidence") is not None]
+                mean_feat_conf = float(np.mean(feat_confs)) if feat_confs else None
 
                 # Synthesize answer if applicable
                 if tool_name == "detect_water":
                     count = tool_result.get("water_features_count", 0)
                     area = tool_result.get("total_water_km2", 0.0)
                     final_answer = f"Water detection identified {count} contiguous water bodies covering a total surface area of {area:.2f} km²."
-                    confidences.append(0.92)
+                    if mean_feat_conf is not None:
+                        confidences.append(mean_feat_conf)
                 elif tool_name == "detect_vegetation":
                     area = tool_result.get("total_veg_km2", 0.0)
                     final_answer = f"Vegetation canopy extraction identifies {area:.2f} km² of dense vegetative cover across the AOI."
-                    confidences.append(0.89)
+                    if mean_feat_conf is not None:
+                        confidences.append(mean_feat_conf)
                 elif tool_name == "detect_and_count_structures":
                     count = tool_result.get("candidate_count", 0)
                     area = tool_result.get("total_structure_km2", 0.0)
                     final_answer = f"Detected {count} structural infrastructure candidates covering {area:.2f} km² across the scene."
-                    confidences.append(0.87)
+                    if mean_feat_conf is not None:
+                        confidences.append(mean_feat_conf)
                 elif tool_name == "calculate_ndvi":
                     mean_ndvi = tool_result.get("mean_ndvi", 0.0)
                     veg_pct = tool_result.get("vegetation_coverage_pct", 0.0)
                     final_answer = f"Mean NDVI index is {mean_ndvi:.2f}, indicating {veg_pct:.1f}% vegetative land-cover."
-                    confidences.append(0.94)
+                    confidences.append(round(min(0.98, max(0.65, 0.75 + abs(mean_ndvi) * 0.2)), 2))
 
                 step_outputs[f"step_{step_num}"] = tool_result
                 step_row.status = "DONE"
@@ -282,7 +314,7 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
                 "error": str(exc),
             })
 
-    avg_confidence = float(np.mean(confidences)) if confidences else 0.85
+    avg_confidence = float(np.mean(confidences)) if confidences else None
     if not final_answer:
         final_answer = f"Completed {len(steps)} analysis step(s). Evidence regions and metrics have been extracted."
 
@@ -331,10 +363,20 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
             "platform": primary_img.sensor or "Sentinel-2",
             "external_id": prov.get("stac_item_id", "SCENE_PRIMARY"),
             "acquisition_date": prov.get("acquisition_date", timezone.now().strftime("%Y-%m-%d")),
-            "cloud_cover": 5.0,
+            "cloud_cover": float(prov.get("cloud_cover", getattr(primary_img, "cloud_cover_pct", 0.0) or 0.0)),
         })
 
-    measurements_dict = {"step_count": len(steps)}
+    measurements_dict = {
+        "step_count": len(steps),
+        "noise_cleaning": {
+            "cloud_cover_pct": quality_report.cloud_cover_pct,
+            "shadow_cover_pct": quality_report.shadow_cover_pct,
+            "haze_detected": quality_report.haze_detected,
+            "sar_speckle_reduced": quality_report.sar_speckle_reduced,
+            "usable_clear_data_pct": quality_report.usable_clear_data_pct,
+            "cleaning_methods_applied": quality_report.cleaning_methods_applied,
+        },
+    }
     for s_out in step_outputs.values():
         if isinstance(s_out, dict):
             measurements_dict.update(s_out)
@@ -376,10 +418,7 @@ def execute_plan(query: Query, plan: dict[str, Any], image_assets: list[Any], im
     plan_dict["ui_actions"] = reason_res.ui_actions
     query.structured_plan = plan_dict
 
-    if final_answer and final_answer not in (reason_res.synthesized_answer or ""):
-        query.answer = f"{final_answer} {reason_res.synthesized_answer}".strip()
-    else:
-        query.answer = reason_res.synthesized_answer or final_answer
+    query.answer = reason_res.synthesized_answer or final_answer or "Satellite analysis completed successfully."
     query.confidence = reason_res.calibrated_confidence or avg_confidence
     query.evidence_graph = reason_res.evidence_graph
 

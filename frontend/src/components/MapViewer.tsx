@@ -28,6 +28,11 @@ interface MapViewerProps {
   onAskThisArea?: (aoi: any, promptText?: string) => void;
   onExplainFeature?: (feature: ExplainFeatureData) => void;
   uiActions?: UIAction[];
+  onViewportChange?: (viewport: {
+    bbox: [number, number, number, number];
+    center: [number, number];
+    zoom: number;
+  }) => void;
 }
 
 type BasemapType = 'satellite' | 'dark' | 'osm';
@@ -87,6 +92,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({
   onAskThisArea,
   onExplainFeature,
   uiActions,
+  onViewportChange,
 }) => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -200,6 +206,31 @@ export const MapViewer: React.FC<MapViewerProps> = ({
     map.on('zoom', () => {
       setZoomLevel(Number(map.getZoom().toFixed(1)));
     });
+
+    const emitViewport = () => {
+      try {
+        const b = map.getBounds();
+        const c = map.getCenter();
+        const z = map.getZoom();
+        if (b && c && onViewportChange) {
+          onViewportChange({
+            bbox: [
+              Number(b.getWest().toFixed(5)),
+              Number(b.getSouth().toFixed(5)),
+              Number(b.getEast().toFixed(5)),
+              Number(b.getNorth().toFixed(5)),
+            ],
+            center: [Number(c.lng.toFixed(5)), Number(c.lat.toFixed(5))],
+            zoom: Number(z.toFixed(1)),
+          });
+        }
+      } catch (err) {
+        // Map bounds not ready yet
+      }
+    };
+
+    map.on('moveend', emitViewport);
+    map.on('load', emitViewport);
 
     mapRef.current = map;
 
@@ -370,7 +401,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({
           const props = e.features[0].properties || {};
           setHoveredFeature({
             class_name: props.class_name || 'Detected Feature',
-            confidence: props.confidence ? Number(props.confidence) : 0.92,
+            confidence: props.confidence != null ? Number(props.confidence) : undefined,
             area_km2: props.area_km2 ? Number(props.area_km2) : evidence.quantified_area_km2 || undefined,
             x: e.point.x,
             y: e.point.y,
@@ -391,7 +422,7 @@ export const MapViewer: React.FC<MapViewerProps> = ({
             onExplainFeature({
               id: props.id ? String(props.id) : undefined,
               class_name: props.class_name || 'Detected Feature',
-              confidence: props.confidence ? Number(props.confidence) : 0.92,
+              confidence: props.confidence != null ? Number(props.confidence) : undefined,
               area_km2: props.area_km2 ? Number(props.area_km2) : evidence.quantified_area_km2 || undefined,
               area_ha: props.area_km2 ? Number(props.area_km2) * 100 : (evidence.quantified_area_hectares || undefined),
               centroid: [Number(e.lngLat.lng.toFixed(5)), Number(e.lngLat.lat.toFixed(5))],
@@ -621,6 +652,29 @@ export const MapViewer: React.FC<MapViewerProps> = ({
     setAoiAreaHa(null);
   };
 
+  const handleLiveSatelliteClick = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const center = map.getCenter();
+    const bounds = map.getBounds();
+    const viewportAOI = {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [bounds.getWest(), bounds.getSouth()],
+          [bounds.getEast(), bounds.getSouth()],
+          [bounds.getEast(), bounds.getNorth()],
+          [bounds.getWest(), bounds.getNorth()],
+          [bounds.getWest(), bounds.getSouth()],
+        ],
+      ],
+      name: `Observation Center (${center.lat.toFixed(3)}°N, ${center.lng.toFixed(3)}°E)`,
+    };
+    if (onAskThisArea) {
+      onAskThisArea(activeAOI || viewportAOI, 'Show latest available satellite observation for this area and detect surface dynamics');
+    }
+  };
+
   const handleAskThisAreaClick = () => {
     if (activeAOI && onAskThisArea) {
       onAskThisArea(activeAOI, 'Analyze what is happening in this designated Area of Interest.');
@@ -717,6 +771,18 @@ export const MapViewer: React.FC<MapViewerProps> = ({
             </button>
           )}
         </div>
+
+        {/* LIVE / LATEST Satellite Monitoring */}
+        <button
+          onClick={handleLiveSatelliteClick}
+          className="px-2.5 py-1 text-xs font-mono rounded-md transition-all flex items-center gap-1.5 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white font-semibold shadow-md shadow-emerald-950/40 ring-1 ring-emerald-400/40 active:scale-95"
+          title="Near-Real-Time Satellite Monitoring: Fetch latest available observation for this area and detect surface dynamics"
+        >
+          <Activity className="w-3.5 h-3.5 text-white animate-pulse" />
+          <span>LIVE / LATEST</span>
+        </button>
+
+        <div className="h-4 w-px bg-slate-800 mx-1" />
 
         {/* Evidence Toggle */}
         {evidence?.geojson && evidence.geojson.length > 0 && (

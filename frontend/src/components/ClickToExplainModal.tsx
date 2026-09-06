@@ -18,7 +18,7 @@ import {
 export interface ExplainFeatureData {
   id?: string;
   class_name: string;
-  confidence: number;
+  confidence?: number;
   area_m2?: number;
   area_km2?: number;
   area_ha?: number;
@@ -49,7 +49,7 @@ export const ClickToExplainModal: React.FC<ClickToExplainModalProps> = ({
 }) => {
   if (!isOpen || !feature) return null;
 
-  const confPercent = (feature.confidence * 100).toFixed(1);
+  const confPercent = feature.confidence != null ? (feature.confidence * 100).toFixed(1) : 'N/A';
   const areaHa = feature.area_ha ?? (feature.area_m2 ? (feature.area_m2 / 10000) : 0);
   const areaKm2 = feature.area_km2 ?? (feature.area_m2 ? (feature.area_m2 / 1000000) : 0);
 

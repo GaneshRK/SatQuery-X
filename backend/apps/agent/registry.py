@@ -29,6 +29,21 @@ def list_models_info() -> list[dict[str, Any]]:
     cfg = load_registry_config()
     result = []
     for model_id, info in cfg.items():
+        wrapper_path = info.get("wrapper")
+        status = "NOT_CONFIGURED"
+        backend_engine = "spectral_heuristics"
+        try:
+            if wrapper_path:
+                mod_name, cls_name = wrapper_path.rsplit(".", 1)
+                mod = importlib.import_module(mod_name)
+                getattr(mod, cls_name)
+                has_torch = importlib.util.find_spec("torch") is not None
+                status = "READY_BASELINE" if has_torch else "READY_ALGORITHMIC"
+                backend_engine = "pytorch_blip" if "blip" in str(info.get("base_model", "")) and has_torch else "numpy_rasterio_spectral"
+        except Exception as e:
+            status = "UNAVAILABLE"
+            backend_engine = str(e)
+
         result.append({
             "id": model_id,
             "task": info.get("task", ""),
@@ -36,7 +51,8 @@ def list_models_info() -> list[dict[str, Any]]:
             "version": info.get("version", "1.0-baseline"),
             "adaptation": info.get("adaptation", "baseline"),
             "base_model": info.get("base_model", ""),
-            "status": "ready",
+            "status": status,
+            "backend_engine": backend_engine,
         })
     return result
 

@@ -112,3 +112,41 @@ class ImagePair(models.Model):
 
     def __str__(self):
         return f"Pair {self.pair_type}: {self.image_a.original_filename} & {self.image_b.original_filename}"
+
+
+class ImageryArtifact(models.Model):
+    """
+    Explicitly tracks all scientific and visual asset derivatives for an observation or analysis pair.
+    Decouples raw scientific GeoTIFFs from browser-native visual assets (RGB WebP/PNG, Thumbnails, Change Masks, GeoJSON).
+    """
+    ARTIFACT_TYPES = [
+        ("GEOTIFF", "GeoTIFF"),
+        ("RGB_PREVIEW", "RGB Preview"),
+        ("THUMBNAIL", "Thumbnail"),
+        ("FALSE_COLOR", "False Color"),
+        ("CHANGE_MASK", "Change Mask"),
+        ("CHANGE_PROBABILITY", "Change Probability"),
+        ("GEOJSON", "GeoJSON Vector Polygons"),
+        ("EVIDENCE_JSON", "Evidence JSON Dossier"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    image_asset = models.ForeignKey(
+        ImageAsset, on_delete=models.CASCADE, related_name="artifacts", null=True, blank=True
+    )
+    image_pair = models.ForeignKey(
+        ImagePair, on_delete=models.CASCADE, related_name="pair_artifacts", null=True, blank=True
+    )
+    artifact_type = models.CharField(max_length=50, choices=ARTIFACT_TYPES)
+    file = models.FileField(upload_to="artifacts/")
+    mime_type = models.CharField(max_length=100, default="image/webp")
+    width = models.IntegerField(null=True, blank=True)
+    height = models.IntegerField(null=True, blank=True)
+    bounds = models.JSONField(null=True, blank=True, help_text="Bounding envelope [west, south, east, north]")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.artifact_type} ({self.file.name})"

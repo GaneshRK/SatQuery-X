@@ -24,16 +24,20 @@ import {
   MicOff,
   HelpCircle,
 } from 'lucide-react';
-import { ExecutionTrace, InputMode } from '@/types';
+import { ExecutionTrace, InputMode, RasterMetadata } from '@/types';
 import { submitQuery, listQueries, QueryDetailData, getExportUrl } from '@/services/queries';
+import { createSession } from '@/services/sessions';
 
 interface ChatConsoleProps {
   sessionId: string;
   detectedMode: InputMode | null;
   hasImages: boolean;
+  images?: RasterMetadata[];
+  currentViewport?: { bbox: [number, number, number, number]; center: [number, number]; zoom: number } | null;
   pendingPrompt?: string | null;
   onClearPendingPrompt?: () => void;
   onQueryExecuted: (trace: ExecutionTrace) => void;
+  onEnsureSession?: () => Promise<string>;
 }
 
 export function formatQueryToTrace(queryData: QueryDetailData, sessionId: string): ExecutionTrace {
@@ -112,9 +116,12 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
   sessionId,
   detectedMode,
   hasImages,
+  images,
+  currentViewport,
   pendingPrompt,
   onClearPendingPrompt,
   onQueryExecuted,
+  onEnsureSession,
 }) => {
   const [queryText, setQueryText] = useState('');
   const [loading, setLoading] = useState(false);
@@ -248,38 +255,60 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
 
   const handleSend = async (overrideText?: string) => {
     const textToSend = overrideText || queryText;
-    if (!textToSend.trim() || !sessionId || loading) return;
+    if (!textToSend.trim() || loading) return;
 
     setLoading(true);
     setError(null);
-    setLoadingStage('Analyzing query intent with Model Router...');
+    setLoadingStage('Analyzing query intent with Agent Orchestrator...');
     setQueryText('');
 
     try {
-      setTimeout(() => setLoadingStage('Validating CRS and reading raster chunks...'), 600);
-      setTimeout(() => setLoadingStage('Executing deterministic computer vision & spectral math...'), 1400);
-
-      const res = await submitQuery(sessionId, textToSend);
-
-      setTimeout(async () => {
-        try {
-          const updatedHistory = await listQueries(sessionId);
-          setQueriesHistory(updatedHistory || []);
-          const latest = updatedHistory?.find((q) => q.id === res.query_id) || updatedHistory?.[0];
-          if (latest) {
-            const trace = formatQueryToTrace(latest, sessionId);
-            onQueryExecuted(trace);
-          }
-        } catch (pollErr) {
-          console.error('Error refreshing queries:', pollErr);
-        } finally {
-          setLoading(false);
-          setLoadingStage('');
+      let activeSid = sessionId;
+      if (!activeSid) {
+        setLoadingStage('Initializing analysis workspace...');
+        if (onEnsureSession) {
+          activeSid = await onEnsureSession();
+        } else {
+          const newSession = await createSession('Earth Intelligence Workspace');
+          activeSid = newSession.id;
         }
-      }, 2200);
+      }
+
+      let activeImageId: string | undefined = undefined;
+      if (images && images.length === 1) {
+        activeImageId = images[0].image_id;
+      }
+
+      setLoadingStage('Dispatching query to Agentic Pipeline...');
+      const visualContext = currentViewport ? { current_viewport: currentViewport } : undefined;
+      const res = await submitQuery(activeSid, textToSend, activeImageId, undefined, undefined, visualContext);
+
+      setLoadingStage('Processing geospatial analysis & synthesizing evidence...');
+      let completed = false;
+      let attempts = 0;
+      let latest: QueryDetailData | undefined;
+
+      while (!completed && attempts < 15) {
+        attempts++;
+        const updatedHistory = await listQueries(activeSid);
+        setQueriesHistory(updatedHistory || []);
+        latest = updatedHistory?.find((q) => q.id === res.query_id) || updatedHistory?.[0];
+
+        if (latest && (latest.status === 'COMPLETED' || latest.status === 'FAILED')) {
+          completed = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 600));
+      }
+
+      if (latest) {
+        const trace = formatQueryToTrace(latest, activeSid);
+        onQueryExecuted(trace);
+      }
     } catch (err: any) {
       console.error('Submit query failed:', err);
-      setError(err?.message || 'Failed to submit query.');
+      setError(err?.message || 'Failed to submit query. Please try again.');
+    } finally {
       setLoading(false);
       setLoadingStage('');
     }
@@ -598,8 +627,9 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
             (suggestion, i) => (
               <button
                 key={i}
+                type="button"
                 onClick={() => handleSend(suggestion)}
-                disabled={loading || !sessionId}
+                disabled={loading}
                 className="px-2.5 py-1 text-[11px] rounded-md bg-slate-900/90 hover:bg-blue-600/20 hover:text-blue-300 hover:border-blue-500/40 text-slate-300 border border-slate-800 transition-all font-mono text-left disabled:opacity-40"
               >
                 &bull; {suggestion}
@@ -616,23 +646,30 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
             e.preventDefault();
             handleSend();
           }}
-          className="flex items-center gap-2"
+          className="flex items-end gap-2"
         >
           <div className="relative flex-1">
-            <input
-              type="text"
+            <textarea
+              id="query-input"
+              rows={2}
               value={queryText}
               onChange={(e) => setQueryText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
               placeholder={
                 hasImages
                   ? 'Ask any geospatial query (e.g. Quantify surface water extent in km²)...'
                   : 'Ask anything about Earth (e.g. What is changing around Chennai?)...'
               }
-              disabled={loading || !sessionId}
-              className="w-full bg-slate-900 border border-slate-800 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-lg pl-4 pr-10 py-2.5 text-xs text-white placeholder-slate-500 font-mono transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={loading}
+              className="w-full bg-slate-900 border border-slate-800 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-lg pl-4 pr-10 py-2.5 text-xs text-white placeholder-slate-500 font-mono transition-all resize-none disabled:opacity-50"
             />
             {loading && (
-              <div className="absolute right-3 top-1/2 -translate-y-1/2">
+              <div className="absolute right-3 top-3">
                 <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
               </div>
             )}
@@ -641,8 +678,8 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
           <button
             type="button"
             onClick={toggleVoiceInput}
-            disabled={loading || !sessionId}
-            className={`p-2.5 rounded-lg border transition-all flex items-center justify-center ${
+            disabled={loading}
+            className={`p-2.5 rounded-lg border transition-all flex items-center justify-center shrink-0 mb-0.5 ${
               isListening
                 ? 'bg-red-950 text-red-400 border-red-500 animate-pulse ring-2 ring-red-500/50'
                 : 'bg-slate-900 text-slate-400 hover:text-slate-200 hover:bg-slate-800 border-slate-800'
@@ -654,8 +691,8 @@ export const ChatConsole: React.FC<ChatConsoleProps> = ({
 
           <button
             type="submit"
-            disabled={loading || !queryText.trim() || !sessionId}
-            className="px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white text-xs font-medium font-mono flex items-center gap-2 transition-all shadow-md shadow-blue-600/20 disabled:shadow-none active:scale-95"
+            disabled={loading || !queryText.trim()}
+            className="px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white text-xs font-medium font-mono flex items-center gap-2 transition-all shadow-md shadow-blue-600/20 disabled:shadow-none active:scale-95 shrink-0 mb-0.5"
           >
             <span>Reason</span>
             <Send className="w-3.5 h-3.5" />

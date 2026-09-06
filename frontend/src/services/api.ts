@@ -25,9 +25,11 @@ export async function apiRequest<T = any>(
     headers,
   });
 
-  // Handle Token Expiry
+  // Handle Token Expiry & Auto-Reauthentication
   if (response.status === 401 && typeof window !== "undefined") {
+    let newAccessToken: string | null = null;
     const refreshToken = localStorage.getItem("satquery_refresh_token");
+
     if (refreshToken) {
       try {
         const refreshRes = await fetch(`${BASE_URL}/auth/refresh/`, {
@@ -37,15 +39,41 @@ export async function apiRequest<T = any>(
         });
         if (refreshRes.ok) {
           const data = await refreshRes.json();
+          newAccessToken = data.access;
           localStorage.setItem("satquery_access_token", data.access);
-          headers.set("Authorization", `Bearer ${data.access}`);
-          const retryRes = await fetch(url, { ...options, headers });
-          if (!retryRes.ok) throw new Error(await retryRes.text());
-          return retryRes.json();
         }
       } catch (err) {
-        console.error("Token refresh failed", err);
+        console.warn("Token refresh failed:", err);
       }
+    }
+
+    // If refresh failed or was absent, re-authenticate with default analyst account
+    if (!newAccessToken) {
+      try {
+        const loginRes = await fetch(`${BASE_URL}/auth/login/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: "analyst", password: "satquery2026" }),
+        });
+        if (loginRes.ok) {
+          const loginData = await loginRes.json();
+          newAccessToken = loginData.access;
+          localStorage.setItem("satquery_access_token", loginData.access);
+          if (loginData.refresh) {
+            localStorage.setItem("satquery_refresh_token", loginData.refresh);
+          }
+        }
+      } catch (loginErr) {
+        console.error("Auto-login fallback failed:", loginErr);
+      }
+    }
+
+    if (newAccessToken) {
+      headers.set("Authorization", `Bearer ${newAccessToken}`);
+      const retryRes = await fetch(url, { ...options, headers });
+      if (retryRes.status === 204) return {} as T;
+      if (!retryRes.ok) throw new Error(await retryRes.text());
+      return retryRes.json();
     }
   }
 

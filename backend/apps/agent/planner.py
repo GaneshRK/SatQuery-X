@@ -30,6 +30,22 @@ def create_execution_plan(intent: Any, mode: str) -> dict[str, Any]:
         ]
         return {"mode": mode, "task": "VQA", "steps": steps}
 
+    # 1b. GROUNDING
+    if task in ("grounding", "GROUNDING", "REGION_GROUNDING"):
+        steps = [
+            {"step": 1, "tool": "RS_GROUNDING", "parameters": {"text_prompt": target}, "description": "Text-guided visual grounding and target localization"},
+            {"step": 2, "tool": "calculate_area", "parameters": {}, "description": "Quantify bounding region ground surface area in km²"},
+        ]
+        return {"mode": mode, "task": "GROUNDING", "steps": steps}
+
+    # 1c. SEMANTIC_RETRIEVAL (RemoteCLIP)
+    if task in ("SEMANTIC_RETRIEVAL", "remoteclip_semantic_retrieval", "semantic_retrieval"):
+        steps = [
+            {"step": 1, "tool": "remoteclip_semantic_retrieval", "parameters": {"target": target}, "description": "Auxiliary semantic representation and candidate class scoring via RemoteCLIP"},
+            {"step": 2, "tool": "calculate_area", "parameters": {}, "description": "Quantify matched land-cover area in km²"},
+        ]
+        return {"mode": mode, "task": "SEMANTIC_RETRIEVAL", "steps": steps}
+
     # 2. CHANGE_VQA
     if task in ("change_vqa", "CHANGE_VQA"):
         steps = [

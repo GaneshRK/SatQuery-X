@@ -4,12 +4,14 @@ import React, { useState } from 'react';
 import { X, UploadCloud, CheckCircle2, AlertCircle, FileImage, Layers, Loader2 } from 'lucide-react';
 import { RasterMetadata, InputMode } from '@/types';
 import { uploadImage, createPair, listImages } from '@/services/images';
+import { createSession } from '@/services/sessions';
 
 interface UploadModalProps {
   isOpen: boolean;
   onClose: () => void;
   sessionId: string;
   onUploadSuccess: (images: RasterMetadata[], detectedMode: InputMode) => void;
+  onEnsureSession?: () => Promise<string>;
 }
 
 export const UploadModal: React.FC<UploadModalProps> = ({
@@ -17,6 +19,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   onClose,
   sessionId,
   onUploadSuccess,
+  onEnsureSession,
 }) => {
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -38,18 +41,23 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       return;
     }
 
-    if (!sessionId) {
-      setError('Session is not initialized. Please refresh the page.');
-      return;
-    }
-
     setUploading(true);
     setError(null);
 
     try {
+      let activeSid = sessionId;
+      if (!activeSid) {
+        if (onEnsureSession) {
+          activeSid = await onEnsureSession();
+        } else {
+          const newSession = await createSession('Earth Intelligence Workspace');
+          activeSid = newSession.id;
+        }
+      }
+
       const uploadedAssets = [];
       for (const file of files) {
-        const { asset } = await uploadImage(sessionId, file);
+        const { asset } = await uploadImage(activeSid, file);
         uploadedAssets.push(asset);
       }
 
@@ -62,7 +70,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           (imgB.modality === 'SAR' && imgA.modality !== 'SAR');
         const pairType = isCrossModal ? 'CROSS_MODAL' : 'BI_TEMPORAL';
         try {
-          await createPair(sessionId, imgA.id, imgB.id, pairType);
+          await createPair(activeSid, imgA.id, imgB.id, pairType);
         } catch (pairErr) {
           console.warn('Pair creation info:', pairErr);
         }
@@ -72,7 +80,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       // Small delay to allow Celery / background validator to set previews and bounds
       await new Promise((r) => setTimeout(r, 600));
 
-      const allImages = await listImages(sessionId);
+      const allImages = await listImages(activeSid);
       const mapped: RasterMetadata[] = allImages.map((img) => ({
         image_id: img.id,
         filename: img.original_filename,

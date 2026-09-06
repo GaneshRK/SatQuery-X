@@ -40,17 +40,25 @@ class SessionQueryListCreateView(views.APIView):
         if pair_id:
             pair = get_object_or_404(ImagePair, id=pair_id, session_id=session_id)
 
-        # Fallback to active session image if not explicitly passed
+        # Fallback to active session image pair or image if not explicitly passed
         if not image and not pair:
-            image = session.imagery_assets.filter(processing_status="VALIDATED").first()
+            pair = session.image_pairs.first()
+            if not pair:
+                image = session.imagery_assets.filter(processing_status="VALIDATED").first()
 
-        # Ingest visual context if passed from client
+        # Ingest visual context & AOI geometry if passed from client
         visual_ctx = request.data.get("visual_context")
-        if visual_ctx and isinstance(visual_ctx, dict):
+        aoi_geom = request.data.get("aoi_geometry")
+        if (visual_ctx and isinstance(visual_ctx, dict)) or aoi_geom:
             current_ctx = dict(session.conversation_context or {})
-            current_ctx["current_visual_state"] = visual_ctx
-            if visual_ctx.get("active_region"):
-                current_ctx["active_region"] = visual_ctx["active_region"]
+            if visual_ctx and isinstance(visual_ctx, dict):
+                current_ctx["current_visual_state"] = visual_ctx
+                if visual_ctx.get("active_region"):
+                    current_ctx["active_region"] = visual_ctx["active_region"]
+                if visual_ctx.get("current_viewport"):
+                    current_ctx["current_viewport"] = visual_ctx["current_viewport"]
+            if aoi_geom:
+                current_ctx["aoi_geometry"] = aoi_geom
             session.conversation_context = current_ctx
             session.save(update_fields=["conversation_context"])
 

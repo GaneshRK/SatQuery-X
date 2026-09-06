@@ -26,6 +26,21 @@ def validate_agent_inputs(
             "reasons": [],
         }
 
+    # 0a. Follow-up refinement & Region comparison checks
+    if getattr(intent, "intent", "") == "FOLLOW_UP_REFINEMENT":
+        return {
+            "valid": True,
+            "mode": "FOLLOW_UP_REFINEMENT",
+            "reasons": [],
+        }
+
+    if getattr(intent, "intent", "") == "REGION_COMPARISON":
+        return {
+            "valid": True,
+            "mode": "REGION_COMPARISON",
+            "reasons": [],
+        }
+
     # 0b. Mode A (Zero-Upload Autonomous Query) check (§1, §58)
     has_location = bool(getattr(intent, "location", None))
     is_satellite_query = getattr(intent, "intent", "") in ("SATELLITE_SEARCH", "LATEST_OBSERVATION")

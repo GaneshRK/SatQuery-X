@@ -91,7 +91,7 @@ class OpenAIProvider(AIProvider):
                         provider="openai",
                         model_name=self.model_name,
                         text=content,
-                        confidence=0.92,
+                        confidence=None,
                         latency_ms=latency,
                         status="ok",
                     )

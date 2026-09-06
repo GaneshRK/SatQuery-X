@@ -94,14 +94,14 @@ class CopernicusProvider(SatelliteProvider):
             except Exception as e:
                 logger.warning("Copernicus STAC endpoint %s query failed: %s", endpoint, e)
 
-        # Fallback to Mock provider if live Copernicus is unreachable or unconfigured
-        logger.info("Falling back to MockSatelliteProvider for offline or unauthenticated mode")
+        # Fallback to simulated Copernicus Sentinel observation candidates when live network is unconfigured or unreachable
+        logger.info("Copernicus live endpoints unreachable or returned 0 results: Engaging simulated observation candidates")
         mock_provider = MockSatelliteProvider()
         fallback_candidates = mock_provider.search_scenes(
             aoi_geometry, date_start, date_end, sensor, max_cloud_cover, limit
         )
         for c in fallback_candidates:
-            c.provider = "copernicus_cached_fallback"
+            c.provider = "copernicus_offline_simulation"
         return fallback_candidates
 
     def get_scene_metadata(self, stac_item_id: str) -> dict[str, Any]:

@@ -10,8 +10,10 @@ from apps.queries.models import Query
 @shared_task(bind=True)
 def run_query_task(self, query_id: str):
     query = Query.objects.get(id=query_id)
-    session_ctx = {
+    session_ctx = dict(query.session.conversation_context or {})
+    session_ctx.update({
         "image_count": query.session.imagery_assets.count(),
         "pair_type": query.image_pair.pair_type if query.image_pair else None,
-    }
+        "has_images": query.session.imagery_assets.exists(),
+    })
     return Agent.run(query, session_ctx)

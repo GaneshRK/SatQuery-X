@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import io
 import numpy as np
 import pytest
@@ -10,6 +11,11 @@ from rest_framework.test import APIClient
 from PIL import Image
 
 User = get_user_model()
+
+
+@pytest.fixture(autouse=True)
+def enable_test_satellite_mock(monkeypatch):
+    monkeypatch.setenv("SATQUERY_MOCK_SATELLITE", "True")
 
 
 @pytest.fixture

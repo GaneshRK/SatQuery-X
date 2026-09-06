@@ -136,10 +136,78 @@ class ImageAssetPreviewView(views.APIView):
     permission_classes = [permissions.AllowAny]  # Previews can be loaded by MapLibre/img tags
 
     def get(self, request, session_id, image_id):
+        from apps.imagery.services.artifacts import register_imagery_artifacts
         asset = get_object_or_404(ImageAsset, id=image_id, session_id=session_id)
-        if asset.preview_url and os.path.exists(asset.preview_url.lstrip("/")):
-            return FileResponse(open(asset.preview_url.lstrip("/"), "rb"), content_type="image/png")
-        if asset.file:
+        dto = register_imagery_artifacts(asset)
+        if dto.preview_path and os.path.exists(dto.preview_path):
+            ext = os.path.splitext(dto.preview_path)[1].lower()
+            mime = "image/webp" if ext == ".webp" else "image/png"
+            return FileResponse(open(dto.preview_path, "rb"), content_type=mime)
+        if asset.file and os.path.exists(asset.file.path):
+            return FileResponse(asset.file.open("rb"), content_type=asset.content_type)
+        raise Http404("Preview not available")
+
+
+class DedicatedImageryDetailView(views.APIView):
+    """GET /api/imagery/<uuid:image_id>/ or /api/v1/imagery/<uuid:image_id>/"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, image_id):
+        from apps.imagery.services.artifacts import register_imagery_artifacts, make_absolute_url
+        asset = get_object_or_404(ImageAsset, id=image_id)
+        dto = register_imagery_artifacts(asset)
+
+        artifacts = []
+        for art in asset.artifacts.all():
+            artifacts.append({
+                "type": art.artifact_type,
+                "url": make_absolute_url(art.file.url if art.file else None, request),
+                "mime_type": art.mime_type,
+                "width": art.width,
+                "height": art.height,
+            })
+
+        data = {
+            "id": str(asset.id),
+            "original_filename": asset.original_filename,
+            "sensor": asset.sensor,
+            "modality": asset.modality,
+            "file_format": asset.file_format,
+            "acquisition_date": str(asset.acquisition_date) if asset.acquisition_date else None,
+            "cloud_cover_pct": float(asset.cloud_cover_pct or 0.0),
+            "resolution_m": float(asset.resolution_m or 10.0),
+            "bounds_wgs84": asset.bounds_wgs84,
+            "crs": asset.crs,
+            "width": asset.width,
+            "height": asset.height,
+            "band_count": asset.band_count,
+            "geotiff_url": make_absolute_url(dto.geotiff_url, request),
+            "preview_url": make_absolute_url(dto.preview_url, request),
+            "thumbnail_url": make_absolute_url(dto.thumbnail_url, request),
+            "artifacts": artifacts,
+            "provenance": asset.provenance,
+        }
+        return Response(data)
+
+
+class DedicatedImageryPreviewView(views.APIView):
+    """GET /api/imagery/<uuid:image_id>/preview/ or /api/v1/imagery/<uuid:image_id>/preview/"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, image_id):
+        from apps.imagery.services.artifacts import register_imagery_artifacts
+        asset = get_object_or_404(ImageAsset, id=image_id)
+        dto = register_imagery_artifacts(asset)
+
+        preview_path = dto.preview_path
+        if preview_path and os.path.exists(preview_path):
+            ext = os.path.splitext(preview_path)[1].lower()
+            mime = "image/webp" if ext == ".webp" else "image/png"
+            return FileResponse(open(preview_path, "rb"), content_type=mime)
+
+        if dto.thumbnail_path and os.path.exists(dto.thumbnail_path):
+            return FileResponse(open(dto.thumbnail_path, "rb"), content_type="image/webp")
+        if asset.file and os.path.exists(asset.file.path):
             return FileResponse(asset.file.open("rb"), content_type=asset.content_type)
         raise Http404("Preview not available")
 

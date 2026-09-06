@@ -15,6 +15,7 @@ class SatelliteCandidateDTO:
     thumbnail_url: str | None = None
     assets_summary: dict[str, Any] = field(default_factory=dict)
     provider: str = "copernicus"
+    is_synthetic: bool = False
 
 
 class SatelliteProvider(ABC):

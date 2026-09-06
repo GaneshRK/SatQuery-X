@@ -24,6 +24,11 @@ class ToolDefinition:
     handler: Callable[..., dict[str, Any]]
     timeout_seconds: int = 30
     requires_imagery: bool = True
+    task: str = "general"
+    required_images: int = 1
+    required_relationship: str = "SINGLE_IMAGE"
+    model: str = "Deterministic/GIS"
+    gpu_requirement: str = "CPU_ONLY"
     provenance_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -51,12 +56,57 @@ class ToolRegistry:
             {
                 "name": t.name,
                 "description": t.description,
+                "task": t.task,
+                "required_images": t.required_images,
+                "required_relationship": t.required_relationship,
+                "model": t.model,
+                "gpu_requirement": t.gpu_requirement,
                 "input_schema": t.input_schema,
                 "output_schema": t.output_schema,
                 "timeout_seconds": t.timeout_seconds,
             }
             for t in self._tools.values()
         ]
+
+    def get_tool_manifest(self) -> list[dict[str, Any]]:
+        return self.list_tools()
+
+    def find_tools_for_task(
+        self,
+        task: str,
+        image_count: int | None = None,
+        relationship: str | None = None,
+    ) -> list[ToolDefinition]:
+        """Discovers all tools capable of handling the specified task and input constraints per §9."""
+        task_clean = task.lower().strip()
+        candidates = []
+        for tool in self._tools.values():
+            tool_task = tool.task.lower()
+            tool_name = tool.name.lower()
+            if tool_task == task_clean or tool_name == task_clean or task_clean in tool_task or tool_task in task_clean:
+                if image_count is not None and tool.requires_imagery and tool.required_images > image_count:
+                    continue
+                if relationship is not None and tool.required_relationship not in ("NONE", relationship):
+                    continue
+                candidates.append(tool)
+        return candidates
+
+    def can_solve(
+        self,
+        tool_name: str,
+        task: str,
+        image_count: int,
+        relationship: str = "SINGLE_IMAGE",
+    ) -> tuple[bool, str]:
+        """Validates if a specific tool can solve the task with the given image configuration."""
+        tool = self.get_tool(tool_name)
+        if not tool:
+            return False, f"Tool '{tool_name}' is not registered in ToolRegistry."
+        if tool.requires_imagery and tool.required_images > image_count:
+            return False, f"Tool '{tool_name}' requires {tool.required_images} image(s), but only {image_count} provided."
+        if relationship != "NONE" and tool.required_relationship not in ("NONE", "SINGLE_IMAGE", relationship):
+            return False, f"Tool '{tool_name}' requires relationship '{tool.required_relationship}', but inputs have '{relationship}'."
+        return True, "Tool is compatible with task and input constraints."
 
     def execute(self, tool_name: str, **kwargs) -> dict[str, Any]:
         tool = self.get_tool(tool_name)
@@ -86,6 +136,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="calculate_ndvi",
                 description="Compute Normalized Difference Vegetation Index (NIR - Red) / (NIR + Red)",
+                task="NDVI",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="SpectralIndices/Rasterio",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray"},
                 output_schema={"mean_ndvi": "float", "vegetation_coverage_pct": "float"},
                 handler=_handle_calculate_ndvi,
@@ -97,6 +152,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="calculate_ndwi",
                 description="Compute Normalized Difference Water Index (Green - NIR) / (Green + NIR)",
+                task="NDWI",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="SpectralIndices/Rasterio",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray"},
                 output_schema={"mean_ndwi": "float", "water_coverage_pct": "float"},
                 handler=_handle_calculate_ndwi,
@@ -108,6 +168,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="detect_water",
                 description="Segment water bodies and return vector polygons with metric surface areas",
+                task="WATER_DETECTION",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="Otsu/OpenCV",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray", "bounds_wgs84": "dict"},
                 output_schema={"water_features_count": "int", "total_water_km2": "float", "polygons": "list"},
                 handler=_handle_detect_water,
@@ -119,6 +184,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="detect_vegetation",
                 description="Segment dense vegetation canopy and calculate canopy coverage area in km²",
+                task="VEGETATION_ANALYSIS",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="Otsu/OpenCV",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray", "bounds_wgs84": "dict"},
                 output_schema={"vegetation_features_count": "int", "total_veg_km2": "float"},
                 handler=_handle_detect_vegetation,
@@ -130,6 +200,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="detect_and_count_structures",
                 description="Deterministic detection and counting of building/infrastructure candidates",
+                task="BUILDING_ANALYSIS",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="Morphological/Contours",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray", "bounds_wgs84": "dict"},
                 output_schema={"candidate_count": "int", "total_structure_km2": "float", "polygons": "list"},
                 handler=_handle_detect_structures,
@@ -141,9 +216,15 @@ class ToolRegistry:
             ToolDefinition(
                 name="calculate_area",
                 description="Calculate metric ground surface area in m² and km² for any binary mask",
+                task="AREA_MEASUREMENT",
+                required_images=0,
+                required_relationship="NONE",
+                model="Shapely/PyProj",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"mask": "numpy.ndarray", "affine_list": "list", "crs": "str"},
                 output_schema={"area_m2": "float", "area_km2": "float", "valid_pixel_count": "int"},
                 handler=_handle_calculate_area,
+                requires_imagery=False,
             )
         )
 
@@ -152,6 +233,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="search_satellite_imagery",
                 description="Query Copernicus Data Space Ecosystem for Sentinel-1/2 candidate scenes",
+                task="SATELLITE_SEARCH",
+                required_images=0,
+                required_relationship="NONE",
+                model="CopernicusSTAC",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"aoi_geometry": "dict", "sensor": "str", "date_start": "str", "date_end": "str"},
                 output_schema={"candidate_count": "int", "candidates": "list", "provider": "str"},
                 handler=_handle_search_satellite,
@@ -164,6 +250,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="calculate_ndbi",
                 description="Compute Normalized Difference Built-up Index (SWIR - NIR) / (SWIR + NIR)",
+                task="NDBI",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="SpectralIndices/Rasterio",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray"},
                 output_schema={"mean_ndbi": "float", "built_up_coverage_pct": "float"},
                 handler=_handle_calculate_ndbi,
@@ -175,6 +266,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="calculate_nbr",
                 description="Compute Normalized Burn Ratio (NIR - SWIR2) / (NIR + SWIR2)",
+                task="NBR",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="SpectralIndices/Rasterio",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray"},
                 output_schema={"mean_nbr": "float", "burn_risk_coverage_pct": "float"},
                 handler=_handle_calculate_nbr,
@@ -186,6 +282,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="detect_change",
                 description="Bi-temporal differencing and vector polygonization between two observations",
+                task="CHANGE_DETECTION",
+                required_images=2,
+                required_relationship="BI_TEMPORAL",
+                model="RasterDifference/Otsu",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"before_array": "numpy.ndarray", "after_array": "numpy.ndarray"},
                 output_schema={"changed_area_hectares": "float", "change_percentage": "float", "change_class": "str"},
                 handler=_handle_detect_change,
@@ -197,6 +298,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="search_web",
                 description="Guarded web research retrieving corroborating reports from trusted domains",
+                task="WEB_RESEARCH",
+                required_images=0,
+                required_relationship="NONE",
+                model="DuckDuckGo/Brave",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"query": "str", "aoi_name": "str"},
                 output_schema={"evidence_count": "int", "citations": "list"},
                 handler=_handle_search_web,
@@ -209,6 +315,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="verify_evidence",
                 description="Cross-source verification of physical satellite reflectance against external reports",
+                task="VERIFY_EVIDENCE",
+                required_images=0,
+                required_relationship="NONE",
+                model="EvidenceEngine",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"satellite_scenes": "list", "external_evidence": "list"},
                 output_schema={"verification_status": "str", "confidence_score": "float"},
                 handler=_handle_verify_evidence,
@@ -221,6 +332,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="vqa",
                 description="Remote sensing Visual Question Answering using specialist VLM adapter",
+                task="VQA",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="GeoChat",
+                gpu_requirement="OPTIONAL",
                 input_schema={"question": "str"},
                 output_schema={"answer": "str", "confidence": "float"},
                 handler=_handle_vqa,
@@ -232,6 +348,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="caption",
                 description="Remote sensing scene captioning and land-cover description",
+                task="CAPTION",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="GeoChat",
+                gpu_requirement="OPTIONAL",
                 input_schema={},
                 output_schema={"caption": "str", "confidence": "float"},
                 handler=_handle_caption,
@@ -243,6 +364,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="grounding",
                 description="Text-guided visual grounding detecting target features and bounding boxes",
+                task="GROUNDING",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="GroundingDINO/SAM",
+                gpu_requirement="OPTIONAL",
                 input_schema={"text_prompt": "str"},
                 output_schema={"boxes": "list", "confidence": "float"},
                 handler=_handle_grounding,
@@ -254,6 +380,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="change_detection",
                 description="Deep-learning bi-temporal change detection and probability mapping",
+                task="CHANGE_DETECTION",
+                required_images=2,
+                required_relationship="BI_TEMPORAL",
+                model="ChangeFormer",
+                gpu_requirement="OPTIONAL",
                 input_schema={},
                 output_schema={"answer": "str", "boxes": "list", "change_mask": "bytes"},
                 handler=_handle_change_detection,
@@ -265,6 +396,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="change_vqa",
                 description="Change reasoning layer answering questions over measured change masks",
+                task="CHANGE_VQA",
+                required_images=2,
+                required_relationship="BI_TEMPORAL",
+                model="ChangeFormer",
+                gpu_requirement="OPTIONAL",
                 input_schema={"question": "str"},
                 output_schema={"answer": "str", "confidence": "float"},
                 handler=_handle_change_vqa,
@@ -276,6 +412,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="optical_sar_fusion",
                 description="Dual-branch cross-modal fusion combining optical and SAR radar imagery",
+                task="OPTICAL_SAR_ANALYSIS",
+                required_images=2,
+                required_relationship="OPTICAL_SAR_PAIR",
+                model="OpticalSARFusion",
+                gpu_requirement="OPTIONAL",
                 input_schema={},
                 output_schema={"answer": "str", "confidence": "float", "boxes": "list"},
                 handler=_handle_optical_sar,
@@ -287,6 +428,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="geo_metadata",
                 description="Extract raster bounds, resolution, CRS, and channel metadata",
+                task="GEO_METADATA",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="GDAL/Rasterio",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"image_bytes": "bytes"},
                 output_schema={"width": "int", "height": "int", "crs": "str", "resolution_m": "float"},
                 handler=_handle_geo_metadata,
@@ -298,6 +444,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="histogram_analysis",
                 description="Compute spectral channel statistical distributions, mean, and standard deviation",
+                task="HISTOGRAM_ANALYSIS",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="NumPy/Rasterio",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"raster_array": "numpy.ndarray"},
                 output_schema={"bands_analyzed": "int", "statistics": "list"},
                 handler=_handle_histogram_analysis,
@@ -309,6 +460,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="coregistration",
                 description="Inspect CRS, spatial bounds, and geometric overlap between image pairs",
+                task="COREGISTRATION",
+                required_images=2,
+                required_relationship="BI_TEMPORAL",
+                model="Rasterio/Affine",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"bounds_a": "dict", "bounds_b": "dict"},
                 output_schema={"coregistration_valid": "bool", "overlap_wgs84": "dict"},
                 handler=_handle_coregistration,
@@ -321,6 +477,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="spatial_relation",
                 description="Analyze spatial proximity, buffer distances, and containment relations",
+                task="SPATIAL_RELATION",
+                required_images=0,
+                required_relationship="NONE",
+                model="Shapely",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"aoi_a": "dict", "aoi_b": "dict"},
                 output_schema={"relation": "str", "spatial_match": "bool"},
                 handler=_handle_spatial_relation,
@@ -333,6 +494,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="temporal_comparison",
                 description="Perform multi-temporal radiometric consistency and change trajectory check",
+                task="TEMPORAL_COMPARISON",
+                required_images=0,
+                required_relationship="NONE",
+                model="TemporalConsistency",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"t1_stats": "dict", "t2_stats": "dict"},
                 output_schema={"temporal_delta_detected": "bool"},
                 handler=_handle_temporal_comparison,
@@ -345,6 +511,11 @@ class ToolRegistry:
             ToolDefinition(
                 name="report_generation",
                 description="Generate PDF and HTML intelligence report dossier for the active session",
+                task="REPORT_GENERATION",
+                required_images=0,
+                required_relationship="NONE",
+                model="WeasyPrint/HTML",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"session_id": "str", "query_id": "str"},
                 output_schema={"report_type": "str", "status": "str"},
                 handler=_handle_report_generation,
@@ -357,10 +528,31 @@ class ToolRegistry:
             ToolDefinition(
                 name="evidence_export",
                 description="Export detected evidence polygons and masks as standard GeoJSON FeatureCollection",
+                task="EVIDENCE_EXPORT",
+                required_images=0,
+                required_relationship="NONE",
+                model="GeoJSONEngine",
+                gpu_requirement="CPU_ONLY",
                 input_schema={"features": "list"},
                 output_schema={"feature_count": "int", "geojson": "dict"},
                 handler=_handle_evidence_export,
                 requires_imagery=False,
+            )
+        )
+
+        # 26. remoteclip_semantic_retrieval (RemoteCLIP Model per §33)
+        self.register(
+            ToolDefinition(
+                name="remoteclip_semantic_retrieval",
+                description="Auxiliary semantic representation and zero-shot query scoring using RemoteCLIP",
+                task="SEMANTIC_RETRIEVAL",
+                required_images=1,
+                required_relationship="SINGLE_IMAGE",
+                model="RemoteCLIP",
+                gpu_requirement="OPTIONAL",
+                input_schema={"text_queries": "list"},
+                output_schema={"similarity_scores": "dict", "ranked_classes": "list"},
+                handler=_handle_remoteclip_retrieval,
             )
         )
 
@@ -618,13 +810,15 @@ def _handle_verify_evidence(
 
     if has_sat and has_ext:
         status_str = "FULLY_CORROBORATED"
-        score = 0.92
+        ext_scores = [e.get("trust_score", 0.8) for e in external_evidence]
+        avg_trust = float(np.mean(ext_scores)) if ext_scores else 0.8
+        score = round(min(0.98, max(0.70, 0.70 + 0.15 * avg_trust + min(0.10, len(satellite_scenes) * 0.05))), 2)
     elif has_sat:
         status_str = "PHYSICAL_SATELLITE_ONLY"
-        score = 0.85
+        score = round(min(0.92, max(0.65, 0.70 + min(0.20, len(satellite_scenes) * 0.10))), 2)
     else:
         status_str = "UNVERIFIED"
-        score = 0.60
+        score = round(min(0.60, max(0.30, len(external_evidence) * 0.20)), 2)
 
     return {
         "verification_status": status_str,
@@ -635,11 +829,10 @@ def _handle_verify_evidence(
 
 
 def _handle_vqa(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, question: str = "", **kwargs) -> dict[str, Any]:
-    from apps.agent.contracts import ModelInput
-    from apps.models_ai.rs_vqa.wrapper import RSVQAModel
-    model = RSVQAModel()
-    inputs = ModelInput(model_id="RS_VQA", image_bytes=image_bytes or [], image_paths=image_paths or [], question=question)
-    out = model.predict(inputs)
+    from ai.adapters.geochat_adapter import GeoChatVQAAdapter
+    adapter = GeoChatVQAAdapter()
+    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    out = adapter.answer(img_in, question=question, **kwargs)
     return {
         "answer": out.answer,
         "confidence": out.confidence,
@@ -649,11 +842,10 @@ def _handle_vqa(image_bytes: list[bytes] | None = None, image_paths: list[str] |
 
 
 def _handle_caption(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, **kwargs) -> dict[str, Any]:
-    from apps.agent.contracts import ModelInput
-    from apps.models_ai.rs_caption.wrapper import RSCaptionModel
-    model = RSCaptionModel()
-    inputs = ModelInput(model_id="RS_CAPTION", image_bytes=image_bytes or [], image_paths=image_paths or [])
-    out = model.predict(inputs)
+    from ai.adapters.geochat_adapter import GeoChatVQAAdapter
+    adapter = GeoChatVQAAdapter()
+    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    out = adapter.caption(img_in, **kwargs)
     return {
         "caption": out.caption,
         "confidence": out.confidence,
@@ -662,11 +854,10 @@ def _handle_caption(image_bytes: list[bytes] | None = None, image_paths: list[st
 
 
 def _handle_grounding(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, text_prompt: str = "", **kwargs) -> dict[str, Any]:
-    from apps.agent.contracts import ModelInput
-    from apps.models_ai.rs_grounding.wrapper import RSGroundingModel
-    model = RSGroundingModel()
-    inputs = ModelInput(model_id="RS_GROUNDING", image_bytes=image_bytes or [], image_paths=image_paths or [], text_prompt=text_prompt)
-    out = model.predict(inputs)
+    from ai.adapters.grounding_adapter import GroundingDINOAdapter
+    adapter = GroundingDINOAdapter()
+    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    out = adapter.ground(img_in, text_prompt=text_prompt, **kwargs)
     return {
         "boxes": out.boxes or [],
         "confidence": out.confidence,
@@ -675,11 +866,11 @@ def _handle_grounding(image_bytes: list[bytes] | None = None, image_paths: list[
 
 
 def _handle_change_detection(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, **kwargs) -> dict[str, Any]:
-    from apps.agent.contracts import ModelInput
-    from apps.models_ai.change_detection.wrapper import ChangeDetectionModel
-    model = ChangeDetectionModel()
-    inputs = ModelInput(model_id="CHANGE_DETECTION", image_bytes=image_bytes or [], image_paths=image_paths or [])
-    out = model.predict(inputs)
+    from ai.adapters.changeformer_adapter import ChangeFormerAdapter
+    adapter = ChangeFormerAdapter()
+    t1_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    t2_in = image_bytes[1] if (image_bytes and len(image_bytes) > 1) else (image_paths[1] if (image_paths and len(image_paths) > 1) else None)
+    out = adapter.detect_change(t1_in, t2_in, params=kwargs)
     return {
         "answer": out.answer,
         "confidence": out.confidence,
@@ -691,11 +882,11 @@ def _handle_change_detection(image_bytes: list[bytes] | None = None, image_paths
 
 
 def _handle_change_vqa(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, question: str = "", change_mask: Any = None, **kwargs) -> dict[str, Any]:
-    from apps.agent.contracts import ModelInput
-    from apps.models_ai.change_vqa.wrapper import ChangeVQAModel
-    model = ChangeVQAModel()
-    inputs = ModelInput(model_id="CHANGE_VQA", image_bytes=image_bytes or [], image_paths=image_paths or [], question=question, change_mask=change_mask)
-    out = model.predict(inputs)
+    from ai.adapters.changeformer_adapter import ChangeFormerAdapter
+    adapter = ChangeFormerAdapter()
+    t1_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    t2_in = image_bytes[1] if (image_bytes and len(image_bytes) > 1) else (image_paths[1] if (image_paths and len(image_paths) > 1) else None)
+    out = adapter.answer_change(t1_in, t2_in, change_mask=change_mask, question=question, params=kwargs)
     return {
         "answer": out.answer,
         "confidence": out.confidence,
@@ -705,17 +896,38 @@ def _handle_change_vqa(image_bytes: list[bytes] | None = None, image_paths: list
 
 
 def _handle_optical_sar(image_bytes: list[bytes] | None = None, image_paths: list[str] | None = None, **kwargs) -> dict[str, Any]:
-    from apps.agent.contracts import ModelInput
-    from apps.models_ai.optical_sar_fusion.wrapper import OpticalSARFusionModel
-    model = OpticalSARFusionModel()
-    inputs = ModelInput(model_id="OPTICAL_SAR_FUSION", image_bytes=image_bytes or [], image_paths=image_paths or [])
-    out = model.predict(inputs)
+    from ai.adapters.optical_sar_adapter import OpticalSARAdapter
+    adapter = OpticalSARAdapter()
+    opt_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    sar_in = image_bytes[1] if (image_bytes and len(image_bytes) > 1) else (image_paths[1] if (image_paths and len(image_paths) > 1) else None)
+    out = adapter.fuse(opt_in, sar_in, params=kwargs)
     return {
         "answer": out.answer,
         "confidence": out.confidence,
         "boxes": out.boxes or [],
         "status": out.status,
         "raw": out.raw,
+    }
+
+
+def _handle_remoteclip_retrieval(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    text_queries: list[str] | None = None,
+    **kwargs,
+) -> dict[str, Any]:
+    from ai.adapters.remoteclip_adapter import RemoteCLIPAdapter
+    adapter = RemoteCLIPAdapter()
+    img_in = image_bytes[0] if (image_bytes and len(image_bytes) > 0) else (image_paths[0] if (image_paths and len(image_paths) > 0) else None)
+    queries = text_queries or ["agricultural area", "built-up area", "water body", "vegetation"]
+    scores = adapter.score_similarity(img_in, queries)
+    ranked = adapter.classify_region(img_in, queries)
+    return {
+        "similarity_scores": scores,
+        "ranked_classes": ranked,
+        "top_class": ranked[0]["class"] if ranked else None,
+        "top_confidence": ranked[0]["confidence"] if ranked else 0.0,
+        "status": "ok",
     }
 
 
@@ -777,14 +989,18 @@ def _handle_spatial_relation(aoi_a: dict[str, Any], aoi_b: dict[str, Any], relat
     return {
         "relation": relation_type,
         "spatial_match": True,
-        "confidence": 0.88,
+        "confidence": None,
     }
 
 
 def _handle_temporal_comparison(t1_stats: dict[str, Any], t2_stats: dict[str, Any], **kwargs) -> dict[str, Any]:
+    mean1 = float(t1_stats.get("mean", 0.0))
+    mean2 = float(t2_stats.get("mean", 0.0))
+    delta = abs(mean1 - mean2)
+    consistency = round(max(0.50, 1.0 - min(0.50, delta / 1000.0)), 2) if (mean1 != 0 or mean2 != 0) else None
     return {
-        "temporal_delta_detected": True,
-        "radiometric_consistency": 0.92,
+        "temporal_delta_detected": delta > 0.05,
+        "radiometric_consistency": consistency,
         "status": "COMPARISON_COMPLETE",
     }
 
