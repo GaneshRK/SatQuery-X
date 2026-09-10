@@ -68,6 +68,8 @@ from apps.agent.evidence_engine import EvidenceEngine
 from apps.agent.registry import get_model_wrapper
 from apps.agent.tool_registry import ToolRegistry
 from apps.queries.models import ExecutionStep, Query
+from apps.queries.provenance import build_provenance_ledger
+from apps.agent.modality_router import resolve_analysis_route
 
 
 logger = logging.getLogger(__name__)
@@ -1737,6 +1739,12 @@ def _execute_model(
                     [],
                 )
             ),
+            "analysis_route": resolve_analysis_route(
+                imagery_context.get("assets", []),
+                requested_relationship=str(
+                    params.get("relationship") or ""
+                ),
+            ),
         },
     )
 
@@ -1844,6 +1852,8 @@ def _execute_model(
             "changed_area_hectares",
             "changed_area_km2",
             "verification_status",
+            "analysis_route",
+            "modality_routing",
         ):
             if key in output.raw:
                 result[key] = output.raw[key]
@@ -1941,6 +1951,11 @@ def _build_tool_kwargs(
     )
 
     kwargs.setdefault(
+        "analysis_route",
+        resolve_analysis_route(imagery_context.get("assets", []), str(params.get("relationship") or params.get("requested_relationship") or "")),
+    )
+
+    kwargs.setdefault(
         "bounds_wgs84",
         metadata.get(
             "bounds_wgs84"
@@ -1999,6 +2014,54 @@ def _build_tool_kwargs(
         "query_id",
         str(query.id),
     )
+
+    # Tool handlers have explicit required inputs. Populate them from the
+    # real query/image context instead of letting Python fail with missing
+    # positional-argument errors.
+    if tool_name == "vqa":
+        kwargs.setdefault("question", query.text)
+
+    if tool_name == "geo_metadata":
+        primary = imagery_context.get("assets", [])
+        filename = None
+        if primary and isinstance(primary[0], dict):
+            filename = (
+                primary[0].get("filename")
+                or primary[0].get("original_filename")
+            )
+        if not filename:
+            paths = imagery_context.get("paths", [])
+            if paths:
+                filename = Path(str(paths[0])).name
+        if filename:
+            kwargs.setdefault("filename", filename)
+
+    if tool_name == "spatial_relation":
+        assets = imagery_context.get("assets", [])
+        bounds = []
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            b = asset.get("bounds_wgs84") or asset.get("bounds")
+            if isinstance(b, dict):
+                try:
+                    west = float(b["west"]); south = float(b["south"])
+                    east = float(b["east"]); north = float(b["north"])
+                    if west < east and south < north:
+                        bounds.append((west, south, east, north))
+                except (KeyError, TypeError, ValueError):
+                    pass
+        if len(bounds) >= 2:
+            def _bbox_geojson(b):
+                west, south, east, north = b
+                return {
+                    "type": "Polygon",
+                    "coordinates": [[[west, south], [east, south],
+                                     [east, north], [west, north],
+                                     [west, south]]],
+                }
+            kwargs.setdefault("aoi_a", _bbox_geojson(bounds[0]))
+            kwargs.setdefault("aoi_b", _bbox_geojson(bounds[1]))
 
     return kwargs
 
@@ -2247,6 +2310,10 @@ def _execute_area_quantifier(
 def _is_registered_model(
     tool_name: str,
 ) -> bool:
+
+    # These are executor-native handlers, not specialist models.
+    if tool_name in SPECIAL_INTERNAL_TOOLS:
+        return False
 
     try:
         wrapper = get_model_wrapper(
@@ -3348,7 +3415,15 @@ class AgentExecutor:
                     "",
                 )
             ).strip()
-
+            # Normalize planner capability names to executor tool names.
+            # The planner uses logical capability names while the executor
+            # dispatches concrete/internal execution handlers.
+            tool_name = {
+                "CONTEXT": "CONTEXT_RESOLUTION",
+                "resolve_location": "LOCATION_RESOLUTION",
+                "evidence_fusion": "EVIDENCE_VALIDATOR",
+                "ANSWER_COMPOSITION": "ANSWER_COMPOSER",
+            }.get(tool_name, tool_name)
             if not tool_name:
                 continue
 
@@ -3473,6 +3548,52 @@ class AgentExecutor:
                     }
 
                 # ----------------------------------------------------------
+                # Location resolution.
+                # ----------------------------------------------------------
+
+                elif tool_name == "LOCATION_RESOLUTION":
+
+                    from apps.agent.location_resolver import resolve_location
+
+                    location_text = str(
+                        params.get("location")
+                        or getattr(
+                            query,
+                            "text",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    session_context = _get_session_context(
+                        query
+                    )
+
+                    resolved_location = resolve_location(
+                        text=location_text,
+                        session_context=session_context,
+                    )
+
+                    if resolved_location is None:
+                        result = {
+                            "status": "completed",
+                            "location": None,
+                            "resolved": False,
+                            "confidence": 0.0,
+                            "error": (
+                                "Could not resolve the requested "
+                                "location from the available geographic evidence."
+                            ),
+                        }
+                    else:
+                        result = {
+                            "status": "completed",
+                            "location": _json_safe(
+                                resolved_location
+                            ),
+                        }
+
+                # ----------------------------------------------------------
                 # Preprocessing.
                 # ----------------------------------------------------------
 
@@ -3485,6 +3606,20 @@ class AgentExecutor:
                         ),
                         "quality": preprocessing_result,
                     }
+
+                # ----------------------------------------------------------
+                # Runtime modality/relationship routing.
+                # ----------------------------------------------------------
+
+                elif tool_name == "resolve_analysis_route":
+                    result = resolve_analysis_route(
+                        imagery_context.get("assets", []),
+                        requested_relationship=str(
+                            params.get("requested_relationship")
+                            or item.get("relationship")
+                            or ""
+                        ),
+                    )
 
                 # ----------------------------------------------------------
                 # Area quantification.
@@ -3522,12 +3657,7 @@ class AgentExecutor:
                 # Specialist model.
                 # ----------------------------------------------------------
 
-                elif (
-                    tool_name in MODEL_TOOL_NAMES
-                    or self._is_registered_model(
-                        tool_name
-                    )
-                ):
+                elif tool_name in MODEL_TOOL_NAMES:
 
                     result = _execute_model(
                         model_id=tool_name,
@@ -3583,6 +3713,82 @@ class AgentExecutor:
                 result = _normalize_tool_result(
                     result
                 )
+
+                # ----------------------------------------------------------
+                # Agentic acquisition can create real ImageAsset records.
+                # Refresh the executor's live imagery context so all later
+                # specialist steps consume the downloaded imagery rather than
+                # the empty pre-acquisition input set.
+                # ----------------------------------------------------------
+                if tool_name == "acquire_satellite_imagery" and result.get("status") == "completed":
+                    try:
+                        refreshed_assets = _query_input_assets(query)
+                        if refreshed_assets:
+                            imagery_context = _build_imagery_context(refreshed_assets)
+                            imagery_context, refresh_report = _preprocess_imagery(imagery_context)
+                            preprocessing_result = {
+                                "status": "completed",
+                                "trigger": "agentic_satellite_acquisition",
+                                "refresh": refresh_report,
+                            }
+                            input_refs = [str(getattr(a, "id", "")) for a in refreshed_assets]
+                            if hasattr(step_row, "input_refs"):
+                                step_row.input_refs = _json_safe(input_refs)
+                                step_row.save(update_fields=["input_refs"])
+                    except Exception as refresh_exc:
+                        logger.exception("Failed to refresh imagery after satellite acquisition.")
+                        result = {
+                            **result,
+                            "status": "failed",
+                            "error": f"Downloaded imagery could not be attached to the analysis context: {refresh_exc}",
+                        }
+
+                # ----------------------------------------------------------
+                # Temporal Optical/SAR coregistration refresh. The tool
+                # produces real derived SAR GeoTIFFs on the paired optical
+                # grids. Rebuild the live imagery context in the exact
+                # [optical_t1, sar_t1, optical_t2, sar_t2] order so the
+                # native four-stream model consumes the aligned streams.
+                # ----------------------------------------------------------
+                if tool_name == "coregister_temporal_optical_sar" and result.get("status") == "completed":
+                    try:
+                        pairs = result.get("pairs") or []
+                        source_assets = list(imagery_context.get("assets", []))
+                        ordered_assets = []
+                        for pair in pairs:
+                            for key in ("optical_source_index", "sar_source_index"):
+                                idx = int(pair[key])
+                                if idx < 0 or idx >= len(source_assets):
+                                    raise ValueError("Coregistration returned an invalid source asset index.")
+                                meta = dict(source_assets[idx])
+                                meta["temporal_pair_index"] = int(pair["temporal_index"])
+                                meta["coregistered_to_optical_grid"] = key == "sar_source_index"
+                                meta["paired_acquisition"] = pair.get("optical_acquisition")
+                                ordered_assets.append(meta)
+                        ordered_paths = [str(x) for x in (result.get("ordered_paths") or [])]
+                        if len(ordered_assets) != 4 or len(ordered_paths) != 4:
+                            raise ValueError("Temporal coregistration did not return exactly four ordered streams.")
+                        imagery_context = dict(imagery_context)
+                        imagery_context["paths"] = ordered_paths
+                        imagery_context["bytes"] = []
+                        imagery_context["assets"] = ordered_assets
+                        imagery_context["arrays"] = []
+                        imagery_context, refresh_report = _preprocess_imagery(imagery_context)
+                        preprocessing_result = {
+                            "status": "completed",
+                            "trigger": "temporal_optical_sar_coregistration",
+                            "refresh": refresh_report,
+                        }
+                        if hasattr(step_row, "input_refs"):
+                            step_row.input_refs = _json_safe(ordered_paths)
+                            step_row.save(update_fields=["input_refs"])
+                    except Exception as refresh_exc:
+                        logger.exception("Failed to refresh imagery after temporal coregistration.")
+                        result = {
+                            **result,
+                            "status": "failed",
+                            "error": f"Coregistered imagery could not be attached to the analysis context: {refresh_exc}",
+                        }
 
                 # ----------------------------------------------------------
                 # Capture change mask.
@@ -4041,6 +4247,20 @@ class AgentExecutor:
         query.save(
             update_fields=update_fields
         )
+
+        # ------------------------------------------------------------------
+        # Tamper-evident provenance ledger.
+        # ------------------------------------------------------------------
+
+        provenance_verification = build_provenance_ledger(query)
+
+        query.evidence_graph = _json_safe(
+            {
+                **evidence_graph,
+                "provenance_ledger": provenance_verification,
+            }
+        )
+        query.save(update_fields=["evidence_graph"])
 
         # ------------------------------------------------------------------
         # Session memory.

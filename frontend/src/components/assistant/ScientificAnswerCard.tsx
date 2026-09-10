@@ -21,6 +21,7 @@ import {
 import { Badge } from "../ui/Badge";
 import { Card } from "../ui/Card";
 import { Button } from "../ui/Button";
+import OutcomeQualityPanel from "../OutcomeQualityPanel";
 
 export interface ObservationData {
   label?: string;
@@ -36,8 +37,17 @@ export interface ObservationData {
 
 export interface AnalysisResponseData {
   analysis_id?: string;
+  status?: string;
+  error?: string | null;
+  detected_mode?: string;
+  detected_task?: string;
+  completed_at?: string | null;
+  evidence_bundle?: any;
+  evidence_graph?: any;
+  location?: any;
   answer?: string;
   confidence?: number;
+  images?: Array<{ id?: string; filename?: string; preview_url?: string | null; file_url?: string | null; processing_status?: string; is_georeferenced?: boolean | null; crs?: string | null; }>;
   confidence_breakdown?: {
     data_quality_pct?: number;
     model_confidence_pct?: number;
@@ -102,9 +112,9 @@ export const ScientificAnswerCard: React.FC<ScientificAnswerCardProps> = ({
   const [showTrace, setShowTrace] = useState(false);
   const [showObservations, setShowObservations] = useState(true);
 
-  const confidencePct = Math.round(
-    (data.confidence_breakdown?.result_confidence_pct || (data.confidence || 0.94) * 100) * 10
-  ) / 10;
+  const rawConfidence = data.confidence_breakdown?.result_confidence_pct ??
+    (typeof data.confidence === "number" ? data.confidence * 100 : null);
+  const confidencePct = rawConfidence == null ? null : Math.round(rawConfidence * 10) / 10;
 
   const chain = data.evidence_chain;
   const hotspots = data.hotspots || [];
@@ -119,12 +129,9 @@ export const ScientificAnswerCard: React.FC<ScientificAnswerCardProps> = ({
     );
   };
 
-  const followUpSuggestions = [
-    "How much total area changed?",
-    "Show the largest affected region",
-    "Download scientific GeoTIFF change mask",
-    "Compare vegetation index between T1 and T2",
-  ];
+  const followUpSuggestions = Array.isArray((data as any).follow_up_questions)
+    ? (data as any).follow_up_questions.filter(Boolean)
+    : [];
 
   return (
     <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-200">
@@ -142,19 +149,19 @@ export const ScientificAnswerCard: React.FC<ScientificAnswerCardProps> = ({
               </h3>
               <p className="text-[10px] text-slate-400 font-mono">
                 ID: {data.analysis_id ? data.analysis_id.slice(0, 8) : "Live"} •{" "}
-                {data.workflow || "BI_TEMPORAL_ANALYSIS"}
+                {data.workflow || data.detected_task || "ANALYSIS"}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
             <Badge
-              variant={confidencePct >= 85 ? "success" : "warning"}
+              variant={confidencePct != null && confidencePct >= 85 ? "success" : "warning"}
               size="sm"
               dot
               className="font-mono"
             >
-              Result Confidence: {confidencePct}%
+              Result Confidence: {confidencePct == null ? "—" : `${confidencePct}%`}
             </Badge>
 
             {onOpenProofModal && (
@@ -172,6 +179,65 @@ export const ScientificAnswerCard: React.FC<ScientificAnswerCardProps> = ({
 
         {/* Natural Language Answer Body */}
         <div className="mb-4">{renderFormattedAnswer(data.answer)}</div>
+
+        {/* Actual uploaded imagery returned by the backend. */}
+        {Array.isArray(data.images) && data.images.length > 0 && (
+          <div className="mb-4 pt-3 border-t border-slate-800">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 mb-2">
+              Input Imagery
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {data.images.map((image, index) => {
+                const rawUrl = image.preview_url || image.file_url || "";
+                const url = rawUrl && rawUrl.startsWith("http")
+                  ? rawUrl
+                  : rawUrl
+                    ? `http://localhost:8000${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`
+                    : "";
+                return (
+                  <div key={image.id || index} className="rounded-lg border border-slate-800 bg-slate-950/60 overflow-hidden">
+                    {url ? (
+                      <a href={url} target="_blank" rel="noreferrer" className="block">
+                        <img src={url} alt={image.filename || `Uploaded image ${index + 1}`} className="w-full h-32 object-cover" />
+                      </a>
+                    ) : (
+                      <div className="h-32 flex items-center justify-center text-[10px] text-slate-500">Preview unavailable</div>
+                    )}
+                    <div className="p-2">
+                      <div className="text-[11px] text-slate-200 truncate">{image.filename || `Image ${index + 1}`}</div>
+                      <div className="text-[9px] text-slate-500 font-mono mt-1">
+                        {image.processing_status || "stored"}{image.is_georeferenced ? " • georeferenced" : ""}{image.crs ? ` • ${image.crs}` : ""}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Real geospatial result returned by the backend. */}
+        {data.location && (data.location.coordinates || data.location.bbox || data.location.administrative) && (
+          <div className="mb-4 pt-3 border-t border-slate-800">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 mb-2">
+              Geospatial Result
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <div className="rounded-md bg-slate-950/60 border border-slate-800 p-2"><div className="text-[9px] text-slate-500">Area</div><div className="text-[10px] text-slate-200 truncate">{data.location.administrative?.area || data.location.name || "—"}</div></div>
+              <div className="rounded-md bg-slate-950/60 border border-slate-800 p-2"><div className="text-[9px] text-slate-500">District</div><div className="text-[10px] text-slate-200 truncate">{data.location.administrative?.district || "—"}</div></div>
+              <div className="rounded-md bg-slate-950/60 border border-slate-800 p-2"><div className="text-[9px] text-slate-500">State</div><div className="text-[10px] text-slate-200 truncate">{data.location.administrative?.state || "—"}</div></div>
+              <div className="rounded-md bg-slate-950/60 border border-slate-800 p-2"><div className="text-[9px] text-slate-500">Country</div><div className="text-[10px] text-slate-200 truncate">{data.location.administrative?.country || "—"}</div></div>
+            </div>
+            {Array.isArray(data.location.coordinates) && data.location.coordinates.length === 2 && (
+              <div className="mt-2 text-[10px] font-mono text-cyan-300">
+                Coordinates: {Number(data.location.coordinates[1]).toFixed(6)}°N, {Number(data.location.coordinates[0]).toFixed(6)}°E
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Presentation-focused outcome validation */}
+        <OutcomeQualityPanel data={data} />
 
         {/* Hotspot Clusters Table (if available) */}
         {hotspots.length > 0 && (
@@ -230,11 +296,11 @@ export const ScientificAnswerCard: React.FC<ScientificAnswerCardProps> = ({
               </span>
               <div className="font-mono text-slate-200 mt-0.5">
                 <span className="text-cyan-400 font-semibold">
-                  {chain.pixel_count ? chain.pixel_count.toLocaleString() : "184,000"} px
+                  {chain.pixel_count != null ? chain.pixel_count.toLocaleString() : "—"} px
                 </span>{" "}
                 × 100m² GSD ={" "}
                 <span className="text-emerald-400 font-semibold">
-                  {chain.total_area_km2 || 18.4} km²
+                  {chain?.total_area_km2 == null ? "—" : chain.total_area_km2} km²
                 </span>
               </div>
             </div>

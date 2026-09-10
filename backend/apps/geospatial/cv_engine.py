@@ -1,4 +1,4 @@
-"""
+﻿"""
 Deterministic computer-vision and remote-sensing feature engine.
 
 This module provides evidence-producing algorithms.
@@ -859,7 +859,6 @@ def classify_land_cover(
     bare_count = counts[
         "bare_soil_candidate"
     ]
-
     return LandCoverMetrics(
         aoi_total_area_km2=(
             round(

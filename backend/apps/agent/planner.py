@@ -840,6 +840,7 @@ def infer_input_relationship(
         "SINGLE_IMAGE",
         "BI_TEMPORAL",
         "CROSS_MODAL",
+        "TEMPORAL_CROSS_MODAL",
         "TEXT_ONLY",
         "NONE",
     }
@@ -856,6 +857,9 @@ def infer_input_relationship(
 
     if normalized_mode == "CROSS_MODAL":
         return "CROSS_MODAL"
+
+    if normalized_mode == "TEMPORAL_CROSS_MODAL":
+        return "TEMPORAL_CROSS_MODAL"
 
     if normalized_mode == "BI_TEMPORAL":
         return "BI_TEMPORAL"
@@ -1227,6 +1231,26 @@ def _append_report_stage(
     )
 
 
+def _append_modality_router(steps: list[PlanStep], relationship: str) -> None:
+    _append_step(
+        steps,
+        "resolve_analysis_route",
+        (
+            "Resolve the analysis route from actual imagery metadata, including "
+            "single-image, bi-temporal, optical/SAR, and temporal optical/SAR cases."
+        ),
+        parameters={
+            "requested_relationship": relationship,
+            "require_explicit_modality_metadata": True,
+            "allow_sensor_platform_metadata": True,
+            "never_guess_from_input_order": True,
+        },
+        required_images=1,
+        relationship=relationship,
+        capability=AgentCapability.QUERY_UNDERSTANDING,
+    )
+
+
 # ============================================================================
 # Specialized pipelines
 # ============================================================================
@@ -1267,6 +1291,8 @@ def _build_change_pipeline(
         required_images=2,
         relationship="BI_TEMPORAL",
     )
+
+    _append_modality_router(steps, relationship)
 
     _append_step(
         steps,
@@ -1561,6 +1587,43 @@ def _build_single_image_pipeline(
     )
 
 
+def _build_temporal_optical_sar_pipeline(steps: list[PlanStep], intent: Any, relationship: str) -> None:
+    if relationship != "TEMPORAL_CROSS_MODAL":
+        return
+    _append_metadata_step(steps, required_images=4, relationship="TEMPORAL_CROSS_MODAL")
+    _append_modality_router(steps, relationship)
+    _append_step(
+        steps,
+        "coregister_temporal_optical_sar",
+        "Pair the real observations by acquisition time and coregister each SAR scene to its paired optical grid before multimodal inference.",
+        parameters={
+            "max_pair_delta_hours": 72.0,
+            "require_crs": True,
+            "require_spatial_overlap": True,
+            "preserve_temporal_order": True,
+            "never_guess_modality": True,
+        },
+        required_images=4, relationship="TEMPORAL_CROSS_MODAL",
+        capability=AgentCapability.MULTI_IMAGE_ANALYSIS,
+    )
+    _append_step(
+        steps,
+        "temporal_optical_sar",
+        "Fuse Optical/SAR observations at two timestamps with separate modality and temporal streams.",
+        parameters={
+            "target": _target(intent),
+            "require_two_optical_observations": True,
+            "require_two_sar_observations": True,
+            "require_explicit_modality_metadata": True,
+            "require_spatial_alignment": True,
+            "preserve_temporal_order": True,
+        },
+        required_images=4, relationship="TEMPORAL_CROSS_MODAL",
+        capability=AgentCapability.MULTI_IMAGE_ANALYSIS,
+    )
+    _append_evidence_fusion(steps)
+
+
 def _build_cross_modal_pipeline(
     steps: list[PlanStep],
     intent: Any,
@@ -1576,6 +1639,8 @@ def _build_cross_modal_pipeline(
         required_images=2,
         relationship="CROSS_MODAL",
     )
+
+    _append_modality_router(steps, relationship)
 
     _append_step(
         steps,
@@ -2010,6 +2075,32 @@ def create_execution_plan(
             latest_only=_is_latest_observation(intent),
         )
 
+        # Agentic acquisition: when the request needs actual imagery for
+        # downstream analysis, search results are not enough. Select real
+        # provider assets, download them, validate them, and attach them to
+        # the query before specialist models execute. Pure catalogue-search
+        # requests remain metadata-only.
+        if image_count == 0 and _intent_name(intent) not in {
+            "SATELLITE_SEARCH", "SCENE_SEARCH", "IMAGE_SEARCH", "CATALOG_SEARCH",
+        }: 
+            acquisition_count = 4 if relationship == "TEMPORAL_CROSS_MODAL" else (2 if _is_change_query(intent) else 1)
+            _append_step(
+                steps,
+                "acquire_satellite_imagery",
+                (
+                    "Select real catalogue observation(s), download provider assets, "
+                    "validate geospatial integrity, and attach the resulting imagery "
+                    "to the active query before analysis."
+                ),
+                parameters={
+                    "required_images": acquisition_count,
+                    "asset_preference": "",
+                    "require_real_download": True,
+                    "require_geospatial_validation": True,
+                },
+                capability=AgentCapability.SATELLITE_SEARCH,
+            )
+
         # If real uploaded imagery is also available, it can be analyzed.
         if image_count > 0:
             _append_metadata_step(
@@ -2027,7 +2118,10 @@ def create_execution_plan(
                 relationship,
             )
 
-            if relationship == "BI_TEMPORAL" and _is_change_query(intent):
+            if relationship == "TEMPORAL_CROSS_MODAL":
+                _build_temporal_optical_sar_pipeline(steps, intent, relationship)
+
+            elif relationship == "BI_TEMPORAL" and _is_change_query(intent):
                 _build_change_pipeline(
                     steps,
                     intent,
@@ -2052,6 +2146,11 @@ def create_execution_plan(
     # Cross-modal
     # ====================================================================
 
+    elif relationship == "TEMPORAL_CROSS_MODAL":
+        _append_preprocessing_step(steps, relationship)
+        _build_temporal_optical_sar_pipeline(steps, intent, relationship)
+        _append_evidence_validation(steps)
+
     elif _is_cross_modal(
         intent,
         normalized_mode,
@@ -2060,6 +2159,8 @@ def create_execution_plan(
             steps,
             relationship,
         )
+
+        _append_modality_router(steps, relationship)
 
         _build_cross_modal_pipeline(
             steps,
@@ -2172,6 +2273,8 @@ def create_execution_plan(
             steps,
             relationship,
         )
+
+        _append_modality_router(steps, relationship)
 
         _build_single_image_pipeline(
             steps,
@@ -2371,7 +2474,7 @@ def create_execution_plan(
         },
 
         "planner": {
-            "version": "3.0",
+            "version": "3.1",
             "strategy": "grounded_agentic_routing",
 
             "deterministic_measurements_before_semantic_interpretation": True,
@@ -2381,6 +2484,8 @@ def create_execution_plan(
             "map_context_supported": True,
             "multi_image_supported": True,
             "cross_modal_supported": True,
+            "runtime_modality_routing": True,
+            "temporal_cross_modal_supported": True,
 
             "evidence_fusion_enabled": True,
             "evidence_validation_enabled": True,

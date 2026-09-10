@@ -34,7 +34,7 @@ import numpy as np
 from PIL import Image
 
 from apps.agent.contracts import ModelInput, ModelOutput
-from apps.models_ai.manage import model_manager
+from apps.models_ai.manager import model_manager
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ class RSVQAModel:
             "VQA_MODEL_ID",
             "",
         ).strip()
+        self.checkpoint = os.getenv("VQA_CHECKPOINT", "").strip()
 
         self.allow_visual_fallback = (
             os.getenv(
@@ -111,7 +112,7 @@ class RSVQAModel:
         # 1. Prefer a configured real VQA/VLM.
         # --------------------------------------------------------------
 
-        if self.preferred_model:
+        if self.preferred_model or self.checkpoint:
             model_output = self._try_configured_model(
                 inputs,
                 image,
@@ -176,9 +177,16 @@ class RSVQAModel:
         a model result.
         """
 
+        model_id = self.preferred_model or self.checkpoint
+
+        def factory():
+            from apps.models_ai.rs_vqa.hf_model import HuggingFaceRSVQA
+            return HuggingFaceRSVQA(model_id, device=model_manager.device)
+
         model = model_manager.load_model(
-            self.preferred_model
-        )
+            model_id,
+            factory_fn=factory,
+            )
 
         if model is None:
             logger.info(
@@ -201,7 +209,7 @@ class RSVQAModel:
 
             if normalized is None:
                 model_manager.mark_prediction(
-                    self.preferred_model,
+                    model_id,
                     success=False,
                     error="Model returned no usable VQA result.",
                 )
@@ -213,7 +221,7 @@ class RSVQAModel:
 
             if not answer:
                 model_manager.mark_prediction(
-                    self.preferred_model,
+                    model_id,
                     success=False,
                     error="VQA model returned no answer.",
                 )
@@ -234,7 +242,7 @@ class RSVQAModel:
             )
 
             model_manager.mark_prediction(
-                self.preferred_model,
+                model_id,
                 success=True,
             )
 
@@ -250,7 +258,7 @@ class RSVQAModel:
                 status="ok",
                 raw={
                     "execution": "configured_model",
-                    "base_model": self.preferred_model,
+                    "base_model": model_id,
                     "device": model_manager.device,
                     "question": question,
                     "provenance": normalized.get(
@@ -262,14 +270,14 @@ class RSVQAModel:
 
         except Exception as exc:
             model_manager.mark_prediction(
-                self.preferred_model,
+                model_id,
                 success=False,
                 error=str(exc),
             )
 
             logger.exception(
                 "Configured VQA model '%s' failed.",
-                self.preferred_model,
+                model_id,
             )
 
             return None

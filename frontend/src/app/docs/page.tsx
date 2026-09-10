@@ -41,7 +41,7 @@ export default function DocumentationPage() {
     {
       step: 5,
       title: "Inspect Verifiable Proof Chain",
-      desc: "Inspect pixel-level derivation (184,000 px × 100m² = 18.40 km²), coordinate reference systems, and download GeoTIFF masks.",
+      desc: "Inspect pixel-level derivation from measured backend evidence, coordinate reference systems, and downloadable GeoTIFF masks.",
     },
   ];
 

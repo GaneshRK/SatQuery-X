@@ -282,13 +282,22 @@ def build_query_context(query: Query) -> dict:
 )
 def run_query_task(
     self,
-    query_id: str,
+    ingestion_results=None,
+    query_id: str | None = None,
 ) -> dict:
     """
     Execute one query through the master SatQuery-X orchestrator.
 
     The task does not perform scientific analysis itself.
     """
+
+    # Celery chord callbacks pass the header results as the first argument.
+    # Direct calls may pass only query_id. Support both forms.
+    if query_id is None and isinstance(ingestion_results, str):
+        query_id = ingestion_results
+        ingestion_results = None
+    if not query_id:
+        raise ValueError("query_id is required")
 
     query = None
 

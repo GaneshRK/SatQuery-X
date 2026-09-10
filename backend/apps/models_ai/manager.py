@@ -17,7 +17,7 @@ This file is NOT Django's project-level manage.py.
 
 It is the model lifecycle manager located at:
 
-    backend/apps/models_ai/manage.py
+    backend/apps/models_ai/manager.py
 """
 
 from __future__ import annotations

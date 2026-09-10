@@ -87,7 +87,7 @@ export interface ExecutionTrace {
   plan: PlanStep[];
   outputs: Record<string, any>;
   answer: string;
-  confidence: number;
+  confidence?: number;
   answer_contract?: AnswerContract;
   evidence: EvidenceOutput;
   structured_plan?: any;

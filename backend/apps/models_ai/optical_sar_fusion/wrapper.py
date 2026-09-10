@@ -46,12 +46,14 @@ Scientific constraints
 from __future__ import annotations
 
 import io
+import json
 import logging
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import os
 from PIL import Image, ImageDraw
 from scipy import ndimage
 
@@ -65,6 +67,12 @@ logger = logging.getLogger(__name__)
 
 
 class OpticalSARFusionModel:
+    """Cross-modal fusion with an optional real supervised checkpoint.
+
+    When OPTICAL_SAR_CHECKPOINT is configured, inference uses the trained
+    dual-encoder model. Otherwise the existing grounded evidence pipeline
+    remains available as an explicit non-trained fallback.
+    """
     """
     Cross-modal optical + SAR evidence fusion.
 
@@ -97,6 +105,9 @@ class OpticalSARFusionModel:
         start_time = time.perf_counter()
 
         try:
+            trained = self._predict_configured_model(inputs, start_time)
+            if trained is not None:
+                return trained
             return self._predict_internal(
                 inputs,
                 start_time,
@@ -123,6 +134,95 @@ class OpticalSARFusionModel:
                 error=str(exc),
                 latency_ms=latency,
             )
+
+
+    def _predict_configured_model(self, inputs: ModelInput, start_time: float) -> ModelOutput | None:
+        checkpoint = os.getenv("OPTICAL_SAR_CHECKPOINT", "").strip()
+        if not checkpoint:
+            return None
+        try:
+            import torch
+            from ml.optical_sar_fusion.model import OpticalSARNet
+            device = os.getenv("OPTICAL_SAR_DEVICE", "auto")
+            device = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
+            ck = torch.load(checkpoint, map_location=device, weights_only=False)
+            model = OpticalSARNet(int(ck.get("num_classes", 4))).to(device)
+            model.load_state_dict(ck["state_dict"]); model.eval()
+            idx = self._resolve_modality_indices(inputs)
+            if idx is None: return None
+            oi, si = idx
+            op = self._load_image_source(inputs, oi); sp = self._load_image_source(inputs, si)
+            if op is None or sp is None: return None
+            # GeoTIFF inputs must be CRS-aware aligned before inference.
+            # Ordinary image files remain supported only as non-geospatial inputs.
+            opath = str(op.get("source", ""))
+            spath = str(sp.get("source", ""))
+            if opath.lower().endswith((".tif", ".tiff", ".geotiff")) and spath.lower().endswith((".tif", ".tiff", ".geotiff")):
+                from apps.geospatial.coregistration import align_optical_sar
+                def _bands(name: str, default: str) -> list[int]:
+                    raw = os.getenv(name, default).strip()
+                    vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+                    if not vals or any(x < 1 for x in vals):
+                        raise ValueError(f"{name} must contain positive 1-based band indices.")
+                    return vals
+                optical_bands = _bands("OPTICAL_SAR_OPTICAL_BANDS", "1,2,3")
+                sar_bands = _bands("OPTICAL_SAR_SAR_BANDS", "1")
+                o, sar_arr, alignment = align_optical_sar(opath, spath, optical_bands=optical_bands, sar_bands=sar_bands)
+                if o.shape[0] < 3:
+                    raise ValueError("Configured optical raster must provide at least three bands for OpticalSARNet.")
+                o = o[:3]
+                sar = sar_arr[0]
+                alignment_status = alignment
+            else:
+                size=(256,256)
+                o=np.asarray(op["image"].resize(size, Image.Resampling.BILINEAR).convert("RGB"),dtype=np.float32)/255.0
+                sar=np.asarray(sp["image"].resize(size, Image.Resampling.BILINEAR).convert("L"),dtype=np.float32)/255.0
+                alignment_status = {"coregistered": False, "reason": "non-geospatial image inputs"}
+            if o.ndim != 3 or o.shape[0] == 0:
+                raise ValueError("Optical input is empty after preprocessing.")
+            if o.shape[0] == 3:
+                o = np.transpose(o, (1, 2, 0)) if o.shape[1:] != sar.shape else o
+            if o.ndim == 3 and o.shape[-1] == 3:
+                o = o.astype(np.float32)
+            if o.ndim == 3 and o.shape[0] != 3:
+                raise ValueError("Optical tensor must contain exactly three channels.")
+            if o.shape[:2] == sar.shape:
+                o_hwc = o
+            else:
+                o_hwc = np.transpose(o, (1, 2, 0))
+            if o_hwc.shape[:2] != sar.shape:
+                from PIL import Image as _Image
+                o_hwc = np.asarray(_Image.fromarray(np.clip(o_hwc*255,0,255).astype(np.uint8)).resize((sar.shape[1],sar.shape[0]), _Image.Resampling.BILINEAR), dtype=np.float32)/255.0
+            o = o_hwc
+            o = np.nan_to_num(o, nan=0.0, posinf=0.0, neginf=0.0)
+            sar = np.nan_to_num(sar, nan=0.0, posinf=0.0, neginf=0.0)
+            ot=torch.from_numpy(o).permute(2,0,1)[None].to(device); st=torch.from_numpy(sar)[None,None].to(device)
+            with torch.no_grad(): logits=model(ot,st)
+            calibration_temperature = None
+            calibration_path = os.getenv("OPTICAL_SAR_CALIBRATION", "").strip()
+            if calibration_path:
+                try:
+                    payload = json.loads(Path(calibration_path).read_text(encoding="utf-8"))
+                    calibration_temperature = float(payload["temperature"])
+                    if not np.isfinite(calibration_temperature) or calibration_temperature <= 0:
+                        raise ValueError("temperature must be finite and > 0")
+                except Exception as exc:
+                    logger.warning("Ignoring invalid optical-SAR calibration artifact: %s", exc)
+                    calibration_temperature = None
+            if calibration_temperature is not None:
+                logits = logits / calibration_temperature
+            probabilities = torch.softmax(logits, dim=1)
+            pred=probabilities.argmax(1)[0].cpu().numpy()
+            confidence=float(probabilities.max(1).values.mean().item()) if calibration_temperature is not None else None
+            total=float(pred.size); counts=[int((pred==i).sum()) for i in range(model.num_classes)]
+            names={0:"background",1:"water",2:"built_up",3:"vegetation"}
+            classes={names.get(i,f"class_{i}"): round(c/total*100,4) for i,c in enumerate(counts)}
+            answer="Supervised optical-SAR fusion predicts " + ", ".join(f"{k}: {v}%" for k,v in classes.items() if k != "background") + "."
+            latency=int((time.perf_counter()-start_time)*1000)
+            return ModelOutput(model_id=self.model_id,version="4.0-supervised",task=self.task,answer=answer,confidence=confidence,latency_ms=latency,status="ok",raw={"adaptation":"supervised_dual_encoder","checkpoint":checkpoint,"architecture":"OpticalSARNet","class_percentages":classes,"trained_inference":True,"alignment":alignment_status,"confidence_calibration":{"method":"temperature_scaling","temperature":calibration_temperature,"status":"applied" if calibration_temperature is not None else "not_applied"}})
+        except Exception as exc:
+            logger.warning("Configured optical-SAR checkpoint unavailable: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Main pipeline

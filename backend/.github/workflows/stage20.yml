@@ -1,0 +1,29 @@
+name: SatQuery-X Stage 20 Gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Compile
+        working-directory: backend
+        run: python -m compileall -q .
+      - name: Django checks
+        working-directory: backend
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.dev
+        run: python manage.py check
+      - name: Tests
+        working-directory: backend
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.dev
+        run: pytest -q

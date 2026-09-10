@@ -31,8 +31,8 @@ export interface HotspotData {
 }
 
 export interface UnifiedSatelliteMapProps {
-  bounds?: [number, number, number, number]; // [west, south, east, north]
-  center?: [number, number]; // [lng, lat]
+  bounds?: [number, number, number, number] | null; // [west, south, east, north]
+  center?: [number, number] | null; // [lng, lat]
   zoom?: number;
   t1PreviewUrl?: string;
   t2PreviewUrl?: string;
@@ -45,15 +45,15 @@ export interface UnifiedSatelliteMapProps {
 }
 
 export const UnifiedSatelliteMap: React.FC<UnifiedSatelliteMapProps> = ({
-  bounds = [76.85, 10.95, 77.10, 11.15],
-  center = [76.96, 11.01],
+  bounds = null,
+  center = [0, 0],
   zoom = 11,
   t1PreviewUrl,
   t2PreviewUrl,
   changeMaskUrl,
   geojsonUrl,
   hotspots = [],
-  locationName = "Coimbatore, Tamil Nadu",
+  locationName = "",
   onSelectRegion,
   className = "",
 }) => {
@@ -97,10 +97,12 @@ export const UnifiedSatelliteMap: React.FC<UnifiedSatelliteMapProps> = ({
       ],
     };
 
+      const mapCenter = center || [0, 0];
+
     const map = new maplibregl.Map({
       container: mapContainer.current,
       style: activeBasemap === "satellite" ? (satelliteStyle as any) : "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-      center: center,
+      center: mapCenter as [number, number],
       zoom: zoom,
       attributionControl: false,
     });
@@ -155,6 +157,33 @@ export const UnifiedSatelliteMap: React.FC<UnifiedSatelliteMapProps> = ({
             "line-dasharray": [3, 2],
           },
         });
+
+        if (mapCenter && locationName) {
+          map.addSource("location-label", {
+            type: "geojson",
+            data: {
+              type: "Feature",
+              properties: { name: locationName },
+              geometry: { type: "Point", coordinates: mapCenter },
+            } as any,
+          });
+          map.addLayer({
+            id: "location-label",
+            type: "symbol",
+            source: "location-label",
+            layout: {
+              "text-field": ["get", "name"],
+              "text-size": 13,
+              "text-offset": [0, 1.5],
+              "text-anchor": "top",
+            },
+            paint: {
+              "text-color": "#ffffff",
+              "text-halo-color": "#061018",
+              "text-halo-width": 2,
+            },
+          });
+        }
       }
 
       // Add Change Mask Raster if present
@@ -220,10 +249,10 @@ export const UnifiedSatelliteMap: React.FC<UnifiedSatelliteMapProps> = ({
               const props = feat.properties || {};
 
               const selected: HotspotData = {
-                cluster_id: props.cluster_id || props.name || "REGION-01",
-                area_km2: props.area_km2 || 4.8,
+                cluster_id: props.cluster_id || props.name || `REGION-${Date.now()}`,
+                area_km2: props.area_km2,
                 intensity: props.intensity || "High",
-                density_score: props.density_score || 0.94,
+                density_score: props.density_score,
                 dominant_transition: props.dominant_transition || "Vegetation Reduction",
                 coords_str: `${e.lngLat.lat.toFixed(4)}°N, ${e.lngLat.lng.toFixed(4)}°E`,
                 centroid_lat: e.lngLat.lat,
@@ -336,13 +365,15 @@ export const UnifiedSatelliteMap: React.FC<UnifiedSatelliteMapProps> = ({
 
       {/* Top Floating Header & Location Badge */}
       <div className="absolute top-3 left-3 z-10 flex flex-wrap items-center gap-2">
-        <div className="px-3 py-1.5 rounded-xl bg-slate-900/90 backdrop-blur-md border border-slate-700/80 shadow-xl flex items-center gap-2 text-xs font-medium text-slate-100">
-          <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-          <span>{locationName}</span>
-          <span className="text-[10px] text-slate-400 font-mono">
-            [{bounds[0].toFixed(2)}, {bounds[1].toFixed(2)} → {bounds[2].toFixed(2)}, {bounds[3].toFixed(2)}]
-          </span>
-        </div>
+        {bounds && (
+          <div className="px-3 py-1.5 rounded-xl bg-slate-900/90 backdrop-blur-md border border-slate-700/80 shadow-xl flex items-center gap-2 text-xs font-medium text-slate-100">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            <span>{locationName || "Georeferenced observation"}</span>
+            <span className="text-[10px] text-slate-400 font-mono">
+              [{bounds[0].toFixed(5)}, {bounds[1].toFixed(5)} → {bounds[2].toFixed(5)}, {bounds[3].toFixed(5)}]
+            </span>
+          </div>
+        )}
 
         {hotspots.length > 0 && (
           <Button

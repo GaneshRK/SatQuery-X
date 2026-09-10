@@ -460,6 +460,38 @@ class ToolRegistry:
 
         self.register(
             ToolDefinition(
+                name="acquire_satellite_imagery",
+                description=(
+                    "Select a real catalogue candidate from the immediately "
+                    "preceding satellite search, download a real provider asset, "
+                    "validate it, and attach it to the active query."
+                ),
+                task="SATELLITE_ACQUISITION",
+                required_images=0,
+                required_relationship="NONE",
+                model="Copernicus/STAC+Rasterio",
+                gpu_requirement="CPU_ONLY",
+                input_schema={
+                    "step_outputs": "dict",
+                    "query_id": "str",
+                    "asset_preference": "str|None",
+                },
+                output_schema={
+                    "status": "str",
+                    "scene_id": "str",
+                    "asset_id": "str",
+                    "image_asset_id": "str",
+                    "local_path": "str",
+                    "acquisition_date": "str|None",
+                    "provenance": "dict",
+                },
+                handler=_handle_acquire_satellite,
+                requires_imagery=False,
+            )
+        )
+
+        self.register(
+            ToolDefinition(
                 name="calculate_ndbi",
                 description=(
                     "Calculate NDBI from explicitly mapped SWIR and NIR "
@@ -704,7 +736,7 @@ class ToolRegistry:
                 task="CHANGE_VQA",
                 required_images=2,
                 required_relationship="BI_TEMPORAL",
-                model="ChangeFormer",
+                model="SupervisedChangeVQA",
                 gpu_requirement="OPTIONAL",
                 input_schema={
                     "question": "str",
@@ -744,6 +776,43 @@ class ToolRegistry:
                     "boxes": "list",
                 },
                 handler=_handle_optical_sar,
+            )
+        )
+
+        self.register(
+            ToolDefinition(
+                name="coregister_temporal_optical_sar",
+                description=(
+                    "Pair real Optical/SAR observations by acquisition time and "
+                    "reproject each SAR observation onto its paired optical grid."
+                ),
+                task="TEMPORAL_COREGISTRATION",
+                required_images=4,
+                required_relationship="TEMPORAL_CROSS_MODAL",
+                model="Rasterio/CRS-aware temporal pairing",
+                gpu_requirement="CPU_ONLY",
+                input_schema={"image_paths": "list[str]", "image_metadata": "list[dict]", "max_pair_delta_hours": "float"},
+                output_schema={"status": "str", "ordered_paths": "list[str]", "pairs": "list", "stream_order": "list[str]"},
+                handler=_handle_coregister_temporal_optical_sar,
+                requires_imagery=True,
+            )
+        )
+
+        self.register(
+            ToolDefinition(
+                name="temporal_optical_sar",
+                description=(
+                    "Native four-stream temporal Optical/SAR reasoning using two "
+                    "explicitly identified optical and two SAR observations."
+                ),
+                task="TEMPORAL_OPTICAL_SAR",
+                required_images=4,
+                required_relationship="TEMPORAL_CROSS_MODAL",
+                model="TemporalOpticalSAR",
+                gpu_requirement="OPTIONAL",
+                input_schema={"image_bytes": "list[bytes]|None", "image_paths": "list[str]|None", "question": "str"},
+                output_schema={"answer": "str", "confidence": "float|None"},
+                handler=_handle_temporal_optical_sar,
             )
         )
 
@@ -1732,6 +1801,16 @@ def _handle_search_satellite(
                     "collection",
                     None,
                 ),
+                "sensor": getattr(candidate, "sensor", None),
+                "platform": getattr(candidate, "platform", None),
+                "mission": getattr(candidate, "mission", None),
+                "instrument": getattr(candidate, "instrument", None),
+                "footprint_geom": getattr(candidate, "footprint_geom", None),
+                "bbox": getattr(candidate, "bbox", None),
+                "stac_item_url": getattr(candidate, "stac_item_url", None),
+                "thumbnail_url": getattr(candidate, "thumbnail_url", None),
+                "assets_summary": getattr(candidate, "assets_summary", {}) or {},
+                "metadata": getattr(candidate, "metadata", {}) or {},
             }
         )
 
@@ -1750,6 +1829,121 @@ def _handle_search_satellite(
         "status": "ok",
     }
 
+
+# ===========================================================================
+# Agentic satellite acquisition
+# ===========================================================================
+
+
+def _handle_acquire_satellite(
+    step_outputs: dict[str, Any] | None = None,
+    query_id: str | None = None,
+    asset_preference: str | None = None,
+    required_images: int = 1,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Acquire one real asset selected from a prior real catalogue search."""
+    del kwargs
+    if not query_id:
+        raise ValueError("query_id is required for satellite acquisition.")
+    outputs = step_outputs if isinstance(step_outputs, dict) else {}
+    search = None
+    for value in outputs.values():
+        if isinstance(value, dict) and value.get("candidates"):
+            search = value
+    if not search:
+        raise ValueError("Satellite acquisition requires a preceding successful catalogue search.")
+    candidates = search.get("candidates") or []
+    if not candidates:
+        return {"status": "insufficient_evidence", "reason": "The real catalogue returned no candidate scenes."}
+    preferred = str(asset_preference or "").strip().lower()
+    requested_count = max(1, int(required_images or 1))
+    usable = [item for item in candidates if isinstance(item, dict) and item.get("stac_item_id")]
+    usable.sort(key=lambda x: str(x.get("acquisition_date") or ""))
+    def _candidate_modality(item):
+        text = f"{item.get('sensor','')} {item.get('platform','')} {item.get('mission','')}".lower()
+        return "sar" if any(k in text for k in ("sar", "sentinel-1", "radar")) else ("optical" if any(k in text for k in ("optical", "multispectral", "sentinel-2", "landsat")) else "unknown")
+    if requested_count >= 4:
+        # For native temporal Optical/SAR, require an explicit optical+SAR pair
+        # at each of two distinct acquisition dates. Never fabricate a pairing.
+        by_date = {}
+        for item in usable:
+            date_key = str(item.get("acquisition_date") or "").split("T")[0]
+            by_date.setdefault(date_key, {}).setdefault(_candidate_modality(item), []).append(item)
+        complete_dates = [(d, grp) for d, grp in sorted(by_date.items()) if grp.get("optical") and grp.get("sar")]
+        if len(complete_dates) < 2:
+            return {"status": "insufficient_evidence", "reason": "Four-stream temporal Optical/SAR analysis requires two distinct dates, each with an explicit optical and SAR observation.", "complete_date_count": len(complete_dates)}
+        first_date, first_grp = complete_dates[0]; last_date, last_grp = complete_dates[-1]
+        selected_candidates = [first_grp["optical"][-1], first_grp["sar"][-1], last_grp["optical"][-1], last_grp["sar"][-1]]
+    elif requested_count >= 2:
+        if len(usable) < 2:
+            return {"status": "insufficient_evidence", "reason": "At least two distinct catalogue observations are required for bi-temporal analysis.", "candidate_count": len(usable)}
+        selected_candidates = [usable[0], usable[-1]]
+    else:
+        selected_candidates = [usable[-1]]
+    if preferred:
+        for idx, item in enumerate(selected_candidates):
+            assets = item.get("assets_summary") or {}
+            match = next((k for k in assets if preferred in str(k).lower()), None)
+            if match:
+                selected_candidates[idx] = item
+
+    from apps.satellite.models import SatelliteScene, SatelliteAsset
+    from apps.satellite.services.asset_ingestion import download_scene_asset
+    from django.utils.dateparse import parse_datetime
+    from datetime import datetime, timezone as dt_timezone
+    from apps.queries.models import Query
+    from apps.imagery.models import ImageAsset
+    from django.core.files import File
+    from pathlib import Path
+
+    provider_name = "copernicus"
+    query = Query.objects.get(id=query_id)
+    acquired = []
+    for candidate in selected_candidates:
+        collection = str(candidate.get("collection") or "").strip()
+        sensor_raw = str(candidate.get("sensor") or search.get("sensor_requested") or "").upper()
+        sensor = "SAR" if "1" in sensor_raw or "SAR" in sensor_raw else "OPTICAL"
+        acquisition = candidate.get("acquisition_date")
+        if not acquisition:
+            raise ValueError("Selected catalogue candidate has no acquisition date.")
+        dt = parse_datetime(str(acquisition))
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(str(acquisition).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("Selected catalogue candidate has an invalid acquisition timestamp.") from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=dt_timezone.utc)
+        scene, _ = SatelliteScene.objects.update_or_create(
+            provider=provider_name, collection=collection, external_id=str(candidate["stac_item_id"]),
+            defaults={"acquisition_datetime": dt, "cloud_cover": candidate.get("cloud_cover_pct"), "geometry": candidate.get("footprint_geom"), "bbox": candidate.get("bbox"), "platform": str(candidate.get("platform") or ""), "mission": str(candidate.get("mission") or ""), "instrument": str(candidate.get("instrument") or ""), "sensor": sensor, "modality": "SAR" if sensor == "SAR" else "MULTISPECTRAL", "stac_item_url": str(candidate.get("stac_item_url") or ""), "thumbnail_url": str(candidate.get("thumbnail_url") or ""), "metadata": candidate.get("metadata") or {}, "availability_status": "CATALOGUED"})
+        assets = candidate.get("assets_summary") or {}
+        if not isinstance(assets, dict) or not assets:
+            raise ValueError("Selected catalogue candidate has no downloadable asset references.")
+        keys = list(assets)
+        priority = ["visual", "B04", "B02", "VV", "VH", "data"]
+        selected_key = next((k for k in priority if k in assets), keys[0])
+        if preferred:
+            selected_key = next((k for k in keys if preferred in str(k).lower()), selected_key)
+        raw = assets[selected_key]
+        href = raw.get("href") if isinstance(raw, dict) else None
+        if not href:
+            raise ValueError(f"Catalogue asset '{selected_key}' has no downloadable href.")
+        sat_asset, _ = SatelliteAsset.objects.update_or_create(scene=scene, asset_key=str(selected_key), defaults={"href": str(href), "asset_type": str((raw or {}).get("type", "")) if isinstance(raw, dict) else "", "metadata": raw if isinstance(raw, dict) else {}})
+        download = download_scene_asset(scene, sat_asset)
+        path = Path(str(download["local_path"]))
+        if not path.is_file():
+            raise RuntimeError("Downloaded satellite asset is not a local file.")
+        with path.open("rb") as fh:
+            image_asset = ImageAsset(session=query.session, original_filename=path.name, content_type="application/octet-stream", file_format="GEOTIFF" if path.suffix.lower() in {".tif", ".tiff"} else "TIFF", sensor="SENTINEL-1" if sensor == "SAR" else "SENTINEL-2", modality="SAR" if sensor == "SAR" else "MULTISPECTRAL", acquisition_date=dt.date(), processing_status="VALIDATED")
+            image_asset.file.save(path.name, File(fh), save=True)
+        query.input_assets.add(image_asset)
+        acquired.append({"scene_id": str(scene.id), "asset_id": str(sat_asset.id), "image_asset_id": str(image_asset.id), "local_path": str(image_asset.file.path) if hasattr(image_asset.file, "path") else str(path), "acquisition_date": dt.isoformat(), "selected_asset_key": str(selected_key), "provenance": {"provider": provider_name, "stac_item_id": str(candidate["stac_item_id"]), "collection": collection, "sha256": download.get("sha256")}})
+    if acquired:
+        query.image = ImageAsset.objects.get(id=acquired[-1]["image_asset_id"])
+        query.save(update_fields=["image"])
+    return {"status": "completed", "count": len(acquired), "images": acquired, "image_paths": [x["local_path"] for x in acquired], "image_asset_ids": [x["image_asset_id"] for x in acquired]}
 
 # ===========================================================================
 # Change detection
@@ -2278,54 +2472,55 @@ def _handle_change_vqa(
     **kwargs: Any,
 ) -> dict[str, Any]:
     if not question or not str(question).strip():
-        raise ValueError(
-            "Change VQA requires a non-empty question."
-        )
-
-    if change_mask is None:
-        raise ValueError(
-            "Change VQA requires an actual change mask from a prior "
-            "change-detection step."
-        )
-
-    _image_inputs(
-        image_bytes,
-        image_paths,
-        minimum=2,
-    )
-
-    from ai.adapters.changeformer_adapter import ChangeFormerAdapter
-
-    adapter = ChangeFormerAdapter()
-
-    before = _select_image_input(
-        image_bytes,
-        image_paths,
-        0,
-    )
-
-    after = _select_image_input(
-        image_bytes,
-        image_paths,
-        1,
-    )
-
-    out = adapter.answer_change(
-        before,
-        after,
-        change_mask=change_mask,
-        question=question,
-        params=kwargs,
-    )
-
+        raise ValueError("Change VQA requires a non-empty question.")
+    _image_inputs(image_bytes, image_paths, minimum=2)
+    from apps.agent.contracts import ModelInput
+    from apps.models_ai.change_vqa.wrapper import ChangeVQAModel
+    result = ChangeVQAModel().predict(ModelInput(
+        model_id="CHANGE_VQA", image_paths=image_paths or [], image_bytes=image_bytes or [],
+        question=str(question), change_mask=change_mask, params=kwargs,
+    ))
     return {
-        "answer": getattr(out, "answer", None),
-        "confidence": _optional_float(
-            getattr(out, "confidence", None)
-        ),
-        "status": getattr(out, "status", "ok"),
-        "raw": getattr(out, "raw", None),
+        "answer": getattr(result, "answer", None),
+        "confidence": _optional_float(getattr(result, "confidence", None)),
+        "raw": getattr(result, "raw", None),
+        "status": getattr(result, "status", "ok"),
     }
+
+
+def _handle_coregister_temporal_optical_sar(
+    image_paths: list[str] | None = None,
+    image_metadata: list[dict[str, Any]] | None = None,
+    max_pair_delta_hours: float = 72.0,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    del kwargs
+    if not image_paths or not image_metadata:
+        raise ValueError("Temporal coregistration requires image paths and metadata.")
+    from django.conf import settings
+    from apps.geospatial.temporal_coregistration import prepare_temporal_optical_sar
+    result = prepare_temporal_optical_sar(
+        image_metadata, image_paths,
+        max_pair_delta_hours=float(max_pair_delta_hours),
+        output_root=str(Path(settings.MEDIA_ROOT) / "derived"),
+    )
+    return result
+
+
+def _handle_temporal_optical_sar(
+    image_bytes: list[bytes] | None = None,
+    image_paths: list[str] | None = None,
+    question: str = "",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    _image_inputs(image_bytes, image_paths, minimum=4)
+    from apps.agent.contracts import ModelInput
+    from apps.models_ai.temporal_optical_sar_wrapper import TemporalOpticalSARModel
+    result = TemporalOpticalSARModel().predict(ModelInput(
+        model_id="TEMPORAL_OPTICAL_SAR", image_paths=image_paths or [], image_bytes=image_bytes or [],
+        question=str(question), params=kwargs, context={"analysis_route": kwargs.get("analysis_route", {})},
+    ))
+    return {"answer": getattr(result,"answer",None), "confidence": _optional_float(getattr(result,"confidence",None)), "raw": getattr(result,"raw",None), "status": getattr(result,"status","ok"), "error": getattr(result,"error",None)}
 
 
 def _handle_optical_sar(

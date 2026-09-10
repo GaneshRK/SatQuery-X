@@ -237,7 +237,23 @@ def _feature_count(
 
     return None
 
+@dataclass
+class EvidenceClaim:
+    """
+    Backward-compatible evidence claim structure.
 
+    Claims are descriptive references to evidence; this class does not
+    generate or calculate scientific measurements.
+    """
+
+    claim: str
+    evidence: Any = None
+    source: str | None = None
+    confidence: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _remove_none(asdict(self))
 # ============================================================================
 # Evidence structures
 # ============================================================================

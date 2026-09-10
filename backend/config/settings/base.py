@@ -10,9 +10,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-satquery-ai-sih26167-secret-key")
 
-DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() in ("true", "1", "yes")
+DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")
 
-ALLOWED_HOSTS = ["*"]
+# Never use a wildcard host list outside an explicitly configured local dev setup.
+_allowed_hosts = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").strip()
+ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts.split(",") if h.strip()]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -78,6 +80,10 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        # SQLite is used for local Windows development. A generous timeout
+        # prevents transient "database is locked" errors when Django and
+        # the Celery worker touch the development DB concurrently.
+        "OPTIONS": {"timeout": 30},
     }
 }
 
@@ -130,12 +136,31 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "120/minute",
         "user": "300/minute",
+        "analysis": os.getenv("THROTTLE_ANALYSIS", "20/minute"),
+        "satellite_search": os.getenv("THROTTLE_SATELLITE_SEARCH", "30/minute"),
+        "satellite_acquisition": os.getenv("THROTTLE_SATELLITE_ACQUISITION", "10/minute"),
+        "imagery_upload": os.getenv("THROTTLE_IMAGERY_UPLOAD", "20/minute"),
     },
 }
 
 # Upload Size Limits (250MB for Satellite GeoTIFFs)
 DATA_UPLOAD_MAX_MEMORY_SIZE = 262144000  # 250MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 262144000  # 250MB
+
+# Django security defaults. Production can tighten/override these through env vars.
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = os.getenv("SECURE_REFERRER_POLICY", "same-origin")
+SECURE_CROSS_ORIGIN_OPENER_POLICY = os.getenv("SECURE_CROSS_ORIGIN_OPENER_POLICY", "same-origin")
+X_FRAME_OPTIONS = "DENY"
+SECURE_SSL_REDIRECT = os.getenv("SECURE_SSL_REDIRECT", "False").lower() in ("true", "1", "yes")
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "False").lower() in ("true", "1", "yes")
+CSRF_COOKIE_SECURE = os.getenv("CSRF_COOKIE_SECURE", "False").lower() in ("true", "1", "yes")
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
+CSRF_COOKIE_SAMESITE = os.getenv("CSRF_COOKIE_SAMESITE", "Lax")
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = os.getenv("SECURE_HSTS_INCLUDE_SUBDOMAINS", "False").lower() in ("true", "1", "yes")
+SECURE_HSTS_PRELOAD = os.getenv("SECURE_HSTS_PRELOAD", "False").lower() in ("true", "1", "yes")
 
 # SimpleJWT
 SIMPLE_JWT = {

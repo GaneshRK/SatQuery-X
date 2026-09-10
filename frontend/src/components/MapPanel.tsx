@@ -5,9 +5,9 @@ import * as maplibregl from "maplibre-gl";
 
 export default function MapPanel({
   height = 430,
-  center = [76.9558, 11.0168], // [lng, lat] for Coimbatore
+  center = [0, 0],
   zoom = 10,
-  label = "Coimbatore, Tamil Nadu",
+  label = "",
 }: {
   height?: number;
   center?: [number, number];

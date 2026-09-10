@@ -36,7 +36,7 @@ class ChangeFormerAdapter(ChangeDetectionAdapter, ChangeVQAAdapter):
         super().__init__()
         self._cd_backend = ChangeDetectionModel()
         self._vqa_backend = ChangeVQAModel()
-        self.model_name = os.getenv("CHANGE_MODEL_NAME", "ChangeFormer-V6")
+        self.model_name = os.getenv("CHANGE_MODEL_NAME", "SiameseChangeNet-v1")
 
     def detect_change(
         self,

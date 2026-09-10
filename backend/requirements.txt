@@ -10,6 +10,8 @@ redis>=5.0.3
 
 # Database & Storage
 psycopg2-binary>=2.9.9
+dj-database-url>=2.2.0
+gunicorn>=22.0.0; sys_platform != 'win32'
 
 # Imaging & Geospatial
 Pillow>=10.3.0
@@ -29,3 +31,11 @@ reportlab>=4.1.0
 # Testing & Quality
 pytest>=8.1.0
 pytest-django>=4.8.0
+
+# Remote-sensing VQA training/inference (optional but required for Stage 2 RS-VQA)
+torch>=2.2.0
+transformers>=4.45.0,<5.0.0
+peft>=0.12.0
+accelerate>=0.34.0
+safetensors>=0.4.3
+

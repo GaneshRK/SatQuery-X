@@ -1,14 +1,23 @@
+# Real RS-VQA training configuration.
+# Data manifests are explicit inputs; no synthetic benchmark scores are stored here.
 base_model: Salesforce/blip-vqa-base
 method: lora
 lora_rank: 16
 lora_alpha: 32
+lora_dropout: 0.05
 target_modules: [q_proj, v_proj]
-dataset: bigearthnet_text
-train_split: train
-eval_datasets: [rsvqa, vrsbench]
-epochs: 5
+domain_adaptation:
+  dataset: BigEarthNet
+  manifest: data/bigearthnet/train.jsonl
+  prompt: "Describe this remote-sensing image."
+vqa_finetuning:
+  dataset: RSVQA
+  train_manifest: data/rsvqa/train.jsonl
+  eval_manifest: data/rsvqa/val.jsonl
+evaluation:
+  test_manifest: data/rsvqa/test.jsonl
+epochs: 3
 learning_rate: 2e-4
-batch_size: 16
+batch_size: 4
+gradient_accumulation: 4
 output_dir: ml/checkpoints/rsvqa_lora_v1
-hardware: cuda
-fp16: true

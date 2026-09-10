@@ -1,27 +1,10 @@
 {
-  "timestamp": "2026-09-05 06:09:28 UTC",
-  "benchmarks": {
-    "VRSBench_VQA_Caption": {
-      "Accuracy (%)": 87.2,
-      "BLEU-4": 0.428,
-      "Avg Latency (ms)": 142.5
-    },
-    "CDVQA_BiTemporal": {
-      "Accuracy (%)": 81.4,
-      "mIoU (%)": 76.9,
-      "F1-Score": 0.835,
-      "Avg Latency (ms)": 142.5
-    },
-    "BigEarthNet_Fusion": {
-      "Accuracy (%)": 81.4,
-      "F1-Score": 0.835,
-      "Avg Latency (ms)": 142.5
-    },
-    "ISRO_Heldout_Rehearsal": {
-      "Accuracy (%)": 84.6,
-      "mIoU (%)": 76.9,
-      "F1-Score": 0.835,
-      "Avg Latency (ms)": 142.5
-    }
-  }
+  "status": "not_evaluated",
+  "message": "Benchmark metrics are intentionally absent until real held-out manifests and trained checkpoints are supplied and evaluated.",
+  "previous_placeholder_results_removed": true,
+  "real_evaluators": [
+    "RS_VQA",
+    "CHANGE_DETECTION",
+    "CHANGE_VQA"
+  ]
 }

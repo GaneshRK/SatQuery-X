@@ -26,6 +26,7 @@ from apps.queries.views import (
     SessionQueryListCreateView,
 )
 from apps.reports.views import ReportDetailView, ReportDownloadView, SessionReportListCreateView
+from apps.queries.provenance_views import QueryProvenanceView
 from apps.satellite.views import CandidateListView, CandidateSelectView, SatelliteSearchView
 from apps.satellite.temporal_views import (
     SatelliteSceneListView,
@@ -71,6 +72,7 @@ api_v1_patterns = [
     path("sessions/<uuid:session_id>/queries/", SessionQueryListCreateView.as_view(), name="session_queries"),
     path("sessions/<uuid:session_id>/queries/<uuid:query_id>/", QueryDetailView.as_view(), name="query_detail"),
     path("sessions/<uuid:session_id>/queries/<uuid:query_id>/stream/", QueryStreamView.as_view(), name="query_stream"),
+    path("sessions/<uuid:session_id>/queries/<uuid:query_id>/provenance/", QueryProvenanceView.as_view(), name="query_provenance"),
     path("sessions/<uuid:session_id>/queries/<uuid:query_id>/export/<str:export_format>/", QueryExportView.as_view(), name="query_export"),
 
     # Reports

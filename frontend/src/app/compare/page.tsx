@@ -39,9 +39,9 @@ export default function ComparePage() {
   const [beforeFile, setBeforeFile] = useState<File | null>(null);
   const [afterFile, setAfterFile] = useState<File | null>(null);
 
-  const [location, setLocation] = useState("Coimbatore, Tamil Nadu");
-  const [date1, setDate1] = useState("2024-03-01");
-  const [date2, setDate2] = useState("2026-09-01");
+  const [location, setLocation] = useState("");
+  const [date1, setDate1] = useState("");
+  const [date2, setDate2] = useState("");
   const [sensor, setSensor] = useState("SENTINEL-2");
 
   const [busy, setBusy] = useState(false);
@@ -398,7 +398,7 @@ export default function ComparePage() {
                 <div className="text-base font-bold font-mono text-cyan-300">
                   {result.metrics?.total_changed_pixels
                     ? result.metrics.total_changed_pixels.toLocaleString()
-                    : "184,000 px"}
+                    : "—"}
                 </div>
               </div>
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
@@ -406,7 +406,7 @@ export default function ComparePage() {
                 <div className="text-base font-bold font-mono text-emerald-300">
                   {result.metrics?.total_change_sq_km
                     ? `${result.metrics.total_change_sq_km} km²`
-                    : "18.40 km²"}
+                    : "—"}
                 </div>
               </div>
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">

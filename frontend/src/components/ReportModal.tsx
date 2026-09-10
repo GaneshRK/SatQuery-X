@@ -73,7 +73,7 @@ export const ReportModal: React.FC<ReportModalProps> = ({
           <div className="flex items-center justify-between bg-slate-950 p-4 rounded-lg border border-slate-800 font-mono text-xs text-slate-300">
             <div>
               <p>Query ID: <strong className="text-white">{trace.query_id}</strong></p>
-              <p className="text-slate-400 mt-0.5">Mode: <strong className="text-blue-400">{trace.detected_mode}</strong> &bull; Confidence: <strong className="text-emerald-400">{(trace.confidence * 100).toFixed(1)}%</strong></p>
+              <p className="text-slate-400 mt-0.5">Mode: <strong className="text-blue-400">{trace.detected_mode}</strong> &bull; Confidence: <strong className="text-emerald-400">{trace.confidence == null ? "—" : `${(trace.confidence * 100).toFixed(1)}%`}</strong></p>
             </div>
             <div className="flex items-center gap-2">
               <button

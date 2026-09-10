@@ -806,6 +806,46 @@ def ingest_satellite_candidate_task(
 
 
 # =============================================================================
+# REAL SATELLITE ASSET DOWNLOAD
+# =============================================================================
+
+
+@shared_task(bind=True, autoretry_for=(ConnectionError, TimeoutError), retry_backoff=True, retry_kwargs={"max_retries": 3})
+def download_satellite_asset_task(self, asset_id: str) -> dict[str, Any]:
+    """Download one real provider asset and validate its local raster metadata."""
+    if not asset_id:
+        return _task_error("asset_id is required.", task_id=self.request.id)
+
+    try:
+        from apps.satellite.models import SatelliteAsset
+        asset = SatelliteAsset.objects.select_related("scene").get(id=asset_id)
+    except SatelliteAsset.DoesNotExist:
+        return _task_error("The satellite asset was not found.", task_id=self.request.id)
+
+    if asset.is_downloaded and asset.local_path:
+        return {
+            "status": "already_downloaded",
+            "task_id": self.request.id,
+            "asset_id": str(asset.id),
+            "local_path": asset.local_path,
+            "sha256": asset.checksum or None,
+        }
+
+    try:
+        from apps.satellite.services.asset_ingestion import download_scene_asset
+        result = download_scene_asset(asset.scene, asset)
+        result["task_id"] = self.request.id
+        return result
+    except Exception as exc:
+        logger.exception("Real satellite asset download failed for %s", asset_id)
+        return _task_error(
+            "Real satellite asset download/validation failed.",
+            task_id=self.request.id,
+            extra={"asset_id": str(asset.id), "error_type": type(exc).__name__},
+        )
+
+
+# =============================================================================
 # DERIVED-RASTER PLACEHOLDER / ROUTING TASK
 # =============================================================================
 
@@ -869,7 +909,7 @@ def generate_derived_raster_task(
     # -------------------------------------------------------------------------
 
     try:
-        from apps.models_ai.manage import (
+        from apps.models_ai.manager import (
             model_manager,
         )
 

@@ -40,7 +40,7 @@ export const QueryCommandBar: React.FC<QueryCommandBarProps> = ({
   isLoading = false,
   initialQuery = "",
   activeContext = {
-    location: "Coimbatore, Tamil Nadu",
+    location: "",
     sensor: "SENTINEL-2",
   },
   onContextChange,
@@ -226,7 +226,7 @@ export const QueryCommandBar: React.FC<QueryCommandBarProps> = ({
             </label>
             <input
               type="date"
-              value={activeContext?.startDate || "2024-03-01"}
+              value={activeContext?.startDate || ""}
               onChange={(e) =>
                 onContextChange?.({ ...activeContext, startDate: e.target.value })
               }
@@ -239,7 +239,7 @@ export const QueryCommandBar: React.FC<QueryCommandBarProps> = ({
             </label>
             <input
               type="date"
-              value={activeContext?.endDate || "2026-09-01"}
+              value={activeContext?.endDate || ""}
               onChange={(e) =>
                 onContextChange?.({ ...activeContext, endDate: e.target.value })
               }

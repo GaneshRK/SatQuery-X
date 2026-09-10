@@ -27,6 +27,7 @@ export default function LandingPage() {
 
       {/* Hero Section */}
       <section className="relative overflow-hidden pt-12 pb-24 px-6 sm:px-12 max-w-7xl mx-auto w-full">
+        <div className="earth-orbit-visual" aria-hidden="true" />
         {/* Subtle Background Glow */}
         <div className="absolute top-10 left-1/2 -translate-x-1/2 w-[700px] h-[350px] bg-emerald-500/10 rounded-full blur-3xl pointer-events-none -z-10" />
 
@@ -34,22 +35,21 @@ export default function LandingPage() {
           {/* Status Badge */}
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-slate-900/90 border border-slate-700/60 shadow-lg text-xs font-mono text-emerald-400">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span>Copernicus Sentinel-1/2 Real-Time Pipeline Active</span>
+            <span>Copernicus Sentinel-1/2 analysis pipeline</span>
             <span className="text-slate-500 font-sans">|</span>
             <span className="text-slate-300">SIH 26167</span>
           </div>
 
           <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight leading-[1.1] text-white">
-            Autonomous Earth Observation <br />
-            <span className="text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-emerald-400 to-teal-300">
-              Intelligence Engine
+            From satellite pixels to <br />
+            <span className="text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-emerald-300 to-teal-200">
+              defensible Earth intelligence
             </span>
           </h1>
 
           <p className="text-base sm:text-lg text-slate-400 max-w-2xl leading-relaxed">
-            Conversational vision-language satellite reasoning. Interrogate petabyte-scale planetary
-            rasters through natural language, detect bi-temporal physical change, and generate auditable
-            geospatial evidence with zero hallucination.
+            Ask a natural-language question, inspect the processing chain, compare observations, and see why the
+            final outcome is trustworthy. SatQuery turns satellite observations into measurable, auditable evidence.
           </p>
 
           <div className="flex flex-wrap items-center justify-center gap-4 pt-4">
@@ -77,6 +77,25 @@ export default function LandingPage() {
               <GitCompare className="w-4 h-4 text-emerald-400" />
               <span>Siamese Comparison</span>
             </Link>
+          </div>
+        </div>
+
+        {/* Judge-facing validation strip */}
+        <div className="mt-16 grid grid-cols-1 md:grid-cols-3 gap-4 relative">
+          <div className="p-5 rounded-2xl bg-white/[.035] border border-cyan-200/10 backdrop-blur-xl">
+            <div className="eyebrow">01 · Process</div>
+            <div className="text-sm font-semibold text-white mt-2">Every stage is visible</div>
+            <p className="text-xs text-slate-400 mt-2 leading-relaxed">Query interpretation → satellite retrieval → temporal alignment → model inference → evidence generation.</p>
+          </div>
+          <div className="p-5 rounded-2xl bg-white/[.035] border border-cyan-200/10 backdrop-blur-xl">
+            <div className="eyebrow">02 · Outcome</div>
+            <div className="text-sm font-semibold text-white mt-2">Quantified, not just narrated</div>
+            <p className="text-xs text-slate-400 mt-2 leading-relaxed">Changed pixels, area, hotspots, coordinates and source observations stay attached to the answer.</p>
+          </div>
+          <div className="p-5 rounded-2xl bg-white/[.035] border border-cyan-200/10 backdrop-blur-xl">
+            <div className="eyebrow">03 · Correctness</div>
+            <div className="text-sm font-semibold text-white mt-2">Confidence ≠ accuracy</div>
+            <p className="text-xs text-slate-400 mt-2 leading-relaxed">The UI reports evidence quality separately and reserves accuracy claims for ground-truth evaluation.</p>
           </div>
         </div>
 

@@ -732,3 +732,32 @@ class ExecutionStep(models.Model):
                 "error",
             ]
         )
+
+class ProvenanceRecord(models.Model):
+    """Hash-chained audit event for reproducible SatQuery-X execution provenance."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    query = models.ForeignKey(Query, on_delete=models.CASCADE, related_name="provenance_records")
+    execution_step = models.ForeignKey(
+        "queries.ExecutionStep", on_delete=models.SET_NULL, null=True, blank=True, related_name="provenance_records"
+    )
+    sequence = models.PositiveIntegerField()
+    event_type = models.CharField(max_length=64)
+    payload = models.JSONField(default=dict)
+    previous_hash = models.CharField(max_length=64, blank=True, default="")
+    record_hash = models.CharField(max_length=64, unique=True)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [
+            models.UniqueConstraint(fields=["query", "sequence"], name="unique_query_provenance_sequence"),
+        ]
+        indexes = [
+            models.Index(fields=["query", "sequence"], name="prov_query_sequence_idx"),
+            models.Index(fields=["query", "event_type"], name="prov_query_event_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.query_id}:{self.sequence}:{self.event_type}"
+

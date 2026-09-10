@@ -47,6 +47,7 @@ import numpy as np
 from PIL import Image
 
 from apps.agent.contracts import ModelInput, ModelOutput
+from apps.models_ai.manager import model_manager
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class ChangeVQAModel:
     """
 
     model_id = "CHANGE_VQA"
-    version = "3.0-grounded"
+    version = "4.0-supervised-ready"
     task = "change_based_vqa"
 
     def predict(
@@ -131,6 +132,19 @@ class ChangeVQAModel:
         question = self._get_question(
             inputs
         )
+
+        # Prefer the native two-image fusion model when configured. It encodes
+        # T1 and T2 independently and fuses them with the question; it does not
+        # concatenate the timestamps into one visual canvas.
+        native_output = self._try_native_temporal_model(inputs, question, start_time)
+        if native_output is not None:
+            return native_output
+
+        # Legacy supervised BLIP path remains available as a compatibility
+        # option. It uses the documented temporal canvas representation.
+        neural_output = self._try_configured_model(inputs, question, start_time)
+        if neural_output is not None:
+            return neural_output
 
         evidence = self._extract_evidence(
             inputs
@@ -269,6 +283,86 @@ class ChangeVQAModel:
             status="ok",
             raw=raw,
         )
+
+
+    def _try_native_temporal_model(self, inputs: ModelInput, question: str, start_time: float) -> ModelOutput | None:
+        checkpoint = os.getenv("CHANGE_VQA_NATIVE_CHECKPOINT", "").strip()
+        if not checkpoint:
+            return None
+        images = getattr(inputs, "image_paths", []) or []
+        image_bytes = getattr(inputs, "image_bytes", []) or []
+        if len(images) < 2 and len(image_bytes) < 2:
+            return None
+        try:
+            import torch
+            from ml.native_multimodal.model import NativeTemporalMultimodalVQA, question_ids
+            device = model_manager.device
+            ck = torch.load(checkpoint, map_location=device, weights_only=False)
+            answers = ck.get("id_to_answer") or {int(k): v for k, v in ck["id_to_answer"].items()}
+            model = NativeTemporalMultimodalVQA(len(answers), question_buckets=int(ck.get("question_buckets", 4096))).to(device)
+            model.load_state_dict(ck["state_dict"]); model.eval()
+
+            from PIL import Image
+            import io, numpy as np
+            def load(v):
+                im = Image.open(io.BytesIO(v)) if isinstance(v, (bytes, bytearray)) else Image.open(Path(v))
+                im = im.convert("RGB").resize((256,256), Image.Resampling.BILINEAR)
+                x = torch.from_numpy(np.asarray(im)).permute(2,0,1).float()/255.0
+                return (x-torch.tensor([.5,.5,.5]).view(3,1,1))/torch.tensor([.5,.5,.5]).view(3,1,1)
+            t1 = image_bytes[0] if len(image_bytes) >= 2 else images[0]
+            t2 = image_bytes[1] if len(image_bytes) >= 2 else images[1]
+            q = torch.tensor([question_ids(question)], dtype=torch.long, device=device)
+            with torch.inference_mode():
+                logits = model(load(t1).unsqueeze(0).to(device), load(t2).unsqueeze(0).to(device), q)
+                probs = torch.softmax(logits, dim=-1)
+                score, pred = probs.max(dim=-1)
+            answer = answers[int(pred.item())]
+            model_manager.mark_prediction(checkpoint, success=True)
+            return ModelOutput(model_id=self.model_id, version="5.0-native-temporal", task=self.task, answer=answer,
+                confidence=float(score.item()), status="ok", latency_ms=int((time.perf_counter()-start_time)*1000),
+                raw={"adaptation":"native_temporal_multimodal_classifier","base_model":"NativeTemporalMultimodalVQA","checkpoint":checkpoint,
+                     "confidence_type":"uncalibrated_softmax","question":question,"closed_vocabulary":True})
+        except Exception as exc:
+            logger.exception("Configured native temporal Change VQA checkpoint failed")
+            try: model_manager.mark_prediction(checkpoint, success=False, error=str(exc))
+            except Exception: pass
+            return None
+
+    def _try_configured_model(self, inputs: ModelInput, question: str, start_time: float) -> ModelOutput | None:
+        checkpoint = os.getenv("CHANGE_VQA_CHECKPOINT", "").strip()
+        if not checkpoint:
+            return None
+        images = getattr(inputs, "image_paths", []) or []
+        image_bytes = getattr(inputs, "image_bytes", []) or []
+        if len(images) < 2 and len(image_bytes) < 2:
+            return None
+        model_id = checkpoint
+        try:
+            def factory():
+                from apps.models_ai.change_vqa.hf_model import HuggingFaceChangeVQA
+                return HuggingFaceChangeVQA(model_id, device=model_manager.device)
+            model = model_manager.load_model(model_id, factory_fn=factory)
+            if model is None:
+                return None
+            t1 = image_bytes[0] if len(image_bytes) >= 2 else images[0]
+            t2 = image_bytes[1] if len(image_bytes) >= 2 else images[1]
+            result = model.answer(t1, t2, question)
+            answer = str(result.get("answer", "")).strip()
+            if not answer:
+                model_manager.mark_prediction(model_id, success=False, error="Change VQA model returned no answer")
+                return None
+            model_manager.mark_prediction(model_id, success=True)
+            return ModelOutput(model_id=self.model_id, version="4.0-supervised", task=self.task, answer=answer,
+                confidence=result.get("confidence"), status="ok", latency_ms=int((time.perf_counter()-start_time)*1000),
+                raw={"adaptation":"supervised_bitemporal_vqa","base_model":"BLIP VQA + LoRA","checkpoint":checkpoint,
+                     "provenance":result.get("provenance", {}), "question":question})
+        except Exception as exc:
+            logger.exception("Configured Change VQA checkpoint failed")
+            try:
+                model_manager.mark_prediction(model_id, success=False, error=str(exc))
+            except Exception:
+                pass
+            return None
 
     # ------------------------------------------------------------------
     # Input handling

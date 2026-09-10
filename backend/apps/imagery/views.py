@@ -23,6 +23,7 @@ from apps.imagery.tasks import (
 )
 from apps.sessions.models import Session
 from apps.sessions.permissions import get_session_for_user_or_403
+from apps.system.throttles import ImageryUploadRateThrottle
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +249,7 @@ class SessionImageListCreateView(
     permission_classes = [
         permissions.IsAuthenticated
     ]
+    throttle_classes = [ImageryUploadRateThrottle]
 
     def get(
         self,

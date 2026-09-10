@@ -18,7 +18,7 @@ Design rules:
 """
 
 from __future__ import annotations
-
+from django.contrib.auth import get_user_model
 import base64
 import binascii
 import json
@@ -31,6 +31,7 @@ from django.db import transaction
 from django.core.files.base import ContentFile
 from rest_framework import permissions, status, views
 from rest_framework.response import Response
+from apps.system.throttles import AnalysisRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import Project
@@ -38,6 +39,7 @@ from apps.imagery.models import ImageAsset, ImagePair
 from apps.imagery.tasks import ingest_image_task
 from apps.queries.models import Query
 from apps.queries.tasks import run_query_task
+from celery import chord
 from apps.sessions.models import Session
 
 User = get_user_model()
@@ -46,7 +48,28 @@ User = get_user_model()
 # ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
+def get_or_create_default_user():
+    """
+    Return a stable test/development user for internal contract tests.
 
+    This helper is intended for test/development workflows and does not
+    affect authenticated production requests.
+    """
+    User = get_user_model()
+
+    user, _ = User.objects.get_or_create(
+        username="satquery_test_user",
+        defaults={
+            "role": "demo",
+            "email": "satquery_test_user@example.com",
+        },
+    )
+
+    if not user.has_usable_password():
+        user.set_password("password123")
+        user.save(update_fields=["password"])
+
+    return user
 
 def _user_payload(user: User) -> dict[str, Any]:
     """Return the public frontend representation of a user."""
@@ -199,6 +222,16 @@ def _request_date(value: Any):
         return None
 
 
+def _asset_file_url(asset: ImageAsset) -> str | None:
+    try:
+        file_obj = getattr(asset, "file", None)
+        if file_obj and getattr(file_obj, "url", None):
+            return str(file_obj.url)
+    except Exception:
+        pass
+    return None
+
+
 def _asset_summary(asset: ImageAsset) -> dict[str, Any]:
     """
     Return actual stored imagery metadata.
@@ -242,6 +275,11 @@ def _asset_summary(asset: ImageAsset) -> dict[str, Any]:
             "bounds_wgs84",
             None,
         ),
+        # Real browser-openable media URLs. These are derived from Django
+        # storage; no temporary blob URL is persisted as the scientific
+        # result.
+        "file_url": _asset_file_url(asset),
+        "preview_url": getattr(asset, "preview_url", None),
     }
 
 
@@ -276,6 +314,13 @@ def _query_response(
     Return a compatibility response without manufacturing analysis output.
     """
 
+    assets = []
+    try:
+        assets = list(query.input_assets.all())
+    except Exception:
+        if query.image is not None:
+            assets = [query.image]
+
     payload: dict[str, Any] = {
         "analysis_id": str(query.id),
         "query_id": str(query.id),
@@ -283,6 +328,14 @@ def _query_response(
         "query": query.text,
         "answer": query.answer,
         "confidence": query.confidence,
+        "error": getattr(query, "error", None),
+        "detected_mode": query.detected_mode,
+        "detected_task": query.detected_task,
+        "completed_at": (query.completed_at.isoformat() if getattr(query, "completed_at", None) else None),
+        "images": [
+            _asset_summary(asset)
+            for asset in assets
+        ],
         "clarification_required": getattr(
             query,
             "clarification_required",
@@ -588,6 +641,7 @@ class ContractAnalysisQueryView(views.APIView):
     """
 
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [AnalysisRateThrottle]
 
     def _get_or_create_session(
         self,
@@ -985,19 +1039,22 @@ class ContractAnalysisQueryView(views.APIView):
                 update_fields=["image_pair"]
             )
 
-        # Queue ingestion before query execution when imagery was uploaded.
-        for asset in assets:
-            try:
-                self._ingest_asset(asset)
-            except Exception:
-                # The query remains persisted. The frontend receives the
-                # failure instead of a fabricated analysis.
-                pass
-
+        # Queue ingestion first. The analysis MUST start only after every
+        # uploaded asset has completed ingestion; otherwise the query worker
+        # can race the ingestion worker and see an unvalidated image.
         try:
-            task_result = run_query_task.delay(
-                str(query_obj.id)
-            )
+            if assets:
+                ingestion_jobs = [
+                    ingest_image_task.s(str(asset.id))
+                    for asset in assets
+                ]
+                task_result = chord(ingestion_jobs)(
+                    run_query_task.s(str(query_obj.id))
+                )
+            else:
+                task_result = run_query_task.delay(
+                    str(query_obj.id)
+                )
 
             query_obj.refresh_from_db()
 

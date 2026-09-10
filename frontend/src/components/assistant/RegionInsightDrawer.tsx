@@ -10,6 +10,7 @@ import {
   Layers,
   Info,
   Compass,
+  ShieldCheck,
 } from "lucide-react";
 import { Drawer } from "../ui/Drawer";
 import { Badge } from "../ui/Badge";
@@ -34,6 +35,7 @@ export interface RegionInsightDrawerProps {
   region: RegionInsightData | null;
   onAskAIAboutRegion: (region: RegionInsightData) => void;
   onZoomToRegion?: (region: RegionInsightData) => void;
+  onDeepInspect?: (region: RegionInsightData) => void;
 }
 
 export const RegionInsightDrawer: React.FC<RegionInsightDrawerProps> = ({
@@ -42,6 +44,7 @@ export const RegionInsightDrawer: React.FC<RegionInsightDrawerProps> = ({
   region,
   onAskAIAboutRegion,
   onZoomToRegion,
+  onDeepInspect,
 }) => {
   if (!region) return null;
 
@@ -168,6 +171,18 @@ export const RegionInsightDrawer: React.FC<RegionInsightDrawerProps> = ({
 
         {/* Actions */}
         <div className="pt-2 space-y-2">
+          {onDeepInspect && (
+            <Button
+              variant="outline"
+              size="md"
+              className="w-full justify-center text-xs border-cyan-700/60 text-cyan-300 hover:bg-cyan-950/40"
+              leftIcon={<ShieldCheck className="w-4 h-4 text-cyan-400" />}
+              onClick={() => onDeepInspect(region)}
+            >
+              Inspect Ground Truth & Sensors
+            </Button>
+          )}
+
           <Button
             variant="primary"
             size="md"

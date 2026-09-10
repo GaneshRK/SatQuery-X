@@ -719,6 +719,134 @@ class Agent:
     # ------------------------------------------------------------------
 
     @classmethod
+    def _georeferenced_location_response(
+        cls,
+        query: Query,
+        assets: list[Any],
+    ) -> dict[str, Any] | None:
+        """Answer image-location questions from actual raster georeferencing.
+
+        This never turns a user-supplied place string into image evidence.
+        If the uploaded raster has no trustworthy CRS/bounds, the method
+        returns a completed limitation response instead of guessing.
+        """
+        from django.utils import timezone
+
+        asset = assets[0]
+        bounds = getattr(asset, "bounds_wgs84", None)
+        if not isinstance(bounds, dict):
+            query.answer = (
+                "I cannot determine the exact geographic location from this image because "
+                "the uploaded file does not contain usable georeferencing metadata. "
+                "Please provide a georeferenced GeoTIFF or select an AOI/map pin."
+            )
+            query.confidence = None
+            query.status = "COMPLETED"
+            query.completed_at = timezone.now()
+            query.error = None
+            query.structured_plan = {
+                "type": "LOCATION_ANALYSIS",
+                "method": "georeference_metadata",
+                "status": "INSUFFICIENT_GEOREFERENCING",
+            }
+            query.evidence_graph = {
+                "location": {
+                    "available": False,
+                    "source": "uploaded_raster_metadata",
+                    "reason": "No WGS84 bounds available",
+                }
+            }
+            query.answer_trace = [
+                {"step": 1, "tool": "image_ingestion", "status": "DONE"},
+                {"step": 2, "tool": "georeference_check", "status": "DONE"},
+                {"step": 3, "tool": "location_resolution", "status": "INSUFFICIENT_EVIDENCE"},
+            ]
+            query.save(update_fields=[
+                "answer", "confidence", "status", "completed_at",
+                "error", "structured_plan", "evidence_graph", "answer_trace",
+            ])
+            return {"status": "COMPLETED", "answer": query.answer, "confidence": None}
+
+        try:
+            west = float(bounds["west"]); south = float(bounds["south"])
+            east = float(bounds["east"]); north = float(bounds["north"])
+            center_lng = (west + east) / 2.0
+            center_lat = (south + north) / 2.0
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        place_name = None
+        address = {}
+        try:
+            import json as _json
+            import urllib.parse as _urlparse
+            import urllib.request as _urlrequest
+            params = _urlparse.urlencode({
+                "lat": center_lat,
+                "lon": center_lng,
+                "format": "jsonv2",
+                "zoom": 14,
+                "addressdetails": 1,
+            })
+            req = _urlrequest.Request(
+                f"https://nominatim.openstreetmap.org/reverse?{params}",
+                headers={"User-Agent": "SatQuery-X/1.0 (earth-observation-analysis)"},
+            )
+            with _urlrequest.urlopen(req, timeout=4) as response:
+                geocode = _json.loads(response.read().decode("utf-8"))
+            place_name = geocode.get("display_name")
+            address = geocode.get("address") or {}
+        except Exception:
+            # Coordinates remain valid evidence even when reverse geocoding
+            # is unavailable. Never invent a place name.
+            place_name = None
+
+        location = {
+            "name": place_name,
+            "coordinates": [center_lng, center_lat],
+            "bbox": [west, south, east, north],
+            "source": "uploaded_raster_georeferencing",
+            "crs": getattr(asset, "crs", None),
+            "administrative": {
+                "area": address.get("city") or address.get("town") or address.get("village") or address.get("municipality"),
+                "district": address.get("state_district") or address.get("county"),
+                "state": address.get("state"),
+                "country": address.get("country"),
+                "country_code": address.get("country_code"),
+            },
+        }
+
+        name_sentence = f" Reverse geocoding identifies the scene near {place_name}." if place_name else ""
+        query.answer = (
+            f"The uploaded georeferenced image covers approximately "
+            f"{south:.6f}° to {north:.6f}° latitude and "
+            f"{west:.6f}° to {east:.6f}° longitude. "
+            f"Scene center: {center_lat:.6f}°N, {center_lng:.6f}°E."
+            f"{name_sentence}"
+        )
+        query.confidence = None
+        query.status = "COMPLETED"
+        query.completed_at = timezone.now()
+        query.error = None
+        query.structured_plan = {
+            "type": "LOCATION_ANALYSIS",
+            "method": "actual_raster_georeferencing",
+            "location": location,
+        }
+        query.evidence_graph = {"location": location}
+        query.evidence_bundle = {"location": location, "images": [str(asset.id)]}
+        query.answer_trace = [
+            {"step": 1, "tool": "image_ingestion", "status": "DONE"},
+            {"step": 2, "tool": "georeference_metadata", "status": "DONE"},
+            {"step": 3, "tool": "location_resolution", "status": "DONE"},
+        ]
+        query.save(update_fields=[
+            "answer", "confidence", "status", "completed_at", "error",
+            "structured_plan", "evidence_graph", "evidence_bundle", "answer_trace",
+        ])
+        return {"status": "COMPLETED", "answer": query.answer, "confidence": None, "location": location}
+
+    @classmethod
     def _validate_request(
         cls,
         intent: Any,
@@ -1286,6 +1414,21 @@ class Agent:
             intent,
             assets,
         )
+
+        # --------------------------------------------------------------
+        # Deterministic image-location analysis
+        # --------------------------------------------------------------
+        # For "what area/place is this?" the strongest available evidence
+        # is real georeferencing in the uploaded raster. This path runs
+        # before general planning so the request cannot be misrouted into
+        # satellite catalogue search without an AOI.
+        if intent_name == "LOCATION_ANALYSIS" and assets:
+            location_result = cls._georeferenced_location_response(
+                query,
+                assets,
+            )
+            if location_result is not None:
+                return location_result
 
         # --------------------------------------------------------------
         # 3. VALIDATE

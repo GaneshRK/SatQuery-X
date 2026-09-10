@@ -284,7 +284,7 @@ export default function DashboardPage() {
                           </Badge>
                         </div>
                         <div className="flex items-center justify-between text-[10px] text-slate-500">
-                          <span>{item.location || "Coimbatore, Tamil Nadu"}</span>
+                          <span>{item.location || "Location unavailable"}</span>
                           <span>{new Date(item.created_at || Date.now()).toLocaleDateString()}</span>
                         </div>
                       </div>

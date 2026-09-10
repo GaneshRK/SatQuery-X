@@ -70,7 +70,7 @@ export default function AnalysisPage() {
   const handleDownloadReport = () => {
     if (!selectedAnalysis) return;
     const query = selectedAnalysis.query_text || selectedAnalysis.query || "Satellite Analysis";
-    const loc = selectedAnalysis.location || "Coimbatore, Tamil Nadu";
+    const loc = selectedAnalysis.location || "Location unavailable";
     const date = selectedAnalysis.created_at || new Date().toISOString();
     const metrics = selectedAnalysis.metrics || {};
 
@@ -84,10 +84,10 @@ Model: ${selectedAnalysis.model_used || "ChangeFormerV6 (Siamese)"}
 Coordinate Reference: EPSG:4326 (WGS84 Geodetic) / EPSG:6933 Equal Area
 
 QUANTIFIED EXTENTS:
-- Changed Pixels: ${metrics.total_changed_pixels ? metrics.total_changed_pixels.toLocaleString() : "184,000"} px
+- Changed Pixels: ${metrics.total_changed_pixels != null ? metrics.total_changed_pixels.toLocaleString() : "—"} px
 - Ground Sample Distance: ${metrics.pixel_resolution_m || 10} m/pixel
 - Pixel Footprint: 100 m²
-- Derived Surface Extent: ${metrics.total_change_sq_km || 18.40} km²
+- Derived Surface Extent: ${metrics.total_change_sq_km ?? null} km²
 
 SYNTHESIZED SCIENTIFIC REASONING:
 ${selectedAnalysis.answer || "No synthesis text available."}
@@ -102,7 +102,7 @@ ${selectedAnalysis.answer || "No synthesis text available."}
 
   const metrics = selectedAnalysis?.metrics || {};
   const changedPixels = metrics.total_changed_pixels ?? 184000;
-  const changedSqKm = metrics.total_change_sq_km ?? 18.40;
+  const changedSqKm = metrics.total_change_sq_km ?? null;
 
   return (
     <AppShell>
@@ -276,7 +276,7 @@ ${selectedAnalysis.answer || "No synthesis text available."}
                       Audit Record
                     </div>
                     <div className="text-xs font-medium text-slate-200">
-                      {selectedAnalysis.location || "Coimbatore, Tamil Nadu"}
+                      {selectedAnalysis.location || "Location unavailable"}
                     </div>
                   </div>
                   <Badge variant="outline">

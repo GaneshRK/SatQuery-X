@@ -2072,3 +2072,61 @@ def _remove_none(
         ]
 
     return value
+
+class FollowUpGenerator:
+    """
+    Backward-compatible follow-up question generator.
+
+    Generates concise, domain-specific follow-up questions without
+    fabricating measurements or observations.
+    """
+
+    def generate(
+        self,
+        intent: str,
+        aoi_name: str,
+        has_changes: bool = False,
+    ) -> list[str]:
+        intent_normalized = (intent or "").strip().lower()
+        aoi = (aoi_name or "the selected area").strip()
+
+        if intent_normalized in {
+            "urban_expansion",
+            "urban_growth",
+            "built_up_change",
+            "change_detection",
+        }:
+            if has_changes:
+                return [
+                    f"What areas of {aoi} show the largest detected changes?",
+                    f"When did the observed changes in {aoi} occur?",
+                    f"How much built-up area changed in {aoi}?",
+                    f"Would you like to inspect the change locations on the map?",
+                ]
+
+            return [
+                f"Would you like to check earlier imagery for {aoi}?",
+                f"Would you like to compare built-up area across dates in {aoi}?",
+                f"Would you like to inspect vegetation and water changes in {aoi}?",
+                f"Would you like to view the analyzed area on the map?",
+            ]
+
+        if intent_normalized in {
+            "vegetation_monitoring",
+            "vegetation_health",
+            "vegetation",
+            "crop_monitoring",
+        }:
+            return [
+                f"What is the NDVI pattern across {aoi}?",
+                f"Would you like to inspect canopy health in {aoi}?",
+                f"How has crop or vegetation coverage changed in {aoi}?",
+                f"Would you like to compare vegetation across different dates?",
+            ]
+
+        return [
+            f"Would you like to inspect the detected changes in {aoi}?",
+            f"Would you like to compare {aoi} across different dates?",
+            f"Would you like to view the relevant satellite layers for {aoi}?",
+            f"Would you like a more detailed analysis of {aoi}?",
+        ]

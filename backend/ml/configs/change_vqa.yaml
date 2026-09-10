@@ -1,0 +1,11 @@
+base_model: Salesforce/blip-vqa-base
+method: supervised_bitemporal_change_vqa
+adapter: LoRA
+target_modules: [q_proj, v_proj]
+train_manifest: data/change_vqa/train.jsonl
+eval_manifest: data/change_vqa/val.jsonl
+test_manifest: data/change_vqa/test.jsonl
+output_dir: ml/checkpoints/change_vqa_lora_v1
+epochs: 3
+learning_rate: 0.0002
+batch_size: 2

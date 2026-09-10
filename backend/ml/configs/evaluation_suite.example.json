@@ -1,0 +1,29 @@
+{
+  "evaluations": [
+    {
+      "model_id": "RS_VQA",
+      "checkpoint_path": "ml/checkpoints/rsvqa_lora_v1",
+      "dataset_name": "RSVQA",
+      "split": "test",
+      "manifest": "data/rsvqa/test.jsonl",
+      "output": "ml/evaluation/results/rsvqa_test.json"
+    },
+    {
+      "model_id": "CHANGE_DETECTION",
+      "checkpoint_path": "ml/checkpoints/satquery_siamese_cd_v1.pt",
+      "dataset_name": "change-detection",
+      "split": "test",
+      "manifest": "data/change_detection/test.jsonl",
+      "output": "ml/evaluation/results/change_detection_test.json",
+      "threshold": 0.5
+    },
+    {
+      "model_id": "CHANGE_VQA",
+      "checkpoint_path": "ml/checkpoints/change_vqa_lora_v1",
+      "dataset_name": "CDVQA",
+      "split": "test",
+      "manifest": "data/change_vqa/test.jsonl",
+      "output": "ml/evaluation/results/change_vqa_test.json"
+    }
+  ]
+}

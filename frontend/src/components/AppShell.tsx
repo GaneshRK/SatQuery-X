@@ -266,7 +266,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               title="Active Area of Interest (Click to change)"
             >
               <MapPin size={12} className="text-cyan-400" />
-              <span>AOI: Coimbatore [11.01°N, 76.96°E]</span>
+              <span>AOI: Select from map or analysis</span>
             </Link>
           </div>
 

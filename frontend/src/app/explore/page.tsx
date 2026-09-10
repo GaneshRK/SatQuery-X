@@ -32,7 +32,7 @@ interface LocationPreset {
 
 const LOCATION_PRESETS: LocationPreset[] = [
   {
-    name: "Coimbatore, Tamil Nadu",
+    name: "Earth observation scene",
     coords: [76.96, 11.01],
     bounds: [76.85, 10.95, 77.10, 11.15],
     description: "Western Ghats piedmont; rapid industrial & peri-urban sprawl",

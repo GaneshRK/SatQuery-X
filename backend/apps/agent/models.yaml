@@ -65,10 +65,10 @@ CHANGE_DETECTION:
 
   framework: algorithmic_or_configured_model
 
-  version: "3.0-grounded"
-  adaptation: grounded_change_analysis
+  version: "4.0-supervised-ready"
+  adaptation: supervised_bitemporal_change_detection
 
-  base_model: diff-connected-components
+  base_model: SiameseChangeNet-or-configured-ChangeFormer
 
   wrapper: apps.models_ai.change_detection.wrapper.ChangeDetectionModel
 
@@ -78,12 +78,12 @@ CHANGE_VQA:
   input_modes:
     - bi_temporal
 
-  framework: evidence_reasoning
+  framework: supervised_model_with_grounded_fallback
 
-  version: "3.0-grounded"
-  adaptation: grounded_evidence_reasoning
+  version: "5.0-native-temporal-ready"
+  adaptation: native_two_image_temporal_fusion_with_legacy_fallback
 
-  base_model: change-reasoning-over-masks
+  base_model: NativeTemporalMultimodalVQA (closed-vocabulary) + BLIP VQA compatibility path
 
   depends_on:
     - CHANGE_DETECTION
@@ -104,3 +104,15 @@ OPTICAL_SAR_FUSION:
   base_model: dual-branch-fusion-classifier
 
   wrapper: apps.models_ai.optical_sar_fusion.wrapper.OpticalSARFusionModel
+
+TEMPORAL_OPTICAL_SAR:
+  task: temporal_optical_sar_vqa
+  input_modes:
+    - temporal_cross_modal
+  framework: supervised_native_four_stream
+  version: "1.0-native-four-stream"
+  adaptation: temporal_optical_sar_fusion
+  base_model: TemporalOpticalSARVQA
+  wrapper: apps.models_ai.temporal_optical_sar_wrapper.TemporalOpticalSARModel
+  checkpoint_env: TEMPORAL_OPTICAL_SAR_CHECKPOINT
+  confidence: uncalibrated_softmax_until_calibrated

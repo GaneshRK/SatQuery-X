@@ -51,6 +51,12 @@ Environment variables
 CHANGE_DETECTION_MODEL_PATH
     Optional path to a TorchScript model.
 
+CHANGE_DETECTION_CHECKPOINT
+    Optional path to a SatQuery SiameseChangeNet checkpoint (.pt/.pth).
+
+CHANGE_DETECTION_MODEL_TYPE
+    `siamese` loads the project's trained SiameseChangeNet checkpoint.
+
 CHANGE_DETECTION_DEVICE
     Optional torch device. Defaults to "cuda" when available, otherwise CPU.
 
@@ -122,6 +128,22 @@ DEFAULT_MAX_COMPONENTS = 100
 
 # These values are algorithmic parameters, NOT scientific measurements.
 DEFAULT_OTSU_BINS = 256
+
+
+def _load_calibration_temperature() -> float | None:
+    """Load an empirically fitted temperature; never invent one at runtime."""
+    path = os.getenv("CHANGE_DETECTION_CALIBRATION", "").strip()
+    if not path:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        temperature = float(payload["temperature"])
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and > 0")
+        return temperature
+    except Exception as exc:
+        logger.warning("Ignoring invalid change-detection calibration artifact: %s", exc)
+        return None
 
 MIN_THRESHOLD = 1e-6
 MAX_THRESHOLD = 1.0
@@ -463,6 +485,7 @@ class TrainedChangeModel:
         self.model = None
         self.device = "cpu"
         self.path: str | None = None
+        self.model_type: str | None = None
         self.loaded = False
         self.error: str | None = None
 
@@ -470,10 +493,13 @@ class TrainedChangeModel:
             self.error = "PyTorch is not installed."
             return
 
-        configured_path = os.getenv(
-            "CHANGE_DETECTION_MODEL_PATH",
-            "",
-        ).strip()
+        configured_path = os.getenv("CHANGE_DETECTION_MODEL_PATH", "").strip()
+        checkpoint_path = os.getenv("CHANGE_DETECTION_CHECKPOINT", "").strip()
+        model_type = os.getenv("CHANGE_DETECTION_MODEL_TYPE", "").strip().lower()
+
+        if checkpoint_path:
+            configured_path = checkpoint_path
+            model_type = model_type or "siamese"
 
         if not configured_path:
             self.error = (
@@ -505,14 +531,27 @@ class TrainedChangeModel:
             )
 
         try:
-            self.model = torch.jit.load(
-                str(model_path),
-                map_location=self.device,
-            )
+            if model_type == "siamese" or model_path.suffix.lower() in {".pth", ".pt", ".ckpt"} and os.getenv("CHANGE_DETECTION_MODEL_TYPE", "").strip().lower() == "siamese":
+                from ml.change_detection.model import SiameseChangeNet
 
-            self.model.eval()
+                checkpoint = torch.load(str(model_path), map_location=self.device)
+                if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+                    raise RuntimeError("Siamese checkpoint must contain model_state_dict.")
+                self.model = SiameseChangeNet(
+                    in_channels=int(checkpoint.get("in_channels", 3))
+                )
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+                self.model.to(self.device)
+                self.model.eval()
+            else:
+                self.model = torch.jit.load(
+                    str(model_path),
+                    map_location=self.device,
+                )
+                self.model.eval()
 
             self.path = str(model_path)
+            self.model_type = model_type or "torchscript"
             self.loaded = True
 
             logger.info(
@@ -1623,6 +1662,16 @@ class ChangeDetectionModel:
                 model_source = (
                     "trained_change_detection_model"
                 )
+
+                calibration_temperature = _load_calibration_temperature()
+                if calibration_temperature is not None:
+                    # The trained model returns logits/probabilities. Recalibrate
+                    # only when a held-out validation artifact is explicitly supplied.
+                    # Trained wrapper exposes probabilities, so invert the
+                    # probability to a logit before applying temperature scaling.
+                    p = np.clip(probability_map, 1e-6, 1.0 - 1e-6)
+                    logits = np.log(p / (1.0 - p))
+                    probability_map = 1.0 / (1.0 + np.exp(-np.clip(logits / calibration_temperature, -80.0, 80.0)))
 
             except Exception as exc:
                 model_error = str(exc)

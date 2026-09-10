@@ -233,8 +233,8 @@ export default function EarthObservationArtifacts({
               properties: {
                 name: "Hotspot 1: Primary Canopy Reduction Core",
                 area_km2: 9.57,
-                confidence: 0.94,
-                intensity: "High (0.94)",
+                confidence: undefined,
+                intensity: "",
                 transition: "Vegetation Canopy Reduction / Exposed Ground",
               },
               geometry: { type: "Polygon", coordinates: makeCluster(220, 190, 48) },
@@ -298,7 +298,7 @@ export default function EarthObservationArtifacts({
               `<div style="color:#0f172a; font-family: sans-serif; font-size: 12px; padding: 6px; min-width: 170px;">
                 <strong style="color:#dc2626;">🚨 ${p?.name || p?.cluster_name || "Detected Alteration"}</strong><br/>
                 <span style="font-size: 11px;">Area: <b>${p?.area_km2 || "9.57"} km²</b></span><br/>
-                <span style="font-size: 11px;">Confidence: <b>${((p?.confidence || 0.94) * 100).toFixed(1)}%</b></span><br/>
+                <span style="font-size: 11px;">Confidence: <b>${((p?.confidence) * 100).toFixed(1)}%</b></span><br/>
                 <span style="color:#64748b; font-size: 10px;">Transition: ${p?.transition || p?.dominant_transition || "Canopy Loss"}</span>
               </div>`
             )
@@ -960,7 +960,7 @@ export default function EarthObservationArtifacts({
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span>Detected Alteration:</span>
                   <strong style={{ color: "#ef4444" }}>
-                    {metrics?.detected_change_km2 ?? metrics?.vegetation_decreased_km2 ?? "18.4"} km²
+                    {metrics?.detected_change_km2 ?? metrics?.vegetation_decreased_km2 ?? "—"} km²
                   </strong>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -1291,10 +1291,10 @@ export default function EarthObservationArtifacts({
                     gap: 4,
                   }}
                 >
-                  <div>• Changed Pixel Count (N): <b>{evidenceChain?.pixel_count ?? ((metrics?.detected_change_km2 ?? 18.4) * 10000).toLocaleString()} pixels</b></div>
-                  <div>• Ground Sample Distance (GSD): <b>10.0 m × 10.0 m = 100.0 m² / pixel</b></div>
-                  <div>• Ground Footprint: <b>N × 100 m² = {((metrics?.detected_change_km2 ?? 18.4) * 1000000).toLocaleString()} m²</b></div>
-                  <div>• Metric Extent: <b>{metrics?.detected_change_km2 ?? 18.40} km² ({((metrics?.detected_change_km2 ?? 18.4) * 100).toLocaleString()} hectares)</b></div>
+                  <div>• Changed Pixel Count (N): <b>{evidenceChain?.pixel_count != null ? evidenceChain.pixel_count.toLocaleString() : "—"} pixels</b></div>
+                  <div>• Ground Sample Distance (GSD): <b>{evidenceChain?.pixel_ground_area_m2 != null ? `${Math.sqrt(evidenceChain.pixel_ground_area_m2).toFixed(2)} m × ${Math.sqrt(evidenceChain.pixel_ground_area_m2).toFixed(2)} m` : "—"}</b></div>
+                  <div>• Ground Footprint: <b>{evidenceChain?.total_area_m2 != null ? `${evidenceChain.total_area_m2.toLocaleString()} m²` : "—"}</b></div>
+                  <div>• Metric Extent: <b>{metrics?.detected_change_km2 != null ? metrics.detected_change_km2 : "—"} km²</b></div>
                 </div>
               </div>
 

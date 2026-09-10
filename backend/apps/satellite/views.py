@@ -32,6 +32,7 @@ from typing import Any
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
+from apps.system.throttles import SatelliteSearchRateThrottle
 from rest_framework.views import APIView
 
 from apps.satellite.indexer import HistoricalCatalogueIndexer
@@ -307,6 +308,7 @@ class HistoricalCatalogueSearchView(APIView):
     permission_classes = [
         permissions.IsAuthenticated
     ]
+    throttle_classes = [SatelliteSearchRateThrottle]
 
     def post(self, request, *args, **kwargs):
         session_id = request.data.get("session_id")
